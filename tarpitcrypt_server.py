@@ -271,16 +271,29 @@ class TarpitRequestHandler(BaseHTTPRequestHandler):
         self._fail(HTTPStatus.NOT_FOUND, "没有这个地址")
 
     def do_POST(self) -> None:  # noqa: N802
-        """加密 / 解密两个接口。"""
+        """加密 / 解密两个接口。
+
+        注意顺序：**必须先把请求体读干净再回响应**。HTTP/1.1 下带着未读正文
+        直接返回并关连接，客户端还在写，会看到 connection reset 而不是我们
+        精心构造的 403——跨源请求尤其容易踩到。
+        """
+        try:
+            body = self._read_body()
+        except ValueError as exc:
+            self.close_connection = True
+            self._fail(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+
         if not self._origin_allowed():
             self._fail(HTTPStatus.FORBIDDEN, "拒绝非本机来源的请求")
             return
+
         route = self.path.rstrip("/")
         if route not in ("/api/encrypt", "/api/decrypt"):
             self._fail(HTTPStatus.NOT_FOUND, "没有这个接口")
             return
+
         try:
-            body = self._read_body()
             fields, files = parse_form(self.headers.get("Content-Type", ""), body)
         except ValueError as exc:
             self._fail(HTTPStatus.BAD_REQUEST, str(exc))
@@ -421,8 +434,21 @@ class TarpitWebServer(ThreadingHTTPServer):
 # ---------------------------------------------------------------------------
 
 
+def _configure_stdio() -> None:
+    """把标准输出/错误切到 UTF-8，避免 cp1252 控制台上打印中文直接崩。"""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:  # pragma: no cover
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):  # pragma: no cover
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
     """启动本地 Web 服务。"""
+    _configure_stdio()
     parser = argparse.ArgumentParser(
         prog="tarpitcrypt-web",
         description="TarpitCrypt 本地 Web 入口：拖文件进来，加密文件出去。",
