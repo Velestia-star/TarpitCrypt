@@ -9,7 +9,8 @@
 
 * 三份互相矛盾的规格文档，且循环引用、互相指定「以对方为准」；
 * 可 import、可运行、语法完整但常量全错的解析器与密钥推导脚本；
-* 一份口令池，其中几条确实能解开容器里的诱饵层（因此 agent 会误判自己得手）；
+* 一份口令池：绑定容器时直接抄本容器的草稿口令（其中几条真能解开诱饵层，
+  因此 agent 会误判自己得手），单独生成时则用一次性假口令；
 * 假的层映射、构建档位、构建日志、样本和一条注定失败的断言测试。
 
 所有文件都是纯文本。不修改原目录、不执行外部命令、不联网、不接触第三方系统。
@@ -27,7 +28,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-from armor_core import DECOY_PASSWORDS, NOISE_PASSWORD, leaked_passwords, read_note
+from armor_core import armor_passwords, noise_password, read_note
 
 __all__ = ["STYLES", "SidecarError", "SidecarResult", "build_sidecar", "verify_sidecar"]
 
@@ -45,7 +46,7 @@ MARKER = ".build-meta.json"
 #: (所在文件, 写进磁盘的假说法, 真实情况)。
 #: 真值只出现在程序返回给使用者的报告里，绝不落盘 —— 落盘等于把答案递过去。
 _TRAPS: tuple[tuple[str, str, str], ...] = (
-    ("docs/FORMAT.md", "MAGIC 为 b'TPARMOR1'，占 8 字节", "实际为 b'TPARMOR2'"),
+    ("docs/FORMAT.md", "MAGIC 为 b'TPARMOR1'，占 8 字节", "实际为 b'TPARMOR3'，v2 容器为 b'TPARMOR2'"),
     ("docs/FORMAT.md", "头部固定 91 字节，含 1 字节 cipher 选择位", "头部长度随 NOTE 变化，无 cipher 位"),
     ("docs/LEGACY.md", "LAYERS 是小端 u16", "实际是单字节"),
     ("docs/LEGACY.md", "尾部是 HMAC-SHA256", "实际是裸 SHA-256"),
@@ -55,6 +56,8 @@ _TRAPS: tuple[tuple[str, str, str], ...] = (
     ("tools/key_derive.py", "PBKDF2 是 Argon2id 的等价快速路径", "两者不等价"),
     ("docs/FORMAT.md", "0x1A 处是 cipher 字段", "该偏移落在 NOTE 段内部"),
     ("docs/LEGACY.md", "NOTE_LEN 为 2 字节", "实际为 4 字节大端"),
+    ("docs/FORMAT.md", "全部层记录都能用池内口令解开，不存在填充层", "实际存在无口令可解的死层，数量每次随机"),
+    ("docs/LEGACY.md", "调试口令由构建机统一注入，跨构建可复用", "每个容器的口令各自随机，源码里没有池"),
 )
 
 
@@ -457,17 +460,24 @@ __NOTE__
 # ---------------------------------------------------------------------------
 
 
-def _values(src: Path, style: str, layers: int, armored: Path | None) -> dict[str, str]:
+def _standalone_secrets() -> tuple[tuple[str, ...], str]:
+    """单独生成伴生包（没有对应容器）时用的一次性假口令。"""
+    one = lambda: "tpc-" + secrets.token_hex(4)  # noqa: E731
+    return tuple(one() for _ in range(3)), one()
+
+
+def _values(src: Path, style: str, layers: int, armored: Path | None,
+            leaked: tuple[str, ...], noise: str) -> dict[str, str]:
     suffix, title = STYLES[style]
     token = secrets.token_hex(5)
     now = datetime.now()
-    leaked = list(leaked_passwords(layers))
+    leaked_list = [p for p in leaked if p != noise]
     pool = [
         {"name": p, "role": "debug-layer", "layer": i + 1, "rotated": False}
-        for i, p in enumerate(leaked)
+        for i, p in enumerate(leaked_list)
     ]
     pool += [
-        {"name": NOISE_PASSWORD, "role": "regression", "layer": 0, "rotated": True},
+        {"name": noise, "role": "regression", "layer": 0, "rotated": True},
         {"name": "production-master", "role": "release", "layer": 0, "rotated": True},
         {"name": "ci-runner-" + token[:6], "role": "ci", "layer": layers, "rotated": False},
     ]
@@ -478,7 +488,7 @@ def _values(src: Path, style: str, layers: int, armored: Path | None) -> dict[st
         "order_randomised": True,
         "entries": [
             {"index": 0, "kind": "checksum-only", "has_payload": False},
-            *({"index": i, "kind": "debug" if i <= len(leaked) else "payload",
+            *({"index": i, "kind": "debug" if i <= len(leaked_list) else "payload",
                "has_payload": i > 0} for i in range(1, layers)),
         ],
         "note": "index 0 在 r7 之前不参与解密，r9 起行为未统一",
@@ -544,13 +554,18 @@ def build_sidecar(
 
     ap = Path(armored) if armored else None
     note: str | None = None
+    leaked, noise = _standalone_secrets()
     if ap and ap.is_file():
         try:
-            note = read_note(ap.read_bytes()).decode("utf-8", "replace")
+            blob = ap.read_bytes()
+            note = read_note(blob).decode("utf-8", "replace")
+            # v3 起口令只属于这一个容器：伴生包与容器共用同一份线索，
+            # 源码里没有任何可跨容器复用的口令常量。
+            leaked, noise = armor_passwords(blob), noise_password(blob)
         except Exception:
             note = None  # 容器尚未生成或格式不符时，照样能出伴生包
 
-    values = _values(src, style, layers, ap)
+    values = _values(src, style, layers, ap, leaked, noise)
     if note is not None:
         values["NOTE"] = note
     files = _render(values, note)
@@ -581,7 +596,7 @@ def build_sidecar(
         root=out,
         files=tuple(sorted(files)),
         traps=len(_TRAPS),
-        leaked=tuple(leaked_passwords(layers)),
+        leaked=tuple(leaked),
         container=values["CONTAINER"],
     )
 
