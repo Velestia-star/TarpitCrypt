@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tarpitcrypt"
+version = "1.0.0"
+description = "让每一次口令猜测都付出完整代价的本地文件加密工具"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "argon2-cffi>=23.1",
+    "cryptography>=42.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+tarpitcrypt = "tarpitcrypt:main"
+
+[tool.setuptools]
+py-modules = ["tarpitcrypt"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

@@ -1,0 +1,187 @@
+# TarpitCrypt
+
+> 不是让数据「解不开」，而是让**每一次口令猜测都贵到肉疼**。
+
+TarpitCrypt 是一个本地文件加密工具。它把单次破解尝试的成本钉死在文件里：
+破解者每猜一个口令，都必须完整执行 `rounds × Argon2id(mem, time, para)`，
+启用诱饵层时还要再付一次同样的代价。试得越多，亏得越多。
+
+**仅用于加密你自己拥有的数据。**
+
+---
+
+## 快速开始
+
+```bash
+pip install argon2-cffi cryptography
+
+# 加密
+python tarpitcrypt.py encrypt notes.pdf notes.pdf.tarpit
+# 解密
+python tarpitcrypt.py decrypt notes.pdf.tarpit notes.pdf
+# 看文件头（不需要口令）
+python tarpitcrypt.py info notes.pdf.tarpit
+```
+
+口令通过交互式 `getpass` 输入，或从 stdin 读（`--password-stdin`），
+**永远不作为命令行参数**——那样会被 `ps` / 命令行历史记下来。
+
+### 加一个 keyfile
+
+```bash
+python tarpitcrypt.py keygen my.key           # 生成 64 字节 keyfile
+python tarpitcrypt.py encrypt big.iso big.tarpit --keyfile my.key
+python tarpitcrypt.py decrypt big.tarpit big.iso --keyfile my.key
+```
+
+keyfile 丢了 = 数据没了。请离线备份（U 盘 / 纸）。别把它和密文放同一个目录。
+
+### 加一个诱饵层
+
+```bash
+python tarpitcrypt.py encrypt real.txt out.tarpit --decoy fake.txt
+```
+
+同一个文件有两个有效口令：主口令解出 `real.txt`，诱饵口令解出 `fake.txt`。
+解密时命中诱饵层，进程退出码是 **2**（见下方退出码表）。
+
+代价：既然后备解要试两层，攻击者每次猜测的花费直接翻倍。
+
+### 用 AI 生成的参数
+
+```bash
+python tarpitcrypt.py ai-config params.json     # 先校验，看哪些被丢弃
+python tarpitcrypt.py encrypt a.txt a.tarpit --ai-config params.json
+```
+
+AI 只允许输出下面这些键与值，其他一律丢弃并记 warning——
+**AI 永远碰不到口令、密钥、keyfile 的内容，它只产出 JSON 旋钮**：
+
+| 键 | 白名单 |
+|---|---|
+| `mem` | 262144 / 524288 / 1048576 / 2097152（KiB） |
+| `time` | 3 / 4 / 5 |
+| `para` | 2 / 4 / 6 |
+| `rounds` | 2 / 3 / 4 |
+| `pow` | 0 / 16 / 18 / 20 |
+| `cipher` | `xchacha20-poly1305` / `aes-256-gcm` |
+
+---
+
+## 单次猜测到底有多贵（本机实测）
+
+| 参数 | 单次尝试耗时 |
+|---|---|
+| mem=256 MiB, time=3, para=2, rounds=2 | **0.95 s** |
+| mem=1 GiB, time=3, para=4, rounds=2 | **3.20 s** |
+| mem=1 GiB, time=4, para=4, rounds=3 | **5.86 s** |
+
+启用诱饵层 → 上面数字 **×2**。
+
+口径说明：这里的「一次尝试」= 跑完 `_derive` 得到主密钥并完成一次认证。
+Argon2id 是内存硬函数，GPU/ASIC 的并行优势被内存带宽卡死，所以这些秒数
+**不能靠堆显卡压下去**，只能靠堆内存压——而内存是有货币成本的。
+
+> 一个 8 位随机口令大约 2×10¹⁴ 种组合。按 3.2 s/次计，穷举完需要
+> 约 2000 万年。这就是「焦油坑」的全部含义。
+
+---
+
+## 文件格式（VERSION = 1）
+
+所有整数字段大端（`>`）。
+
+| 字段 | 长度 | 说明 |
+|---|---|---|
+| `MAGIC` | 8 | `b"TARPITCR"` |
+| `VERSION` | 1 | `1` |
+| `FLAGS` | 1 | bit0=POW, bit1=KEYFILE, bit2=DECOY |
+| `KDF参数` | 8 | `>IHBB` → mem(KiB,u32) \| time(u16) \| para(u8) \| rounds(u8) |
+| `POW_DIFF` | 1 | 前导零比特数，取值 {0,16,18,20} |
+| `SALT` | 32 | 每次加密重新生成 |
+| `NONCE` | 24 | 每次加密重新生成（AES-GCM 取前 12 字节） |
+| `POW_NONCE` | 8 | PoW 解 |
+| `CT_LEN` | 8 | 密文长度 |
+| `CT` | `CT_LEN` | 密文（含 16 字节认证标签） |
+| `DECOY_NONCE` | 24 | 仅 DECOY 置位时 |
+| `DECOY_LEN` | 8 | 仅 DECOY 置位时 |
+| `DECOY_CT` | `DECOY_LEN` | 仅 DECOY 置位时 |
+
+头部长 **91 字节**。
+
+**AAD 绑定**：主层 AAD = 整段文件头；诱饵层 AAD = `文件头 ‖ DECOY_NONCE ‖ DECOY_LEN`。
+这意味着文件头里任何一个比特被改动，认证都会失败——两段密文也换不了位置。
+
+---
+
+## 为什么安全
+
+- **密钥**：口令与 keyfile 摘要经 HKDF-SHA256 合成为 Argon2id 的输入，
+  串行跑 `rounds` 轮，得到 32 字节主密钥。
+- **机密性 + 完整性**：AES-256-GCM（或 XChaCha20-Poly1305，若运行库提供），
+  16 字节认证标签，密文与文件头都在 AAD 保护下。
+  默认用 AES-256-GCM——因为截至 `cryptography` 50.x 它并没有提供
+  XChaCha20-Poly1305；选 `--cipher xchacha20-poly1305` 时会**告警并降级**
+  到 AES-256-GCM，而不是让程序崩溃。等上游提供该算法，探测会自动启用。
+- **随机性**：SALT / NONCE / keyfile / PoW 起点全部来自 `secrets`（操作系统 CSPRNG）。
+- **没有自创密码学**：只用 `cryptography` 提供的 AEAD / HKDF，以及
+  `argon2-cffi` 的 Argon2id。口令与 keyfile 用 HKDF-SHA256 预哈希合成，
+  这是标准的组合方式，不是自研 KDF。
+- **文件头先校验后使用**：`mem` / `time` / `para` / `rounds` / `POW_DIFF` 全部
+  在进入 Argon2 之前过区间检查，恶意文件没法用超大参数拖死你的机器。
+
+## 什么情况下不安全（请务必读）
+
+1. **口令熵低就全盘皆输。** Argon2 只是把每次尝试变贵，不能把弱口令变强。
+   4 位数字 PIN 在 3 秒/次下也只需几小时。用长口令或高熵口令。
+2. **keyfile 和密文放在一起等于没有 keyfile**，只是把风险换了个位置。
+3. **文件头是明文元数据**：别人能看出你用了多大内存、有没有诱饵层、密文多长。
+   这是为「可迁移」付出的代价，VERSION 就是为将来换格式留的口子。
+4. **PoW 不增加破解成本。** `POW_NONCE` 就写在文件里，验证只需一次 SHA-256。
+   它防控的是「批量低成本造文件」，不是「猜口令」。真正的成本杠杆是
+   `memory_cost × time_cost × rounds`。任何声称 PoW 能拖慢离线破解的说法都不可信。
+5. **诱饵层的存在是可见的**（FLAGS.bit2 + DECOY_LEN 明文）。它提供的是
+   「两份都说得出理由的明文」和额外的 ×2 破解成本，不是「让人看不出有诱饵」。
+6. **本工具不防内存取证、不防键盘记录、不防已失陷的主机。** 解密时明文与口令
+   一定在内存里出现过。
+7. **没有密钥托管。** 口令 + keyfile 丢任何一个，数据永久不可恢复。
+
+---
+
+## 退出码
+
+| 码 | 含义 |
+|---|---|
+| 0 | 成功 |
+| 1 | 参数错误 / 两次口令不一致 |
+| 2 | 诱饵层命中 |
+| 3 | 解密失败（口令或 keyfile 错误） |
+| 4 | 环境错误（依赖缺失、文件不存在等） |
+
+---
+
+## 开发
+
+```bash
+pip install pytest
+python -m pytest tests -q          # 42 passed
+```
+
+测试里带 **KDF 黄金向量**（`_derive` 的固定输入 → 固定输出）。
+任何改动 KDF 流程的提交都必须同步更新该向量，并按要求附带：
+
+1. 变更前后的单次尝试成本对比；
+2. 对已有文件的影响（不兼容则必须 `VERSION + 1` 并提供迁移脚本）；
+3. 新的测试向量（输入、期望输出、口令、keyfile 摘要）。
+
+不允许为了「性能」下调 `memory_cost` 或 `time_cost`，也不允许移除 AAD 绑定。
+
+## 兼容性
+
+- VERSION = 1，格式冻结。解密端遇到未知 VERSION 直接拒绝，绝不猜测着解。
+- 解密端自动识别 AEAD 算法（v1 文件头没有独立的 cipher 字段），
+  因此加密时选的算法不影响文件能否被解开。
+
+## 许可
+
+MIT。
