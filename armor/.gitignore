@@ -1,0 +1,5 @@
+# 加固产物不入库
+*.armored
+*_build_kit/
+*_internal_docs/
+*_archive_r9/
