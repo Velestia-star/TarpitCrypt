@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TarpitCrypt · 焦油坑加密</title>
+<meta name="description" content="在浏览器里本地完成 Argon2id + AES-256-GCM 文件加密，文件不上传。">
+<link rel="stylesheet" href="style.css">
+<script src="vendor/argon2.umd.min.js"></script>
+</head>
+<body>
+<main>
+  <h1>Tarpit<span>Crypt</span></h1>
+  <p class="sub">
+    拖进来，拿走一份 <code>.tarpit</code>。破解者每猜一次口令，都得跑一遍完整的 Argon2id。
+    <br><strong>所有加密都在你的浏览器里完成，文件不会上传到任何服务器。</strong>
+  </p>
+
+  <div class="tabs">
+    <button class="tab active" data-mode="encrypt" type="button">加密</button>
+    <button class="tab" data-mode="decrypt" type="button">解密</button>
+  </div>
+
+  <div class="drop" id="drop">
+    <p><strong id="dropTitle">把文件或整个文件夹拖到这里</strong></p>
+    <p class="hint">
+      或 <label class="link">选择文件<input type="file" id="pickFiles" multiple hidden></label>
+      · <label class="link">选择文件夹<input type="file" id="pickDir" webkitdirectory multiple hidden></label>
+    </p>
+    <p class="hint" id="dropHint">支持多文件；文件夹会打包成一个 .tarpit</p>
+  </div>
+  <ul class="files" id="fileList"></ul>
+
+  <div class="grid">
+    <label>口令
+      <input type="password" id="password" autocomplete="new-password" placeholder="长一点，别用生日">
+    </label>
+    <label id="confirmWrap">再输一次
+      <input type="password" id="password2" autocomplete="new-password">
+    </label>
+    <label>keyfile（可选）
+      <input type="file" id="keyfile">
+    </label>
+    <label id="presetWrap">强度预设
+      <select id="preset">
+        <option value="fast" selected>快速 · 256 MiB × 2 轮（约 1 秒）</option>
+        <option value="standard">标准 · 512 MiB × 2 轮（约 2 秒）</option>
+        <option value="hard">硬核 · 1 GiB × 2 轮（约 3 秒，吃内存）</option>
+      </select>
+    </label>
+  </div>
+
+  <details id="advanced">
+    <summary>高级：PoW / 诱饵层</summary>
+    <div class="grid">
+      <label>PoW 难度
+        <select id="pow">
+          <option value="0" selected>关闭</option>
+          <option value="16">16 bit</option>
+          <option value="18">18 bit（造文件慢几秒）</option>
+        </select>
+      </label>
+      <label>AEAD
+        <input type="text" value="AES-256-GCM（浏览器原生）" disabled>
+      </label>
+      <label class="decoy-only">诱饵明文（可选）
+        <input type="file" id="decoy">
+      </label>
+      <label class="decoy-only">诱饵口令
+        <input type="password" id="decoyPassword" placeholder="用别的口令才能解出诱饵">
+      </label>
+    </div>
+  </details>
+
+  <button class="go" id="go" type="button">加密并下载</button>
+  <div class="status" id="status"></div>
+  <div class="result" id="result"></div>
+
+  <footer>
+    <p>文件不上传 · 口令只在这个页面的内存里 · 由 <a href="https://github.com/wei238982377/TarpitCrypt">TarpitCrypt</a> 在本地运行</p>
+    <p class="hint">
+      与 <code>tarpitcrypt.py</code> 生成的文件格式完全兼容，可以互换解密。
+    </p>
+  </footer>
+</main>
+<script type="module" src="app.js"></script>
+</body>
+</html>

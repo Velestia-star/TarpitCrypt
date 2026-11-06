@@ -27,3 +27,4 @@ py-modules = ["tarpitcrypt", "tarpitcrypt_server"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+markers = ["browser: 需要本机 Edge/Chrome 的端到端兼容性测试"]

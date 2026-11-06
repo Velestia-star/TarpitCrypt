@@ -13,14 +13,15 @@
 
 ```bash
 pip install argon2-cffi cryptography pytest
-python -m pytest tests -o addopts=""   # v1 单元 + 固定样本格式兼容
+python -m pytest tests -o addopts=""   # 82 项：v1 单元 + 固定格式兼容 + 浏览器互解
 python armor/selftest.py               # armor 端到端
 python armor/probe_agent.py            # 模拟逆向轮数对照
 ```
 
-CI 会在 3 个系统 × Python 3.11/3.12/3.13 上跑同一套命令。`ruff` 目前是
-建议项、不阻断合并（见 `.github/workflows/ci.yml`），存量风格问题清完后再
-改成强制。
+CI 会在 3 个系统 × Python 3.11/3.12/3.13 上跑同一套命令。浏览器 ↔ Python
+双向互解依赖本机 Edge/Chrome 与 headless WASM，CI 里单独一步且非阻断；
+`ruff` 同样暂为建议项（见 `.github/workflows/ci.yml`），存量风格问题清完后
+再改成强制。
 
 ## 格式冻结是硬约束
 

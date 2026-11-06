@@ -9,6 +9,9 @@
 
 ### 新增
 
+- **纯前端在线版**（合入同学的 `5e62699`）：`docs/` 发布成 GitHub Pages 后，
+  Argon2id 由 vendor 的 hash-wasm 在浏览器内运行、AEAD 走 WebCrypto，
+  文件不上传；新增浏览器 ↔ Python 双向互解测试。
 - **S 级加固（v3 容器，`armor/`）**：调试口令改为每个容器随机派生，源码
   不再有可复用口令池；掺入任何线索口令都解不开的「死层」，让「解开
   N-1 层后剩下那层必然是真层」的排除法失效；诱饵包按真包统计特征随机
@@ -40,8 +43,8 @@
 
 ### 验证
 
-- `pytest`：81 passed（42 项 v1 单元 + Web 入口 + 21 项固定格式兼容断言
-  + 4 项 keygen 覆盖保护）。
+- `pytest`：82 passed（42 项 v1 单元 + Web 入口 + 21 项固定格式兼容断言
+  + 4 项 keygen 覆盖保护 + 1 项浏览器 ↔ Python 双向互解）。
 - `ruff check .`：All checks passed（`E4/E7/E9/F` 规则集）。
 - `armor/selftest.py`：62/62 通过。
 - GUI 无头全流程（异步加固 / 伴生 / 并行还原 / 报告页）通过。

@@ -34,7 +34,12 @@ jobs:
         run: python -m compileall -q tarpitcrypt.py tarpitcrypt_server.py armor tests
 
       - name: v1 单元测试 + 固定样本格式兼容
-        run: python -m pytest tests -o addopts=""
+        # 浏览器互解依赖本机 Edge/Chrome 与 headless WASM，单独跑、不阻断矩阵。
+        run: python -m pytest tests -o addopts="" -m "not browser"
+
+      - name: 浏览器 ↔ Python 双向互解（建议项）
+        continue-on-error: true
+        run: python -m pytest tests -o addopts="" -m browser
 
       - name: armor 端到端自测
         run: python armor/selftest.py
