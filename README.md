@@ -1,12 +1,34 @@
 # TarpitCrypt
 
-> 不是让数据「解不开」，而是让**每一次口令猜测都贵到肉疼**。
+> 不是让数据「解不开」，而是让**逆向方判断不了自己是不是找对了**。
 
-TarpitCrypt 是一个本地文件加密工具。它把单次破解尝试的成本钉死在文件里：
-破解者每猜一个口令，都必须完整执行 `rounds × Argon2id(mem, time, para)`，
-启用诱饵层时还要再付一次同样的代价。试得越多，亏得越多。
+TarpitCrypt 是一个**反 AI 逆向的整活项目**。底层是一个本地文件加密工具：
+把单次口令猜测的成本钉死在文件头里，每猜一次都要完整执行
+`rounds × Argon2id(mem, time, para)`。在此之上，`armor/` 提供图形化加固层，
+往逆向链路里投放大量「看起来合理、实际走不通」的线索——诱饵层、死层、
+互相矛盾的规格文档、能运行但常量全错的解析器。AI 会反复生成假设、写脚本
+验证、推翻重来，每一轮都烧掉上下文和 token。破解者付的不再是电费，是推理
+成本；越想一次性看懂，亏得越多。
 
-**仅用于加密你自己拥有的数据。**
+**边界**：只做信息误导，不执行、不注入、不联网、不接触第三方系统。输出是
+容器文件，原程序零改动、用前先还原。**仅用于加固你自己拥有的程序包。**
+
+---
+
+## 版本说明
+
+| 层面 | 当前值 | 说明 |
+| --- | --- | --- |
+| 发布版本 | **v0.3.0** | 首个正式 tag / Release，见 [CHANGELOG.md](CHANGELOG.md) |
+| v1 文件格式 | `VERSION = 1`，`MAGIC = TARPITCR` | `.tarpit` 文件，格式冻结 |
+| armor 容器格式 | `VERSION = 3`，`MAGIC = TPARMOR3` | `.armored` 文件；v2 容器仍可读 |
+| Python 包元数据 | `0.3.0` | `pyproject.toml` |
+
+两层格式互不依赖：`armor/` 只复用 v1 的 Argon2id 与 AES-256-GCM 原语，
+**v1 文件格式一个字节没改**。
+
+想直接上手用界面：看 [`armor/README.md`](armor/README.md)，Windows 双击
+`armor/启动.bat` 即可拖入加固。想看命令行加密器，继续往下读。
 
 ---
 
@@ -105,7 +127,13 @@ AI 只允许输出下面这些键与值，其他一律丢弃并记 warning——
 | mem=1 GiB, time=3, para=4, rounds=2 | **3.20 s** |
 | mem=1 GiB, time=4, para=4, rounds=3 | **5.86 s** |
 
-启用诱饵层 → 上面数字 **×2**。
+> **这些数字是特定机器上的一次观测，不是性能承诺。** 另一台机器实测同一档
+> 为 0.47 s。硬件、Python 与 `argon2-cffi` 版本都会影响结果；要复现请用
+> 同一份脚本在同一台机器上重跑，别拿表里的秒数当安全保证。
+
+启用诱饵层时，**本工具自带的 `decrypt()` 会做两次 `_derive`**，但这不等于
+「破解成本 ×2」：攻击者只攻主层就能判定一个候选口令失败，根本不需要碰诱饵
+段。变慢的是合法用户，不是攻击者。早期版本写过 ×2 的说法，已更正。
 
 口径说明：这里的「一次尝试」= 跑完 `_derive` 得到主密钥并完成一次认证。
 Argon2id 是内存硬函数，GPU/ASIC 的并行优势被内存带宽卡死，所以这些秒数
@@ -167,10 +195,14 @@ Argon2id 是内存硬函数，GPU/ASIC 的并行优势被内存带宽卡死，�
 3. **文件头是明文元数据**：别人能看出你用了多大内存、有没有诱饵层、密文多长。
    这是为「可迁移」付出的代价，VERSION 就是为将来换格式留的口子。
 4. **PoW 不增加破解成本。** `POW_NONCE` 就写在文件里，验证只需一次 SHA-256。
-   它防控的是「批量低成本造文件」，不是「猜口令」。真正的成本杠杆是
+   它防控的是「批量低成本造文件」，不是「猜口令」；而且校验发生在
+   `_derive` **之后**，Argon2 的钱已经付完，所谓「错误口令的快速拒绝路径」
+   省下的只是一次 AEAD，占比可以忽略。真正的成本杠杆是
    `memory_cost × time_cost × rounds`。任何声称 PoW 能拖慢离线破解的说法都不可信。
-5. **诱饵层的存在是可见的**（FLAGS.bit2 + DECOY_LEN 明文）。它提供的是
-   「两份都说得出理由的明文」和额外的 ×2 破解成本，不是「让人看不出有诱饵」。
+5. **v1 的诱饵层存在是可见的**（FLAGS.bit2 + DECOY_LEN 明文），命中时还会
+   返回 `is_decoy=True`、退出码 2 并写出诱饵明文。它给的是「一个备用口令」，
+   **可否认性为零**，也不额外增加攻击者的固定成本。想要「不标记真伪」的
+   效果请用 `armor/` 的 v3 容器，两者的设计目标不同。
 6. **本工具不防内存取证、不防键盘记录、不防已失陷的主机。** 解密时明文与口令
    一定在内存里出现过。
 7. **没有密钥托管。** 口令 + keyfile 丢任何一个，数据永久不可恢复。
@@ -192,12 +224,25 @@ Argon2id 是内存硬函数，GPU/ASIC 的并行优势被内存带宽卡死，�
 ## 开发
 
 ```bash
-pip install pytest
-python -m pytest tests          # 58 passed
+pip install argon2-cffi cryptography pytest
+python -m pytest tests -o addopts=""   # 81 passed（含 21 项固定格式兼容 + 4 项 keygen 保护）
+python armor/selftest.py               # 62/62
+python armor/probe_agent.py            # 模拟逆向轮数对照
+python armor/agent_eval.py --runs 5    # 多轮取样 + 评估报告
 ```
 
-测试里带 **KDF 黄金向量**（`_derive` 的固定输入 → 固定输出）。
-任何改动 KDF 流程的提交都必须同步更新该向量，并按要求附带：
+CI 在 3 个系统 × Python 3.11/3.12/3.13 上跑同一套命令，配置见
+`.github/workflows/ci.yml`。协作规则见 [CONTRIBUTING.md](CONTRIBUTING.md)，
+漏洞报告渠道见 [SECURITY.md](SECURITY.md)。
+
+测试里有两类「不能省」的证据：
+
+- **KDF 黄金向量**：`_derive` 的固定输入 → 固定输出；
+- **`tests/fixtures/` 固定格式样本**：四份事先生成并入库的 `.bin`，**只解不加密**。
+  其余测试都是「当前代码加密 → 当前代码解密」自洽，改坏 AAD 组成或诱饵段
+  顺序时照样全绿；只有这批样本能挡住「已发出的旧文件全解不开」。
+
+任何改动 KDF 流程或文件格式的提交，必须附带：
 
 1. 变更前后的单次尝试成本对比；
 2. 对已有文件的影响（不兼容则必须 `VERSION + 1` 并提供迁移脚本）；
@@ -207,10 +252,22 @@ python -m pytest tests          # 58 passed
 
 ## 兼容性
 
-- VERSION = 1，格式冻结。解密端遇到未知 VERSION 直接拒绝，绝不猜测着解。
+- v1 `VERSION = 1` 格式冻结。解密端遇到未知 VERSION 直接拒绝，绝不猜测着解。
 - 解密端自动识别 AEAD 算法（v1 文件头没有独立的 cipher 字段），
   因此加密时选的算法不影响文件能否被解开。
+- `cryptography` 48+ / 50+ 均不提供 `XChaCha20Poly1305`，会自动降级到
+  AES-256-GCM；这条降级路径已实测生效。
+- armor v3 容器按 v2 的同一二进制布局读取，`MAGIC=TPARMOR2` 的旧
+  `.armored` 仍可用主口令还原。
+
+## 作者与贡献者
+
+- [@wei238982377](https://github.com/wei238982377) — 仓库所有者、v1 加密核心与本地 Web 入口
+- [@yanmoren](https://github.com/yanmoren) — `armor/` 加固层、GUI、工程化与发布
+
+完整的逐提交记录见仓库 Contributors 页面。欢迎通过 PR 参与，协作约定见
+`CONTRIBUTING.md`；安全漏洞请走 `SECURITY.md` 的私下渠道。
 
 ## 许可
 
-MIT。
+MIT，版权归 [TarpitCrypt contributors](LICENSE)。

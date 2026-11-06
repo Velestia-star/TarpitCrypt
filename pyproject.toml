@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tarpitcrypt"
-version = "1.0.0"
-description = "让每一次口令猜测都付出完整代价的本地文件加密工具"
+version = "0.3.0"
+description = "反 AI 逆向整活：用信息污染让逆向 agent 反复做无用功"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -15,7 +15,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
+dev = ["pytest>=8.0", "ruff>=0.6"]
 
 [project.scripts]
 tarpitcrypt = "tarpitcrypt:main"

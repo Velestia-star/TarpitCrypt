@@ -13,6 +13,8 @@ from __future__ import annotations
 import ctypes
 import os
 import queue
+import subprocess
+import sys
 import threading
 import tkinter as tk
 import traceback
@@ -20,8 +22,20 @@ from ctypes import wintypes
 from pathlib import Path
 from tkinter import filedialog, font, messagebox, scrolledtext, ttk
 
+from armor_metrics import Metrics, Stopwatch
+
 APP_TITLE = "TarpitCrypt Armor · 程序包加固"
 ACCENT = "#185FA5"
+
+
+def _open_path(path: Path) -> None:
+    """跨平台打开目录。Windows 用资源管理器，其余交给系统默认程序。"""
+    if os.name == "nt":
+        os.startfile(str(path))  # noqa: S606 - 仅打开本工具生成的目录
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", str(path)])
+    else:
+        subprocess.Popen(["xdg-open", str(path)])
 
 
 def _enable_dpi() -> None:
@@ -108,7 +122,6 @@ class NativeDrop:
 class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title(APP_TITLE)
         self.geometry("960x720")
         self.minsize(820, 600)
         try:
@@ -135,9 +148,15 @@ class App(tk.Tk):
         self.kit_out = tk.StringVar()
         self.kit_root: Path | None = None
         self.status = tk.StringVar(value="就绪")
+        self.metrics = Metrics()
+        self.poison = tk.StringVar()
+        self.parallel = tk.BooleanVar(value=False)
 
+        import armor_core as core
         import decoy_kit as dk
+        self.title(f"{APP_TITLE}  v{core.__version__}")
         self.kit_style.set(dk.DEFAULT_STYLE)
+        self.poison.set(dk.DEFAULT_POISON)
         # 风格在「加固」页和「伴生诱饵」页共用一个变量，改动时同步刷新输出路径。
         self.kit_style.trace_add("write", lambda *_args: self._refresh_kit_out())
         self._build()
@@ -163,6 +182,7 @@ class App(tk.Tk):
         self.nb.add(self._tab_armor(), text="  加固  ")
         self.nb.add(self._tab_restore(), text="  还原  ")
         self.nb.add(self._tab_kit(), text="  伴生诱饵  ")
+        self.nb.add(self._tab_report(), text="  运行报告  ")
         self.nb.add(self._tab_about(), text="  说明  ")
 
         bar = ttk.Frame(root)
@@ -238,6 +258,14 @@ class App(tk.Tk):
         ttk.Combobox(side, textvariable=self.kit_style, state="readonly", width=14,
                      values=list(dk.STYLES)).pack(side="left", padx=10)
 
+        ttk.Label(form, text="投毒侧重").grid(row=6, column=0, sticky="w", pady=4)
+        prow = ttk.Frame(form)
+        prow.grid(row=6, column=1, sticky="w", pady=4)
+        ttk.Combobox(prow, textvariable=self.poison, state="readonly", width=16,
+                     values=list(dk.POISON_PROFILES)).pack(side="left")
+        ttk.Label(prow, text="  针对「先读文档 / 先跑脚本」的逆向习惯调整线索组合",
+                  style="Hint.TLabel").pack(side="left", padx=8)
+
         actions = ttk.Frame(f)
         actions.pack(fill="x")
         self.armor_btn = ttk.Button(actions, text="开始加固", style="Accent.TButton",
@@ -278,7 +306,9 @@ class App(tk.Tk):
         self.restore_btn = ttk.Button(actions, text="还原", style="Accent.TButton",
                                       command=self._do_restore)
         self.restore_btn.pack(side="left")
-        ttk.Label(actions, text="  还原结果不标注层号与真伪，这是设计的一部分",
+        ttk.Checkbutton(actions, text="并行尝试各层", variable=self.parallel).pack(
+            side="left", padx=10)
+        ttk.Label(actions, text="  低内存档生效，最多 4 线程；还原结果不标注层号与真伪",
                   style="Hint.TLabel").pack(side="left")
 
         self.dec_log = self._log_box(f)
@@ -311,9 +341,13 @@ class App(tk.Tk):
         ttk.Spinbox(lrow, from_=2, to=8, textvariable=self.layers, width=6).pack(side="left")
         ttk.Label(lrow, text="  与加固页共用；决定口令池里放几条调试口令",
                   style="Hint.TLabel").pack(side="left")
-        ttk.Label(form, text="输出到").grid(row=2, column=0, sticky="w", pady=4)
+        ttk.Label(form, text="投毒侧重").grid(row=2, column=0, sticky="w", pady=4)
+        ttk.Combobox(form, textvariable=self.poison, state="readonly", width=16,
+                     values=list(dk.POISON_PROFILES)).grid(
+                         row=2, column=1, sticky="w", pady=4)
+        ttk.Label(form, text="输出到").grid(row=3, column=0, sticky="w", pady=4)
         ttk.Label(form, textvariable=self.kit_out, style="Hint.TLabel",
-                  wraplength=560).grid(row=2, column=1, sticky="w", pady=4)
+                  wraplength=560).grid(row=3, column=1, sticky="w", pady=4)
 
         actions = ttk.Frame(f)
         actions.pack(fill="x")
@@ -326,6 +360,68 @@ class App(tk.Tk):
 
         self.kit_log = self._log_box(f)
         return f
+
+    def _tab_report(self) -> ttk.Frame:
+        f = ttk.Frame(self.nb, padding=14)
+        ttk.Label(f, text="本地运行报告 · 只统计本机操作，不写进容器，不记录口令",
+                  style="Hint.TLabel").pack(anchor="w", pady=(0, 8))
+        self.report_text = scrolledtext.ScrolledText(
+            f, wrap="word", font=("Consolas", 9), state="disabled", height=16)
+        self.report_text.pack(fill="both", expand=True)
+
+        bar = ttk.Frame(f)
+        bar.pack(fill="x", pady=(8, 0))
+        ttk.Button(bar, text="刷新", command=self._refresh_report).pack(side="left")
+        ttk.Button(bar, text="导出 CSV", command=lambda: self._export_report("csv")).pack(
+            side="left", padx=6)
+        ttk.Button(bar, text="导出 Markdown",
+                   command=lambda: self._export_report("md")).pack(side="left")
+        ttk.Button(bar, text="清空记录", command=self._clear_report).pack(side="right")
+        ttk.Label(bar, text="  token 为量级估算，不是真实 LLM 计费",
+                  style="Hint.TLabel").pack(side="left", padx=10)
+        self._refresh_report()
+        return f
+
+    def _refresh_report(self) -> None:
+        self.report_text.configure(state="normal")
+        self.report_text.delete("1.0", "end")
+        summary = self.metrics.summary()
+        self.report_text.insert("end", "汇总\n" + "=" * 56 + "\n")
+        for key, value in summary.items():
+            self.report_text.insert("end", f"  {key:<24} {value}\n")
+        self.report_text.insert("end", "\n明细（只记文件名，不记口令）\n" + "=" * 56 + "\n")
+        if not self.metrics.attempts:
+            self.report_text.insert("end", "  本次会话还没有记录。做一次加固或还原即可。\n")
+        for i, a in enumerate(self.metrics.attempts, 1):
+            self.report_text.insert(
+                "end",
+                f"  {i:>2}. {a.ts}  {a.action:<8} {a.label[:28]:<28} "
+                f"{'成功' if a.ok else '失败'}  层尝试 {a.layers_tried:<3} "
+                f"耗时 {a.seconds:>7.3f}s  估算 {a.est_tokens:,} tokens\n"
+                + (f"      {a.note}\n" if a.note else ""),
+            )
+        self.report_text.configure(state="disabled")
+
+    def _export_report(self, kind: str) -> None:
+        if kind == "csv":
+            path = filedialog.asksaveasfilename(
+                defaultextension=".csv", filetypes=[("CSV 表格", "*.csv")],
+                initialfile="tarpit_report.csv")
+            if path:
+                self.metrics.to_csv(path)
+        else:
+            path = filedialog.asksaveasfilename(
+                defaultextension=".md", filetypes=[("Markdown", "*.md")],
+                initialfile="tarpit_report.md")
+            if path:
+                Path(path).write_text(self.metrics.to_markdown(), encoding="utf-8")
+        if path:
+            self.status.set(f"报告已导出：{path}")
+
+    def _clear_report(self) -> None:
+        self.metrics.attempts.clear()
+        self._refresh_report()
+        self.status.set("本地记录已清空")
 
     def _tab_about(self) -> ttk.Frame:
         f = ttk.Frame(self.nb, padding=16)
@@ -380,6 +476,21 @@ AI 逆向通常先列目录、读 README 和规格文档。勾选加固页的「
 【参数怎么选】
 层数 2~8：越多分支越多，加密和还原都会相应变慢（每层都要派生一次密钥）。
 强度档只影响 Argon2id 的内存与迭代成本，默认「轻」适合秒级交互。
+「投毒侧重」按目标 agent 的习惯换线索组合：先读文档的多给互相矛盾的
+规格，先跑脚本的多给能 import 但常量全错的解析器；不确定就选「均衡」。
+还原页的「并行尝试各层」只对低内存档生效（最多 4 线程），狠档会自动
+退回串行，避免 Argon2 的峰值内存翻倍。
+
+【运行报告】
+「运行报告」页统计本机会话里的加固 / 还原次数、层尝试、耗时与 token
+量级估算，可导出 CSV 或 Markdown。记录只在内存里，不写进容器，不记口令，
+点「导出」才落盘。token 是按每轮固定开销的粗估，不是真实 LLM 计费；
+真实 agent 实测方法见仓库 docs/AGENT_BENCHMARK.md。
+
+【跨平台】
+拖放用 Windows 原生消息；macOS / Linux 上拖放不可用，但「选择文件 /
+选择文件夹」按钮全平台可用，功能一项不少。单个源文件默认上限 256 MiB，
+大程序包可设环境变量 TARPIT_MAX_SOURCE_BYTES 放宽（全部内容会驻留内存）。
 
 【文件格式】
 MAGIC "TPARMOR3" / VERSION 3 / 层数 / 全局盐 / 明文规格草稿 /
@@ -389,7 +500,8 @@ v2 旧容器按同一布局读取，仍可用主口令还原；v1 文件格式�
 
 【命令行自测】
 python selftest.py        验证加固→还原逐字节一致、诱饵与篡改行为
-python probe_agent.py     模拟逆向 agent，对比普通容器与加固容器的尝试轮数
+python probe_agent.py     模拟逆向 agent，三组工具调用轮数对照
+python agent_eval.py --runs 5 --out report.md   多轮取样 + 评估报告
 
 【依赖】
 Python 3.11+ / argon2-cffi / cryptography / tkinter
@@ -513,7 +625,7 @@ pip install argon2-cffi cryptography
         target = Path(raw) if raw and not raw.startswith("（") else None
         if target and target.is_dir():
             try:
-                os.startfile(str(target))  # noqa: S606 - 仅打开本工具生成的目录
+                _open_path(target)
             except Exception as exc:
                 self.log(self.kit_log, f"打开失败：{exc}")
         else:
@@ -528,6 +640,7 @@ pip install argon2-cffi cryptography
             return
         src = Path(raw)
         style = self.kit_style.get() or dk.DEFAULT_STYLE
+        poison = self.poison.get() or dk.DEFAULT_POISON
         layers = self.layers.get()
         container = Path(self.armored.get()) if (
             self.armored.get() and Path(self.armored.get()).is_file()
@@ -536,9 +649,14 @@ pip install argon2-cffi cryptography
         self.kit_root = src.parent / (src.stem + suffix)
 
         def job(progress, emit):
-            emit("log", f"生成伴生诱饵：{src.name} / {style} / {layers} 层")
-            result = dk.build_sidecar(src, armored=container, layers=layers,
-                                      style=style, on_progress=progress)
+            emit("log", f"生成伴生诱饵：{src.name} / {style} / {poison} / {layers} 层")
+            with Stopwatch() as sw:
+                result = dk.build_sidecar(src, armored=container, layers=layers,
+                                          style=style, poison=poison,
+                                          on_progress=progress)
+            emit("record", dict(action="伴生", label=src.name, ok=True,
+                                layers_tried=0, seconds=sw.elapsed,
+                                note=f"{len(result.files)} 份文件 / {result.traps} 组线索 / {poison}"))
             emit("log", f"输出目录：{result.root}")
             for rel in result.files:
                 emit("log", f"  + {rel}")
@@ -596,6 +714,9 @@ pip install argon2-cffi cryptography
                     self.busy = False
                     self.pb.configure(value=self.pb.cget("maximum"))
                     return
+                elif kind == "record":
+                    self.metrics.record(**payload[0])
+                    self._refresh_report()
                 elif kind == "error":
                     self.log(widget, f"失败：{payload[0]}")
                     self.status.set(f"失败：{payload[0]}")
@@ -617,18 +738,32 @@ pip install argon2-cffi cryptography
         layers, profile = self.layers.get(), self.profile.get()
         want_kit = self.sidecar_on.get()
         kit_style = self.kit_style.get()
+        poison = self.poison.get()
         if not src.exists():
             messagebox.showwarning(APP_TITLE, "请先拖入或选择程序包")
             return
         if not pw or pw != pw2:
             messagebox.showwarning(APP_TITLE, "两次口令不一致，或口令为空")
             return
+        strong, hint = ac.check_password_strength(pw)
+        if not strong and not messagebox.askyesno(
+            APP_TITLE, f"口令偏弱：{hint}\n\n弱口令会让加固形同虚设，仍要继续吗？"
+        ):
+            return
+        if out.exists() and not messagebox.askyesno(
+            APP_TITLE, f"输出文件已存在，确定覆盖吗？\n\n{out}"
+        ):
+            return
 
         def job(progress, emit):
-            emit("log", f"开始加固：{src.name} / {layers} 层 / {profile}")
-            blob = ac.build_armored(src, pw.encode("utf-8"), layers=layers,
-                                    profile=profile, on_progress=progress)
-            out.write_bytes(blob)
+            emit("log", f"开始加固：{src.name} / {layers} 层 / {profile} / {poison}")
+            with Stopwatch() as sw:
+                blob = ac.build_armored(src, pw.encode("utf-8"), layers=layers,
+                                        profile=profile, on_progress=progress)
+                out.write_bytes(blob)
+            emit("record", dict(action="加固", label=out.name, ok=True,
+                                layers_tried=layers, seconds=sw.elapsed,
+                                note=f"{profile} / {len(blob):,} 字节 / {poison}"))
             info = ac.inspect_armored(blob)
             emit("log", f"已写出：{out}")
             emit("log", f"容器 {len(blob):,} 字节 / {info.layers} 层 / "
@@ -638,7 +773,8 @@ pip install argon2-cffi cryptography
                 try:
                     import decoy_kit as dk
                     kit = dk.build_sidecar(src, armored=out, layers=layers,
-                                           style=kit_style, on_progress=progress)
+                                           style=kit_style, poison=poison,
+                                           on_progress=progress)
                     emit("log", f"伴生诱饵：{kit.root}")
                     emit("log", f"  {len(kit.files)} 份拟态文件 / "
                                 f"{kit.traps} 组互相矛盾的字段线索")
@@ -655,18 +791,39 @@ pip install argon2-cffi cryptography
         src = Path(self.armored.get())
         out = Path(self.out_dir.get())
         pw = self.dec_pw.get()
+        parallel = self.parallel.get()
         if not src.is_file():
             messagebox.showwarning(APP_TITLE, "请先拖入或选择 .armored 容器")
             return
         if not pw:
             messagebox.showwarning(APP_TITLE, "请输入口令")
             return
+        if out.is_dir() and any(out.iterdir()) and not messagebox.askyesno(
+            APP_TITLE, f"输出目录已有文件，同名文件会被覆盖，继续吗？\n\n{out}"
+        ):
+            return
 
         def job(progress, emit):
-            emit("log", "开始还原……")
-            result = ac.restore_armored(src.read_bytes(), pw.encode("utf-8"),
-                                        on_progress=progress)
-            written = ac.safe_extract(result.payload, out)
+            seen = [0]
+
+            def track(done, total, msg):
+                seen[0] = max(seen[0], total)
+                progress(done, total, msg)
+
+            emit("log", "开始还原……" + ("（并行）" if parallel else ""))
+            with Stopwatch() as sw:
+                try:
+                    result = ac.restore_armored(src.read_bytes(), pw.encode("utf-8"),
+                                                on_progress=track, parallel=parallel)
+                except ac.ArmorError:
+                    emit("record", dict(action="还原", label=src.name, ok=False,
+                                        layers_tried=seen[0], seconds=sw.elapsed,
+                                        note="口令未解开任何层（错误口令同样计入成本）"))
+                    raise
+                written = ac.safe_extract(result.payload, out)
+            emit("record", dict(action="还原", label=src.name, ok=True,
+                                layers_tried=seen[0], seconds=sw.elapsed,
+                                note=f"写出 {len(written)} 个文件"))
             emit("log", f"内容 SHA-256：{result.sha256}")
             emit("log", f"条目 {result.file_count} 个，已写出 {len(written)} 个文件")
             emit("log", f"输出目录：{out}")

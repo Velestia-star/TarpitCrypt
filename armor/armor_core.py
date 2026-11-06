@@ -45,11 +45,13 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import random
 import re
 import secrets
 import struct
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Callable
@@ -64,9 +66,14 @@ except ModuleNotFoundError:  # pragma: no cover - 仅仓库布局触发
     _sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from tarpitcrypt import CIPHER_AESGCM, _aead_decrypt, _aead_encrypt, _derive
 
+#: 整个工具集的发布版本；容器格式版本另见 VERSION。
+__version__ = "0.3.0"
+
 __all__ = [
+    "__version__",
     "PROFILES",
     "MAGIC",
+    "check_password_strength",
     "VERSION",
     "LEGACY_MAGIC",
     "LEGACY_VERSION",
@@ -94,7 +101,9 @@ MAX_LAYERS = 8
 SALT_LEN = 16
 NONCE_LEN = 12
 DIGEST_LEN = 32
-MAX_SINGLE_FILE = 256 * 1024 * 1024
+#: 单个源文件上限。默认 256 MiB；大程序包可设 TARPIT_MAX_SOURCE_BYTES 放宽，
+#: 代价是加固时整份内容会驻留内存（各层还要按它对齐尺寸）。
+MAX_SINGLE_FILE = int(os.environ.get("TARPIT_MAX_SOURCE_BYTES", 256 * 1024 * 1024))
 
 _U32 = struct.Struct(">I")
 _U64 = struct.Struct(">Q")
@@ -148,6 +157,29 @@ def sha256_bytes(data: bytes) -> str:
 def _notify(on_progress: Progress | None, done: int, total: int, msg: str) -> None:
     if on_progress is not None:
         on_progress(done, total, msg)
+
+
+def check_password_strength(password: str) -> tuple[bool, str]:
+    """给 GUI 用的最低强度体检，返回 (是否合格, 提示)。
+
+    只做本地静态检查，不联网、不记录口令。判定刻意保守：长度与字符种类
+    只是必要条件，不代表口令真的高熵；提示里也如实说明这一点。
+    """
+    if not password:
+        return False, "口令不能为空"
+    if len(password) < 8:
+        return False, "至少 8 个字符"
+    classes = sum((
+        any(c.islower() for c in password),
+        any(c.isupper() for c in password),
+        any(c.isdigit() for c in password),
+        any(not c.isalnum() for c in password),
+    ))
+    if classes < 2:
+        return False, "建议混用大小写、数字或符号中的至少两类"
+    if password.lower() in {"password", "12345678", "qwertyui", "admin123"}:
+        return False, "这是常见弱口令，换一个"
+    return True, "长度与字符种类达标（不等于高熵，长口令更可靠）"
 
 
 def _rng(seed: bytes, label: str, index: int = 0) -> random.Random:
@@ -687,10 +719,8 @@ def _parse(blob: bytes) -> tuple[bytes, list[tuple[bytes, bytes, int, tuple[int,
         start = pos
         mem, time, para, rounds = _LAYER_META.unpack_from(blob, pos)
         pos += _LAYER_META.size
-        l_salt = blob[pos : pos + SALT_LEN]
-        pos += SALT_LEN
-        nonce = blob[pos : pos + NONCE_LEN]
-        pos += NONCE_LEN
+        # 盐与 nonce 只作为 prefix 的一部分交给上层，解析阶段不需要单独取值。
+        pos += SALT_LEN + NONCE_LEN
         ct_len = _U64.unpack_from(blob, pos)[0]
         pos += _U64.size
         if not (8 * 1024 <= mem <= 2 * 1024 * 1024 and 1 <= time <= 10
@@ -729,26 +759,35 @@ def read_note(blob: bytes) -> bytes:
 
 
 def restore_armored(
-    blob: bytes, password: bytes, on_progress: Progress | None = None
+    blob: bytes,
+    password: bytes,
+    on_progress: Progress | None = None,
+    *,
+    parallel: bool = False,
 ) -> RestoreResult:
     """用口令逐层尝试，返回第一个解开的内容。
 
     刻意不返回层号、不标注真伪：任何「这层是诱饵」的提示都会让逆向 agent
     少跑好几轮验证。合法用户凭主口令只会解开真层。
+
+    *parallel* 打开时并行派生各层密钥（Argon2 会释放 GIL）。为免 Argon2
+    的内存硬特性把机器撑爆，只在低内存档且层数 >1 时生效，并发上限 4；
+    否则自动退回串行。无论哪种路径，结果都按层顺序取第一个成功的。
     """
     if not password:
         raise ArmorError("口令不能为空")
     header, parsed = _parse(bytes(blob))
-    for i, (prefix, ct, offset, kdf) in enumerate(parsed, 1):
-        _notify(on_progress, i - 1, len(parsed), f"尝试层 {i}/{len(parsed)}")
+
+    def attempt(item) -> bytes | None:
+        prefix, ct, offset, kdf = item
         mem, time, para, rounds = kdf
         l_salt = prefix[_LAYER_META.size : _LAYER_META.size + SALT_LEN]
         nonce = prefix[_LAYER_META.size + SALT_LEN : _LAYER_META.size + SALT_LEN + NONCE_LEN]
         key = _layer_key(password, l_salt, mem, time, para, rounds)
         aad = header + prefix + _U32.pack(offset)
-        payload = _aead_decrypt(CIPHER_AESGCM, key, nonce, aad, ct)
-        if payload is None:
-            continue
+        return _aead_decrypt(CIPHER_AESGCM, key, nonce, aad, ct)
+
+    def finish(payload: bytes) -> RestoreResult:
         try:
             with zipfile.ZipFile(io.BytesIO(payload)) as zf:
                 entries = tuple(n for n in zf.namelist()
@@ -762,6 +801,35 @@ def restore_armored(
             file_count=len(entries),
             entries=entries,
         )
+
+    # 内存硬 KDF 并行会把峰值内存乘以并发数，狠档一律走串行。
+    heavy = any(kdf[0] > 65536 for *_x, kdf in parsed)
+    want_parallel = parallel and len(parsed) > 1 and not heavy
+    if want_parallel:
+        found: dict[int, bytes] = {}
+        workers = min(4, len(parsed))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(attempt, item): idx
+                for idx, item in enumerate(parsed)
+            }
+            done = 0
+            for fut in as_completed(futures):
+                done += 1
+                _notify(on_progress, done, len(parsed),
+                        f"并行尝试层 {done}/{len(parsed)}")
+                result = fut.result()
+                if result is not None:
+                    found[futures[fut]] = result
+        if found:
+            return finish(found[min(found)])
+        raise ArmorError("口令无法解开任何层")
+
+    for i, item in enumerate(parsed, 1):
+        _notify(on_progress, i - 1, len(parsed), f"尝试层 {i}/{len(parsed)}")
+        payload = attempt(item)
+        if payload is not None:
+            return finish(payload)
     raise ArmorError("口令无法解开任何层")
 
 

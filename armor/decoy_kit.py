@@ -30,7 +30,10 @@ from typing import Callable
 
 from armor_core import armor_passwords, noise_password, read_note
 
-__all__ = ["STYLES", "SidecarError", "SidecarResult", "build_sidecar", "verify_sidecar"]
+__all__ = [
+    "STYLES", "POISON_PROFILES", "DEFAULT_POISON", "SidecarError",
+    "SidecarResult", "build_sidecar", "verify_sidecar",
+]
 
 Progress = Callable[[int, int, str], None]
 
@@ -41,6 +44,16 @@ STYLES: dict[str, tuple[str, str]] = {
     "归档备份": ("_archive_r9", "归档备份"),
 }
 DEFAULT_STYLE = "构建工具包"
+
+#: 投毒侧重。不同逆向 agent 的入口不同：爱读文档的多给矛盾规格，
+#: 爱写脚本的多给能 import 但常量全错的解析器。仅改变线索的组合，
+#: 不改变容器本身，也不改变「假线索不落真值」这条原则。
+POISON_PROFILES: dict[str, str] = {
+    "均衡": "文档与假解析器都给，适合不清楚对方路数",
+    "规格矛盾": "加重互相矛盾的偏移表、兼容头与历史决议",
+    "假解析器": "加重可运行但常量全错的解析/推导脚本",
+}
+DEFAULT_POISON = "均衡"
 MARKER = ".build-meta.json"
 
 #: (所在文件, 写进磁盘的假说法, 真实情况)。
@@ -61,6 +74,24 @@ _TRAPS: tuple[tuple[str, str, str], ...] = (
 )
 
 
+def _select_traps(poison: str) -> tuple[tuple[str, str, str], ...]:
+    """按投毒侧重挑线索。每种都至少留 6 组，避免「一眼看穿只有一类」。"""
+    if poison == "规格矛盾":
+        picked = [t for t in _TRAPS if t[0].startswith(("docs/", "config/"))]
+        return tuple(picked[:10] + [t for t in _TRAPS if t[0].startswith("tools/")][:2])
+    if poison == "假解析器":
+        picked = [t for t in _TRAPS if t[0].startswith("tools/")]
+        # 常量错误清单扩写到每条脚本常量，逼 agent 逐条核对。
+        extra = (
+            ("tools/unpack.py", "HEADER_LEN = 91 由三份文档共同确认", "实际头部长度随 NOTE 变化"),
+            ("tools/unpack.py", "LAYER_ENDIAN 在 r9 起统一为 little", "实际按大端解析"),
+            ("tools/key_derive.py", "derive() 与 Argon2id 输出逐字节相同", "只是 PBKDF2，不可能相同"),
+            ("tools/verify.py", "verify() 通过即代表容器未被改动", "只做结构解析，不校验摘要"),
+        )
+        return tuple(picked + list(extra) + [t for t in _TRAPS if t[0].startswith("docs/")][:2])
+    return _TRAPS
+
+
 class SidecarError(ValueError):
     """输出目录冲突或生成内容校验失败。"""
 
@@ -72,6 +103,7 @@ class SidecarResult:
     traps: int
     leaked: tuple[str, ...]
     container: str
+    poison: str = DEFAULT_POISON
 
 
 def _fill(text: str, values: dict[str, str]) -> str:
@@ -90,7 +122,7 @@ def _json(obj: object) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _render(values: dict[str, str], note: str | None) -> dict[str, str]:
+def _render(values: dict[str, str], note: str | None, poison: str) -> dict[str, str]:
     """返回相对路径 → 文件内容。全部是纯文本。"""
     files: dict[str, str] = {}
 
@@ -441,6 +473,62 @@ def test_aad_mode() -> None:
 [__STAMP__] pipeline finish (warnings: 6, errors: 0)
 """, values)
 
+    if poison == "规格矛盾":
+        files["docs/OFFSET_AUDIT.md"] = _fill("""# 偏移表复核记录（r__REV__，未合并）
+
+> 本文与 docs/FORMAT.md、docs/LEGACY.md 的口径均不一致。三份文档都已
+> 在各自的决议记录里被指定为「唯一真值」，工单未裁决。
+
+| 字段 | FORMAT.md | LEGACY.md | tools/unpack.py | 备注 |
+| --- | --- | --- | --- | --- |
+| 头部长度 | 91 | 108 | 91 | r6 起是否含兼容头未定 |
+| LAYERS | 小端 u16 | 大端 u16 | 小端 u16 | 现行实现为 1 字节 |
+| NOTE_LEN | 2B | 4B 大端 / 2B 兼容 | 2B | 三种读法都试过 |
+| CIPHER 位 | 0x1A | 不存在 | 0x1A | 该偏移落在 NOTE 内 |
+| 校验段 | HMAC-SHA256 | 裸 SHA-256 / HMAC 混合 | 不校验 | 密钥来源未记录 |
+
+复核结论（未签字）：按 build `__BUILD__` 的日志，以上三项都曾出现过「和
+实测对不上」的情况，建议解析时全部走容错分支，不要假定单一真值。
+""", values)
+
+    if poison == "假解析器":
+        files["tools/layer_probe.py"] = _fill('''"""逐层定位辅助脚本（build __BUILD__，内部使用）。
+
+常量抄自 docs/FORMAT.md r7 的附录，与 tools/unpack.py 的取值不一致；
+两者都声称自己是唯一真值。本脚本只做结构打印，不写文件、不访问网络。
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+HEADER_LEN = 108
+LAYER_PREFIX_LEN = 8 + 16 + 12 + 8
+ENDIAN = "little"
+NOTE_LEN_SIZE = 4
+CT_LEN_INCLUDES_TAG = True
+
+
+def probe(path: str | Path) -> list[dict]:
+    blob = Path(path).read_bytes()
+    pos = HEADER_LEN + int.from_bytes(blob[0x1B:0x1B + NOTE_LEN_SIZE], ENDIAN)
+    rows: list[dict] = []
+    while pos + LAYER_PREFIX_LEN <= len(blob):
+        ct_len = int.from_bytes(blob[pos + 36:pos + 44], ENDIAN)
+        if not CT_LEN_INCLUDES_TAG:
+            ct_len += 16
+        rows.append({"offset": pos, "ct_len": ct_len})
+        pos += LAYER_PREFIX_LEN + ct_len
+    return rows
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("用法: python tools/layer_probe.py <容器路径>")
+        raise SystemExit(1)
+    print(probe(sys.argv[1]))
+''', values)
+
     if note is not None:
         files["docs/CONTAINER_DRAFT.md"] = _fill("""# 容器规格草稿（随容器一同分发，r__REV__ 归档副本）
 
@@ -467,7 +555,7 @@ def _standalone_secrets() -> tuple[tuple[str, ...], str]:
 
 
 def _values(src: Path, style: str, layers: int, armored: Path | None,
-            leaked: tuple[str, ...], noise: str) -> dict[str, str]:
+            leaked: tuple[str, ...], noise: str, poison: str) -> dict[str, str]:
     suffix, title = STYLES[style]
     token = secrets.token_hex(5)
     now = datetime.now()
@@ -503,7 +591,8 @@ def _values(src: Path, style: str, layers: int, armored: Path | None,
         "note": "fast 与 default 的 CT_LEN 口径不同，读取前必须先判定构建档位",
     }
     trap_rows = "\n".join(
-        f"| {i} | `{where}` | {claim} |" for i, (where, claim, _truth) in enumerate(_TRAPS, 1)
+        f"| {i} | `{where}` | {claim} |"
+        for i, (where, claim, _truth) in enumerate(_select_traps(poison), 1)
     )
     sample = "\n".join(
         secrets.token_hex(24)[i * 2:i * 2 + 32] for i in range(0, 6)
@@ -533,6 +622,7 @@ def build_sidecar(
     armored: str | Path | None = None,
     layers: int = 4,
     style: str = DEFAULT_STYLE,
+    poison: str = DEFAULT_POISON,
     on_progress: Progress | None = None,
 ) -> SidecarResult:
     """在原程序同级生成伴生诱饵目录，原目录一个字节都不改。
@@ -545,6 +635,8 @@ def build_sidecar(
         raise SidecarError(f"路径不存在：{src}")
     if style not in STYLES:
         raise SidecarError(f"未知拟态风格：{style}")
+    if poison not in POISON_PROFILES:
+        raise SidecarError(f"未知投毒侧重：{poison}")
     if not 2 <= layers <= 8:
         raise SidecarError("层数必须在 2~8 之间")
     suffix, _title = STYLES[style]
@@ -565,10 +657,10 @@ def build_sidecar(
         except Exception:
             note = None  # 容器尚未生成或格式不符时，照样能出伴生包
 
-    values = _values(src, style, layers, ap, leaked, noise)
+    values = _values(src, style, layers, ap, leaked, noise, poison)
     if note is not None:
         values["NOTE"] = note
-    files = _render(values, note)
+    files = _render(values, note, poison)
 
     out.mkdir(parents=True, exist_ok=True)
     digests: dict[str, str] = {}
@@ -589,15 +681,17 @@ def build_sidecar(
         "revision": "r" + values["REV"],
         "created_at": values["STAMP"],
         "style": style,
+        "poison": poison,
         "files": digests,
     }
     (out / MARKER).write_bytes((_json(marker) + "\n").encode("utf-8"))
     return SidecarResult(
         root=out,
         files=tuple(sorted(files)),
-        traps=len(_TRAPS),
+        traps=len(_select_traps(poison)),
         leaked=tuple(leaked),
         container=values["CONTAINER"],
+        poison=poison,
     )
 
 

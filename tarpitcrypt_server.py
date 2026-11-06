@@ -27,8 +27,6 @@ from __future__ import annotations
 import argparse
 import io
 import json
-import mimetypes
-import os
 import sys
 import threading
 import time
