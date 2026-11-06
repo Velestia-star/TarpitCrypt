@@ -46,6 +46,26 @@ def make_package(root: Path) -> Path:
     return src
 
 
+def test_content_probe_regression() -> None:
+    """内容层陷阱端到端：模拟具备 5 个盲区行为的 AI 逆向 agent 打三种诱饵包，
+    必须全部 TRAPPED，且安全不变量（无真实主机泄露）成立。"""
+    import content_probe as cp  # 局部导入，避免循环依赖
+
+    for poison in ("IOC蜜罐", "RAG投毒", "均衡"):
+        with tempfile.TemporaryDirectory() as td:
+            src = make_package(Path(td))
+            out = Path(td) / "sidecar"
+            dk.build_sidecar(src, out_dir=out, layers=4, poison=poison)
+            r = cp.probe_package(out, budget=140)
+            check(f"内容层[{poison}] 安全不变量（无真实主机泄露）",
+                  r["safety_ok"], str(r["leaks"]))
+            check(f"内容层[{poison}] AI agent 被 TRAPPED",
+                  r["verdict"] == "TRAPPED", r["verdict"])
+            check(f"内容层[{poison}] 注入被 typical agent 跟随",
+                  r["typical"]["followed_injection"] or poison == "IOC蜜罐",
+                  str(r["typical"]))
+
+
 def manifest_of(payload: bytes) -> dict:
     """取出载荷里的工具清单（按条目标记，不按文件名）。"""
     with zipfile.ZipFile(io.BytesIO(payload)) as zf:
@@ -516,6 +536,8 @@ def main() -> int:
         check("报告 Markdown 含汇总且不含真实口令",
               "## 汇总" in md and "## 明细" in md
               and "correct-horse-9" not in md and "wrong-pass" not in md)
+
+    test_content_probe_regression()
 
     print(f"\n通过 {len(PASS)} / 失败 {len(FAIL)} / 合计 {len(PASS) + len(FAIL)}")
     if FAIL:
