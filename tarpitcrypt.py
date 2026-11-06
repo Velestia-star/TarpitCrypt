@@ -13,10 +13,15 @@
    ``XChaCha20-Poly1305`` 或 ``AES-256-GCM``，AAD 覆盖密文之前的全部文件头。
 2. **PoW 不是破解成本的主体**。``POW_NONCE`` 明文存放在文件里，验证方只需一次
    SHA-256 就能确认；破解者每个候选口令仍然只多花一次哈希。PoW 的真实作用是
-   「造文件税」——让批量生成文件变贵，并为错误口令提供一条极廉价的快速拒绝
-   路径。真正的「焦油」是 ``memory_cost × time_cost × rounds``（有诱饵层时再 ×2）。
-3. keyfile 通过 Argon2id 的 ``secret``（pepper）参数混入；**缺 keyfile 的尝试
-   同样要跑完整 Argon2 才会失败**，不产生时间侧信道。
+   「造文件税」——让批量生成文件变贵。它的校验位于 ``_derive`` 之后，因此
+   **并不能为错误口令提供提前返回**：Argon2 的成本已经付掉了，省下的只是一次
+   AEAD。真正的「焦油」是 ``memory_cost × time_cost × rounds``。有诱饵层时，
+   本工具自带的 ``decrypt`` 会尝试两次派生，但这不构成攻击者的固定成本——
+   攻击者只攻主层即可判定失败，详见 README「什么情况下不安全」。
+3. keyfile 不是 Argon2id 的独立 ``secret`` / pepper 参数。``hash_secret_raw``
+   只有单一输入，实现先用 **HKDF-SHA256** 把口令与 keyfile 摘要合成为
+   ``_kdf_input``，再整体喂给 Argon2id；**缺 keyfile 的尝试同样要跑完整
+   Argon2 才会失败**，不产生时间侧信道。
 
 禁止事项
 --------
@@ -1028,7 +1033,16 @@ def _run(args: argparse.Namespace) -> int:
         logging.basicConfig(level=logging.DEBUG, format="%(levelname)s %(message)s")
 
     if args.command == "keygen":
-        Path(args.output).write_bytes(secrets.token_bytes(KEYFILE_HINT_LEN))
+        # 独占创建：写第二遍就静默覆盖旧 keyfile，等于亲手弄丢数据。
+        try:
+            fd = os.open(args.output, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError as exc:
+            raise UsageError(
+                f"keyfile 已存在，拒绝覆盖：{args.output}\n"
+                f"请换一个路径，或确认旧文件已离线备份后手动删除。"
+            ) from exc
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(secrets.token_bytes(KEYFILE_HINT_LEN))
         _safe_chmod(args.output)
         print(f"已生成 keyfile：{args.output}（{KEYFILE_HINT_LEN} 字节）。请离线备份，丢失即无法解密。")
         return EXIT_OK

@@ -1,4 +1,6 @@
-# TarpitCrypt Armor · 反 AI 逆向加固工具（v3）
+# TarpitCrypt Armor · 反 AI 逆向加固工具
+
+> 发布版本 **v0.3.0** · 容器格式 **v3** · 详见仓库根 [CHANGELOG.md](../CHANGELOG.md)
 
 把一个程序包拖进窗口，就能给它套上「让 AI 逆向 agent 反复做无用功」的外壳。
 
@@ -7,10 +9,13 @@
 ## 三步上手
 
 1. 双击 `启动.bat`（或 `py -3 armor_gui.py`）。
-2. 把程序包（单个文件或整个文件夹）拖进窗口 → 填主口令、选层数和强度 → 点「开始加固」。
+2. 把程序包（单个文件或整个文件夹）拖进窗口 → 填主口令、选层数 / 强度 / 投毒侧重 → 点「开始加固」。
 3. 同级目录得到 `原名.armored` 容器和一组伴生诱饵文件。要取回原件，切到「还原」页把容器拖进来、输主口令即可**逐字节还原**。
 
 拖 `.armored` 会自动跳到还原页。原程序一个字节都不改，也不做 exe 加壳。
+macOS / Linux 没有原生拖放，但「选择文件 / 选择文件夹」按钮全平台可用。
+
+界面共 5 个页签：**加固 / 还原 / 伴生诱饵 / 运行报告 / 说明**。
 
 ## v3 修了什么：开源项目不能靠「藏答案」
 
@@ -26,6 +31,28 @@ v3 把不确定性从「源码保密」移到「每次生成都不同」：
 
 二进制布局与 v2 完全相同，只是 `MAGIC=b"TPARMOR3"` / `VERSION=3`；**v2 旧容器按同一布局读取，仍可用主口令还原**。v1 文件格式一个字节没改。
 
+## v0.3.0 新增
+
+### 效果可证明、可配置（A 级）
+
+- **运行报告页**：统计本机会话里的错误口令次数、层尝试、耗时与 token 量级估算，可导出 CSV / Markdown。数据只在内存，**不写进容器、不记口令**，点导出才落盘。token 是粗估，不是真实 LLM 计费。
+- **`agent_eval.py`**：多轮取样，输出中位数与区间的 Markdown 报告，避免把口令随机波动当成效果。
+- **`probe_agent.py`**：基线 / 盲 agent / 读源码 agent 三组对照，关键判据是「能否确定性定位真层」。
+- **投毒侧重**：`均衡` / `规格矛盾` / `假解析器`。前者针对爱读文档的 agent 加重互相矛盾的偏移表，后者针对爱写脚本的 agent 加重能 import 但常量全错的解析器。
+- **真实 agent 实测**仍是待办：协议与记录表在 [`docs/AGENT_BENCHMARK.md`](../docs/AGENT_BENCHMARK.md)，拿到实测数据后应替换掉这里的模拟下界。
+
+### 工程化（B 级）
+
+仓库根新增 CI（3 系统 × Python 3.11/3.12/3.13）、`tests/fixtures/` 四份 v1 固定格式向量、`SECURITY.md`、`CONTRIBUTING.md`、`ruff.toml`、CHANGELOG 与作者段。详见根目录 README。
+
+### 易用与分发（C 级）
+
+- 跨平台选择文件 / 文件夹、跨平台打开输出目录；
+- 口令强度体检（弱口令二次确认，不强制拒绝）、输出覆盖二次确认；
+- 低内存档可并行尝试各层（最多 4 线程，狠档自动退回串行，避免 Argon2 峰值内存翻倍）；
+- 单个源文件上限默认 256 MiB，可用 `TARPIT_MAX_SOURCE_BYTES` 调整；
+- `打包exe.bat` + `build_exe.py`：用 PyInstaller 出免装 Python 的 exe。
+
 ## 两种污染形式
 
 ### 1. 多层不可区分容器
@@ -40,8 +67,8 @@ N 层结构完全一致、顺序打乱。诱饵包有 README、配置、源码�
 
 AI 逆向通常先列目录、读 README 和规格文档。伴生模式在原程序**同级**生成一组拟态的内部构建资料（原目录零改动）：
 
-- `docs/FORMAT.md`、`docs/LEGACY.md`、`docs/DECISIONS.md` —— 三份互相矛盾的规格，且互相指定「以对方为准」，形成循环引用，共 12 组矛盾线索；
-- `tools/unpack.py`、`tools/key_derive.py`、`tools/verify.py` —— 可 import、可运行、语法完整，但常量全是错的，对真容器必定解析失败；
+- `docs/FORMAT.md`、`docs/LEGACY.md`、`docs/DECISIONS.md` —— 三份互相矛盾的规格，且互相指定「以对方为准」，形成循环引用；「规格矛盾」侧重会再加一份偏移审计表；
+- `tools/unpack.py`、`tools/key_derive.py`、`tools/verify.py` —— 可 import、可运行、语法完整，但常量全是错的，对真容器必定解析失败；「假解析器」侧重会再加一份逐层探测脚本；
 - `config/passwords.json` —— 口令池；绑定容器时直接抄本容器草稿（其中几条能解开诱饵层，于是 agent 会误判自己得手），单独生成时则用一次性假口令；
 - 假的层映射、构建档位、构建日志、样本，以及一条注定失败的布局断言测试。
 
@@ -51,14 +78,17 @@ AI 逆向通常先列目录、读 README 和规格文档。伴生模式在原程
 
 | 文件 | 作用 |
 | --- | --- |
-| `armor_gui.py` | tkinter 界面；Windows 原生 `WM_DROPFILES` 拖放，无第三方拖放库 |
-| `armor_core.py` | v3 容器：随机口令、死层、去模板化诱饵、层尺寸对齐、安全解包；兼容读取 v2 |
-| `decoy_kit.py` | 伴生诱饵包生成器与清单校验 |
-| `selftest.py` | 44 项端到端自测，含「读源码 agent 无法定位真层」回归与 v2 兼容用例 |
+| `armor_gui.py` | tkinter 界面（5 页签）；Windows 原生 `WM_DROPFILES` 拖放，无第三方拖放库 |
+| `armor_core.py` | v3 容器：随机口令、死层、去模板化诱饵、层尺寸对齐、并行还原、安全解包；兼容读取 v2 |
+| `decoy_kit.py` | 伴生诱饵包生成器、三种投毒侧重与清单校验 |
+| `armor_metrics.py` | 本地运行报告（内存态、CSV / Markdown 导出、token 量级估算） |
+| `selftest.py` | **62 项**端到端自测，含 S 级回归、v2 兼容、并行还原、口令体检、投毒策略与报告 |
 | `probe_agent.py` | 三组模拟逆向 agent（基线 / 盲 / 读源码）轮数与剪枝对照 |
-| `启动.bat` / `运行自测.bat` | Windows 双击入口（GBK 编码） |
+| `agent_eval.py` | 多轮取样评估报告（Markdown，含 token 估算与局限声明） |
+| `build_exe.py` | PyInstaller 打包脚本（可选） |
+| `启动.bat` / `运行自测.bat` / `打包exe.bat` | Windows 双击入口（**GBK 编码，勿转 UTF-8**） |
 
-`tarpitcrypt.py` 是仓库根目录里 v1 的模块，本工具直接复用它的 Argon2id 与 AES-256-GCM 原语，不复制、不修改。`armor_core.py` 同时兼容「与 v1 同目录」和「位于 `armor/` 子目录」两种布局。
+根目录 `tarpitcrypt.py` 是 v1 模块，本工具直接复用它的 Argon2id 与 AES-256-GCM 原语，不复制、不修改。`armor_core.py` 同时兼容「与 v1 同目录」和「位于 `armor/` 子目录」两种布局。
 
 ## 容器格式 v3（全部大端）
 
@@ -76,13 +106,15 @@ TAIL    SHA256(HEADER + 全部 LAYER)(32)
 
 | 项目 | 结果 |
 | --- | --- |
-| `selftest.py` | **44/44 通过**（逐字节往返、口令跨容器不复用、死层存在、知情 agent 无法定位真层、层尺寸对齐、诱饵去模板化、v2 旧容器可还原、篡改/Zip Slip 拒绝、伴生完整性等） |
-| `probe_agent.py` | 基线 **3 轮**拿到真包；盲 agent 约 **30~34 轮**解开 1 份诱饵且无从确证（10~11×）；读源码 agent 轮数基本持平（±2 轮的搜索顺序抖动），**排除法剩 3 层，无法定位真层** |
+| 根目录 `pytest` | **82 passed**（42 项 v1 单元 + Web 入口 + 21 项固定格式兼容 + 4 项 keygen 保护 + 1 项浏览器 ↔ Python 双向互解） |
+| `selftest.py` | **62/62 通过**（逐字节往返、口令跨容器不复用、死层、知情 agent 无法定位真层、层尺寸对齐、v2 兼容、并行还原、投毒策略、报告导出、篡改 / Zip Slip 拒绝等） |
+| `probe_agent.py` | 基线 **3 轮**拿到真包；盲 agent 约 **30~34 轮**解开 1 份诱饵且无从确证（10~11×）；读源码 agent 轮数基本持平（±2 轮搜索顺序抖动），**排除法剩 3 层，无法定位真层** |
 | 历史对照 | v2 时期同样的知情 agent 算法 21 轮即确定性锁定真层 |
 | 层尺寸 | 极差约 50 B / 最大约 2 KB（约 2.5%），真层不是唯一最小层 |
-| GUI | 原生拖放挂载成功；拖入分派、异步加固、伴生生成、风格切换实测无异常 |
+| GUI | 原生拖放挂载成功；5 页签无头全流程（异步加固 / 伴生 / 并行还原 / 错误口令 / 报告页）实测无异常 |
+| CI | 3 系统 × Python 3.11 / 3.12 / 3.13，跑 pytest + selftest + 模拟逆向冒烟 |
 
-口令数量与层分布每次随机，轮数会在上表区间内浮动，别当成固定承诺。轮数也只是下界：草稿里互相矛盾的字段会诱使真实 agent 额外写解析脚本反复核对。**关键指标不是轮数，是确定性**：v2 里读源码能拿到「解开即真包」的判据，v3 里知情 agent 多跑几十轮仍剩 3 层无法排除，始终无法确证自己找对了没有。
+口令数量与层分布每次随机，轮数会在上表区间内浮动，别当成固定承诺。轮数也只是**模拟下界**：草稿里互相矛盾的字段会诱使真实 agent 额外写解析脚本反复核对；真实 token 消耗尚未实测，方法与记录表见 `docs/AGENT_BENCHMARK.md`。**关键指标不是轮数，是确定性**：v2 里读源码能拿到「解开即真包」的判据，v3 里知情 agent 多跑几十轮仍剩 3 层无法排除。
 
 ## 边界
 
@@ -92,10 +124,11 @@ TAIL    SHA256(HEADER + 全部 LAYER)(32)
 
 Python 3.11+、`argon2-cffi`、`cryptography`、`tkinter`（标准库）。
 
-```
+```bash
 pip install argon2-cffi cryptography
 py -3 selftest.py
 py -3 probe_agent.py
+py -3 agent_eval.py --runs 5 --out report.md
 ```
 
 `cryptography 50.x` 没有 `XChaCha20Poly1305`，容器统一走 AES-256-GCM，与 v1 的降级逻辑一致。

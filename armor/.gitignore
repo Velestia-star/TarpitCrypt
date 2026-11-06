@@ -3,3 +3,12 @@
 *_build_kit/
 *_internal_docs/
 *_archive_r9/
+
+# 打包与报告产物
+build/
+dist/
+*.spec
+__pycache__/
+tarpit_report.csv
+tarpit_report.md
+report.md

@@ -1,0 +1,7 @@
+# 批处理是 GBK 编码，交给 Git 按字节保存，别做行尾/编码转换
+*.bat -text
+
+# 固定格式向量是二进制样本，任何行尾转换都会让解密失败
+*.bin -text
+*.tarpit -text
+*.armored -text

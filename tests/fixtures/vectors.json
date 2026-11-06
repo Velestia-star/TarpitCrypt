@@ -1,0 +1,47 @@
+{
+  "schema": 1,
+  "format_version": 1,
+  "generator": "tests/generate_vectors.py",
+  "warning": "固定样本，只做解密回归；重跑会改变字节，非格式升级请勿重跑",
+  "vectors": {
+    "v1_basic": {
+      "file": "v1_basic.bin",
+      "sha256": "e00a7945ce3b4d534f219fa65c987504730e569e2c59a267c2f4e5cbf316db45",
+      "size": 151,
+      "password": "vector-main-basic",
+      "expected_plaintext_hex": "546172706974437279707420763120636f6d7061746962696c69747920766563746f72202d2062617369630a",
+      "is_decoy": false,
+      "note": "最普通的一层密文，无 keyfile / 无诱饵 / 无 PoW"
+    },
+    "v1_keyfile": {
+      "file": "v1_keyfile.bin",
+      "sha256": "df5ca604cd076e1372f639ff6bef681fff1f246a7cd71b81c9fb27e69c93fd93",
+      "size": 153,
+      "password": "vector-main-keyfile",
+      "expected_plaintext_hex": "546172706974437279707420763120636f6d7061746962696c69747920766563746f72202d206b657966696c650a",
+      "is_decoy": false,
+      "note": "带 keyfile，验证 _kdf_input 的 HKDF 合成路径没漂移",
+      "keyfile_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f"
+    },
+    "v1_decoy": {
+      "file": "v1_decoy.bin",
+      "sha256": "256c83e1a4809aacea72b322b6a4b30eaeb11b6fdfeaa508c7ec18818ae5fb4f",
+      "size": 228,
+      "password": "vector-main-decoy",
+      "expected_plaintext_hex": "546172706974437279707420763120636f6d7061746962696c69747920766563746f72202d206465636f79206d61696e0a",
+      "is_decoy": false,
+      "note": "双口令诱饵层，验证诱饵段的顺序与 AAD 绑定",
+      "decoy_password": "vector-decoy",
+      "decoy_plaintext_hex": "7468697320697320746865206465636f79206c617965720a"
+    },
+    "v1_pow": {
+      "file": "v1_pow.bin",
+      "sha256": "808fadb76ff75c93e60296cbec6018750be3fbae8095062e9c90eb4b7eb92ce6",
+      "size": 151,
+      "password": "vector-main-pow",
+      "expected_plaintext_hex": "546172706974437279707420763120636f6d7061746962696c69747920766563746f72202d20706f7731360a",
+      "is_decoy": false,
+      "note": "PoW=16，验证工作量校验与头部字段布局"
+    }
+  }
+}

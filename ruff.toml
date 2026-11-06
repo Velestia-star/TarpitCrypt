@@ -1,0 +1,13 @@
+line-length = 100
+target-version = "py311"
+extend-exclude = ["build", "dist", "*.egg-info"]
+
+[lint]
+# 只开确定的错误类与未使用/未定义符号；风格类规则等存量清理完再逐步打开。
+select = ["E4", "E7", "E9", "F"]
+ignore = ["E501", "E741"]
+
+[lint.per-file-ignores]
+# 测试里经常需要 import 后触发副作用，或故意用私有符号验证兼容性。
+"tests/*" = ["F401"]
+"armor/selftest.py" = ["F401"]

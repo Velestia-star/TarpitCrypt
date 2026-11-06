@@ -13,3 +13,10 @@ venv/
 *.tarpit
 *.key
 *.bin.tmp
+*.armored
+*_build_kit/
+*_internal_docs/
+*_archive_r9/
+tarpit_report.csv
+tarpit_report.md
+report.md

@@ -19,6 +19,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import armor_core as ac  # noqa: E402
+import armor_metrics as am  # noqa: E402
 import decoy_kit as dk  # noqa: E402
 from tarpitcrypt import CIPHER_AESGCM, _aead_decrypt, _aead_encrypt  # noqa: E402
 
@@ -284,6 +285,59 @@ def main() -> int:
             check("已存在的非空目录应拒绝覆盖", False)
         except dk.SidecarError:
             check("已存在的非空目录拒绝覆盖", True)
+
+        # ---- A/C 级新增：口令体检、并行还原、投毒策略、本地报告 ----
+        for weak in ("", "abc", "12345678", "password"):
+            check(f"弱口令 {weak!r} 被体检拦下",
+                  not ac.check_password_strength(weak)[0])
+        check("合格口令通过体检", ac.check_password_strength("correct-horse-9")[0])
+
+        par = ac.restore_armored(blob, pw, parallel=True)
+        check("并行还原结果与串行逐字节一致", par.payload == real.payload)
+        try:
+            ac.restore_armored(blob, b"wrong-pass", parallel=True)
+            check("并行路径错误口令应被拒绝", False)
+        except ac.ArmorError:
+            check("并行路径错误口令被拒绝", True)
+
+        poison_shapes = {}
+        for i, poison in enumerate(dk.POISON_PROFILES):
+            r = dk.build_sidecar(src, out_dir=root / f"poison_{i}",
+                                 armored=container, poison=poison, layers=4)
+            poison_shapes[poison] = (len(r.files), r.traps, r.poison)
+            ok_p, n_p, why_p = dk.verify_sidecar(r.root)
+            check(f"投毒侧重「{poison}」生成物可核验", ok_p and n_p == len(r.files), why_p)
+            extra_bad = []
+            for rel in r.files:
+                if rel.endswith(".py"):
+                    try:
+                        py_compile.compile(str(r.root / rel), doraise=True)
+                    except Exception:
+                        extra_bad.append(rel)
+            check(f"投毒侧重「{poison}」的 Python 语法正确", not extra_bad, str(extra_bad))
+        check("三种投毒侧重产出不同", len(set(poison_shapes.values())) == 3,
+              str(poison_shapes))
+        try:
+            dk.build_sidecar(src, out_dir=root / "poison_bad", poison="不存在")
+            check("未知投毒侧重应被拒绝", False)
+        except dk.SidecarError:
+            check("未知投毒侧重被拒绝", True)
+
+        m = am.Metrics()
+        m.record("还原", "demo.armored", ok=False, layers_tried=4, seconds=0.5,
+                 note="错误口令")
+        m.record("还原", "demo.armored", ok=True, layers_tried=3, seconds=0.4)
+        check("报告汇总统计正确",
+              m.failures == 1 and m.rounds == 9
+              and m.est_tokens == 9 * am.TOKENS_PER_ROUND,
+              f"轮数 {m.rounds} / 估算 token {m.est_tokens}")
+        csv_path = m.to_csv(root / "report.csv")
+        check("报告可导出 CSV", csv_path.is_file()
+              and len(csv_path.read_text(encoding="utf-8-sig").splitlines()) == 3)
+        md = m.to_markdown()
+        check("报告 Markdown 含汇总且不含真实口令",
+              "## 汇总" in md and "## 明细" in md
+              and "correct-horse-9" not in md and "wrong-pass" not in md)
 
     print(f"\n通过 {len(PASS)} / 失败 {len(FAIL)} / 合计 {len(PASS) + len(FAIL)}")
     if FAIL:
