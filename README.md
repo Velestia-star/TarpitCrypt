@@ -54,7 +54,58 @@ python tarpitcrypt.py ai-config params.json     # 先校验，看哪些被丢弃
 python tarpitcrypt.py encrypt a.txt a.tarpit --ai-config params.json
 ```
 
+AI 只允许输出下面这些键与值，其他一律丢弃并记 warning——
+**AI 永远碰不到口令、密钥、keyfile 的内容，它只产出 JSON 旋钮**：
+
+| 键 | 白名单 |
+|---|---|
+| `mem` | 262144 / 524288 / 1048576 / 2097152（KiB） |
+| `time` | 3 / 4 / 5 |
+| `para` | 2 / 4 / 6 |
+| `rounds` | 2 / 3 / 4 |
+| `pow` | 0 / 16 / 18 / 20 |
+| `cipher` | `xchacha20-poly1305` / `aes-256-gcm` |
+
 ---
+
+## 在线版（GitHub Pages，纯前端）
+
+把 `docs/` 目录发布成 GitHub Pages 后，可以直接在浏览器里用：
+
+```
+https://wei238982377.github.io/TarpitCrypt/
+```
+
+**首次启用**：仓库 → Settings → Pages → Source 选 `Deploy from a branch` →
+Branch 选 `main`、目录选 `/docs` → Save。之后每次推送自动更新。
+
+和本地网页版的关键区别：**这里没有服务器**。Argon2id 由 `hash-wasm` 编译成
+WASM 在浏览器里跑，AEAD 用浏览器原生 WebCrypto，文件一个字节都不会上传。
+
+### 与命令行版完全兼容
+
+网页版产出的 `.tarpit` 和 `tarpitcrypt.py` 产出的**逐字节同格式**，
+两边可以互相解开。这不是口号，是有一条专门的双向测试盯着的：
+
+```bash
+python -m pytest tests -k browser      # 需要本机装有 Edge/Chrome
+```
+
+它做的事：Python 造一份密文嵌进页面 → 无头浏览器解开它、再造一份吐回字节 →
+Python 再解开浏览器造的那份，顺带校验浏览器打的 zip。任何一边改了 KDF、
+AAD 或字段顺序，这条测试立刻变红。
+
+浏览器版的额外限制（和 CLI 版不同）：
+
+- **只有 AES-256-GCM**。WebCrypto 没有 XChaCha20-Poly1305，这不是偷懒，
+  是浏览器确实不提供。
+- 强度预设上限压到 **1 GiB**：WASM 在部分设备/移动端分配不到更大的线性内存。
+- 跑 Argon2 期间页面会卡住几秒（主线程被 WASM 占满）。这是故意的等待，
+  不是卡死；界面上有提示。
+- 依赖 `docs/vendor/argon2.umd.min.js`（hash-wasm 4.12.0，MIT，已 vendor
+  进仓库，不从 CDN 加载——加密工具不该有运行时供应链依赖）。
+
+
 
 ## 本地网页版（拖拽即用）
 
@@ -81,19 +132,6 @@ python tarpitcrypt_server.py --open
   避免你同时点两次直接把机器 OOM。代价是并发请求要排队。
 - 单次请求上限 512 MB（明文、密文都要在内存里过一遍）。
 - 网页版不替代 CLI：批量、脚本化、离线环境还是用 `tarpitcrypt.py`。
-
-
-AI 只允许输出下面这些键与值，其他一律丢弃并记 warning——
-**AI 永远碰不到口令、密钥、keyfile 的内容，它只产出 JSON 旋钮**：
-
-| 键 | 白名单 |
-|---|---|
-| `mem` | 262144 / 524288 / 1048576 / 2097152（KiB） |
-| `time` | 3 / 4 / 5 |
-| `para` | 2 / 4 / 6 |
-| `rounds` | 2 / 3 / 4 |
-| `pow` | 0 / 16 / 18 / 20 |
-| `cipher` | `xchacha20-poly1305` / `aes-256-gcm` |
 
 ---
 
@@ -193,7 +231,8 @@ Argon2id 是内存硬函数，GPU/ASIC 的并行优势被内存带宽卡死，�
 
 ```bash
 pip install pytest
-python -m pytest tests          # 58 passed
+python -m pytest tests              # 59 passed（含 1 条需要浏览器的兼容性测试）
+python -m pytest tests -k browser   # 单跑浏览器 ↔ Python 双向互解
 ```
 
 测试里带 **KDF 黄金向量**（`_derive` 的固定输入 → 固定输出）。
@@ -202,6 +241,9 @@ python -m pytest tests          # 58 passed
 1. 变更前后的单次尝试成本对比；
 2. 对已有文件的影响（不兼容则必须 `VERSION + 1` 并提供迁移脚本）；
 3. 新的测试向量（输入、期望输出、口令、keyfile 摘要）。
+
+浏览器版的期望值不是抄一份常量，而是测试时由 Python 侧现算再注入 JS：
+它断言的是「两边算出同一个东西」，所以任何一边改了 KDF 都会立刻暴露。
 
 不允许为了「性能」下调 `memory_cost` 或 `time_cost`，也不允许移除 AAD 绑定。
 
