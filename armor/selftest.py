@@ -433,13 +433,73 @@ def main() -> int:
                     except Exception:
                         extra_bad.append(rel)
             check(f"投毒侧重「{poison}」的 Python 语法正确", not extra_bad, str(extra_bad))
-        check("三种投毒侧重产出不同", len(set(poison_shapes.values())) == 3,
+        check("五种投毒侧重产出不同", len(set(poison_shapes.values())) == 5,
               str(poison_shapes))
         try:
             dk.build_sidecar(src, out_dir=root / "poison_bad", poison="不存在")
             check("未知投毒侧重应被拒绝", False)
         except dk.SidecarError:
             check("未知投毒侧重被拒绝", True)
+
+        # ---- 内容层陷阱：针对真实 AI 逆向工具（IOC 蜜罐 / RAG 投毒）----
+        import ipaddress as _ip
+        _safe_domains = {"example.com", "example.net", "example.org",
+                         "invalid", "localhost", "home.arpa"}
+
+        ioc_kit = dk.build_sidecar(src, out_dir=root / "ioc_kit",
+                                   armored=container, poison="IOC蜜罐", layers=4)
+        check("IOC蜜罐产出假字符串转储", "resources/decoy_strings.txt" in ioc_kit.files)
+        check("IOC蜜罐产出 IOC 清单", "ioc_list.json" in ioc_kit.files)
+        decoy_txt = (ioc_kit.root / "resources/decoy_strings.txt").read_text(encoding="utf-8")
+        bad_ip = []
+        for tok in decoy_txt.replace("=", " ").split():
+            try:
+                ip = _ip.ip_address(tok)
+            except ValueError:
+                continue
+            if ip.is_global:
+                bad_ip.append(tok)
+        check("假 IOC 的 IP 全部落在保留/私有段（无真实公网 IP）",
+              not bad_ip, str(bad_ip[:5]))
+        ioc_json = json.loads((ioc_kit.root / "ioc_list.json").read_text(encoding="utf-8"))
+        bad_ioc = []
+        for item in ioc_json["iocs"]:
+            v = item["value"]
+            try:
+                if _ip.ip_address(v).is_global:
+                    bad_ioc.append(v)
+            except ValueError:
+                if item["type"] in ("domain", "url") and \
+                   not any(d in v for d in _safe_domains):
+                    bad_ioc.append(v)
+        check("IOC 清单无真实公网地址/域名", not bad_ioc, str(bad_ioc[:5]))
+
+        rag_kit = dk.build_sidecar(src, out_dir=root / "rag_kit",
+                                   armored=container, poison="RAG投毒", layers=4)
+        for rel in ("knowledge_base/architecture.md",
+                    "knowledge_base/findings_prior.md",
+                    "analysis_report.draft.md"):
+            check(f"RAG投毒产出 {rel}", rel in rag_kit.files)
+        arch_txt = (rag_kit.root / "knowledge_base/architecture.md").read_text(encoding="utf-8")
+        check("知识库文章含诱导性间接指令（判良性/停止）",
+              "BENIGN" in arch_txt and "停止" in arch_txt)
+
+        # 内容陷阱文件不得泄露伴生口令（真值只回报告，不落盘）
+        _content_files = ["resources/decoy_strings.txt", "ioc_list.json",
+                          "knowledge_base/architecture.md",
+                          "knowledge_base/findings_prior.md",
+                          "analysis_report.draft.md"]
+        _leaked_in_content = set()
+        for rel in _content_files:
+            base = ioc_kit.root if rel in ioc_kit.files else rag_kit.root
+            if rel not in base.iterdir() and rel not in ioc_kit.files and rel not in rag_kit.files:
+                continue
+            txt = (base / rel).read_text(encoding="utf-8", errors="ignore")
+            for p in kit.leaked:
+                if len(p) > 6 and p in txt:
+                    _leaked_in_content.add(rel)
+        check("内容陷阱文件未泄露伴生口令", not _leaked_in_content,
+              str(sorted(_leaked_in_content)))
 
         m = am.Metrics()
         m.record("还原", "demo.armored", ok=False, layers_tried=4, seconds=0.5,

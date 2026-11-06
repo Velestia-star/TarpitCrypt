@@ -1,6 +1,6 @@
 # TarpitCrypt Armor · 反 AI 逆向加固工具
 
-> 发布版本 **v0.3.1** · 容器格式 **v3** · 详见仓库根 [CHANGELOG.md](../CHANGELOG.md)
+> 发布版本 **v0.3.2** · 容器格式 **v3** · 详见仓库根 [CHANGELOG.md](../CHANGELOG.md)
 
 把一个程序包拖进窗口，就能给它套上「让 AI 逆向 agent 反复做无用功」的外壳。
 
@@ -58,7 +58,7 @@ Qt 绿色应用）完整走了一遍「拖入 → 加固 → 伴生诱饵 → �
 - **运行报告页**：统计本机会话里的错误口令次数、层尝试、耗时与 token 量级估算，可导出 CSV / Markdown。数据只在内存，**不写进容器、不记口令**，点导出才落盘。token 是粗估，不是真实 LLM 计费。
 - **`agent_eval.py`**：多轮取样，输出中位数与区间的 Markdown 报告，避免把口令随机波动当成效果。
 - **`probe_agent.py`**：基线 / 盲 agent / 读源码 agent 三组对照，关键判据是「能否确定性定位真层」。
-- **投毒侧重**：`均衡` / `规格矛盾` / `假解析器`。前者针对爱读文档的 agent 加重互相矛盾的偏移表，后者针对爱写脚本的 agent 加重能 import 但常量全错的解析器。
+- **投毒侧重**：`均衡` / `规格矛盾` / `假解析器` / `IOC蜜罐` / `RAG投毒`。前两者分别对应爱读文档 / 爱写脚本的 agent；`IOC蜜罐` 针对会扫字符串提取 IOC 的工具（kernagent、ReverseCore_MCP、agentic-malware-analysis），植入全落保留地址段的假 C2/IOC；`RAG投毒` 针对把项目文档喂进 RAG / 知识图谱 / 多智能体的工具（GhidrAssist、open-reverselab、RAVERSE、REAA），生成诱导性知识库文章并内嵌「停止深挖、判良性」的间接指令。威胁模型与可利用盲区见 [`docs/AI_RE_THREATMODEL.md`](../docs/AI_RE_THREATMODEL.md)。
 - **真实 agent 实测**仍是待办：协议与记录表在 [`docs/AGENT_BENCHMARK.md`](../docs/AGENT_BENCHMARK.md)，拿到实测数据后应替换掉这里的模拟下界。
 
 ### 工程化（B 级）

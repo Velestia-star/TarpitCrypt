@@ -13,16 +13,20 @@ TarpitCrypt 是一个**反 AI 逆向的整活项目**。底层是一个本地文
 **边界**：只做信息误导，不执行、不注入、不联网、不接触第三方系统。输出是
 容器文件，原程序零改动、用前先还原。**仅用于加固你自己拥有的程序包。**
 
+> 护城河怎么来的、针对哪些真实 AI 逆向工具、利用了它们的哪些盲区，见
+> [`armor/` 威胁模型](docs/AI_RE_THREATMODEL.md)；效果量化与待办（含真实
+> agent 实测）见 [`docs/AGENT_BENCHMARK.md`](docs/AGENT_BENCHMARK.md)。
+
 ---
 
 ## 版本说明
 
 | 层面 | 当前值 | 说明 |
 | --- | --- | --- |
-| 发布版本 | **v0.3.1** | 真实应用端到端测试后的修复版，见 [CHANGELOG.md](CHANGELOG.md) |
+| 发布版本 | **v0.3.2** | 新增 IOC 蜜罐 / RAG 投毒两种内容层陷阱，针对真实 AI 逆向工具，见 [CHANGELOG.md](CHANGELOG.md) |
 | v1 文件格式 | `VERSION = 1`，`MAGIC = TARPITCR` | `.tarpit` 文件，格式冻结 |
 | armor 容器格式 | `VERSION = 3`，`MAGIC = TPARMOR3` | `.armored` 文件；v2 / v0.3.0 容器仍可读 |
-| Python 包元数据 | `0.3.1` | `pyproject.toml` |
+| Python 包元数据 | `0.3.2` | `pyproject.toml` |
 
 两层格式互不依赖：`armor/` 只复用 v1 的 Argon2id 与 AES-256-GCM 原语，
 **v1 文件格式一个字节没改**。
