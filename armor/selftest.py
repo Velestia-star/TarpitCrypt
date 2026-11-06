@@ -46,6 +46,15 @@ def make_package(root: Path) -> Path:
     return src
 
 
+def manifest_of(payload: bytes) -> dict:
+    """取出载荷里的工具清单（按条目标记，不按文件名）。"""
+    with zipfile.ZipFile(io.BytesIO(payload)) as zf:
+        for info in zf.infolist():
+            if info.comment == ac.MANIFEST_TAG:
+                return json.loads(zf.read(info))
+    return {}
+
+
 def solved_by(blob: bytes, passwords: tuple[str, ...]) -> list[bytes]:
     """返回这些口令能解开的所有层载荷。"""
     out = []
@@ -134,9 +143,20 @@ def main() -> int:
         check("解开的都不是真包", all(x != real.payload for x in opened))
         check("诱饵包结构完整", len(opened) > 0 and
               any(zipfile.is_zipfile(io.BytesIO(x)) for x in opened))
-        check("诱饵包与真包不可通过标记区分",
-              all(".manifest" in zipfile.ZipFile(io.BytesIO(x)).namelist() for x in opened)
-              and ".manifest" in real.entries)
+        with zipfile.ZipFile(io.BytesIO(real.payload)) as zf:
+            real_names = zf.namelist()
+        check("诱饵包与真包都带同结构清单",
+              all(".manifest" in zipfile.ZipFile(io.BytesIO(x)).namelist()
+                  for x in opened) and ".manifest" in real_names)
+        check("工具清单不混进用户文件列表", ".manifest" not in real.entries)
+        check("工具清单不落进用户目录", not (out / ".manifest").exists())
+        manifests = [manifest_of(real.payload)] + [manifest_of(x) for x in opened]
+        check("清单字段不标真伪：各层 variant 完全一致",
+              all(m and m.get("variant") == manifests[0].get("variant")
+                  for m in manifests),
+              str([m.get("variant") for m in manifests]))
+        check("清单不泄露真实程序包名",
+              manifests[0].get("package") != src.name)
 
         for bad in (noise.encode("utf-8"), b"totally-wrong"):
             try:
@@ -175,6 +195,26 @@ def main() -> int:
         check("各层尺寸接近，真层不是唯一最小层",
               spread < 0.15 and sum(s == min(sizes) for s in sizes) >= 1,
               f"极差 {max(sizes) - min(sizes)}B / 最大 {max(sizes)}B")
+        # 尺寸接近还不够：最大层若挤不下填充，会成为唯一没有填充条目的层。
+        original_pad, padded = ac._pad_zip, []
+
+        def spy_pad(payload: bytes, target: int, token: bytes) -> bytes:
+            out = original_pad(payload, target, token)
+            padded.append(out)
+            return out
+
+        ac._pad_zip = spy_pad
+        try:
+            ac.build_armored(src, pw, layers=4, profile=profile)
+        finally:
+            ac._pad_zip = original_pad
+        pad_name = ac.PAD_PREFIX.encode()
+        check("所有层都带填充条目，真层不会成为唯一例外",
+              len(padded) == 4 and all(pad_name in p for p in padded),
+              f"{sum(pad_name in p for p in padded)}/{len(padded)} 层有填充")
+        pad_spread = max(len(p) for p in padded) - min(len(p) for p in padded)
+        check("各层补齐后尺寸一致（不靠某层不填充凑数）",
+              pad_spread <= 16, f"极差 {pad_spread}B")
         shapes, py_bad = [], []
         for payload in opened:
             with zipfile.ZipFile(io.BytesIO(payload)) as zf:
@@ -239,6 +279,81 @@ def main() -> int:
             check("空口令应被拒绝", False)
         except ac.ArmorError:
             check("空口令被拒绝", True)
+
+        # ---- v0.3.1 真实程序包回归：同名清单 / 空目录 / 内部前缀 / 零残留 ----
+        real_app = root / "RealApp 中文 空格"
+        (real_app / "logs").mkdir(parents=True)
+        (real_app / "cache" / "nested").mkdir(parents=True)
+        (real_app / "src").mkdir()
+        (real_app / "src" / "main.py").write_bytes(b"real payload\n" * 20)
+        (real_app / ".manifest").write_text("用户自己的清单，不能被覆盖", encoding="utf-8")
+        (real_app / ac.PAD_PREFIX.rstrip("/")).mkdir()
+        (real_app / ac.PAD_PREFIX.rstrip("/") / "keep.bin").write_bytes(b"keep me")
+        (real_app / "空文件.bin").write_bytes(b"")
+        app_before = {p.relative_to(real_app).as_posix(): p.read_bytes()
+                      for p in real_app.rglob("*") if p.is_file()}
+        dirs_before = {p.relative_to(real_app).as_posix()
+                       for p in real_app.rglob("*") if p.is_dir()}
+        app_blob = ac.build_armored(real_app, pw, layers=3, profile=profile)
+        app_res = ac.restore_armored(app_blob, pw)
+        app_out = root / "real_app_out"
+        written = ac.safe_extract(app_res.payload, app_out)
+        app_after = {p.relative_to(app_out).as_posix(): p.read_bytes()
+                     for p in app_out.rglob("*") if p.is_file()}
+        dirs_after = {p.relative_to(app_out).as_posix()
+                      for p in app_out.rglob("*") if p.is_dir()}
+        check("程序包自带 .manifest 不被工具清单覆盖且逐字节一致",
+              app_before == app_after,
+              f"差异 {sorted(set(app_before) ^ set(app_after))}")
+        check("内部前缀下的用户文件不被误删",
+              (ac.PAD_PREFIX + "keep.bin") in app_after)
+        check("空目录结构完整保留", dirs_before <= dirs_after,
+              f"缺少 {sorted(dirs_before - dirs_after)}")
+        check("还原只写出程序包文件，无清单/填充残留",
+              len(written) == len(app_before) == app_res.file_count,
+              f"写出 {len(written)} / 条目 {app_res.file_count}")
+        with zipfile.ZipFile(io.BytesIO(app_res.payload)) as zf:
+            app_names = zf.namelist()
+        check("自带 .manifest 时清单自动避让，不产生重名条目",
+              app_names.count(".manifest") == 1 and ".manifest.1" in app_names,
+              str([n for n in app_names if "manifest" in n]))
+        decoys = solved_by(app_blob, ac.armor_passwords(app_blob))
+        decoy_names: list[str] = []
+        if decoys:
+            with zipfile.ZipFile(io.BytesIO(decoys[0])) as zf:
+                decoy_names = zf.namelist()
+        check("避让清单的容器仍能解开诱饵层", bool(decoys))
+        check("诱饵层清单名与真层一致，不泄露结构差异",
+              ".manifest.1" in decoy_names and ".manifest" not in decoy_names)
+
+        only_dirs = root / "OnlyDirs"
+        (only_dirs / "a" / "b").mkdir(parents=True)
+        d_blob = ac.build_armored(only_dirs, pw, layers=2, profile=profile)
+        d_out = root / "only_dirs_out"
+        ac.safe_extract(ac.restore_armored(d_blob, pw).payload, d_out)
+        check("只有空目录的程序包也能加固并还原结构",
+              (d_out / "a" / "b").is_dir())
+        truly_empty = root / "TrulyEmpty"
+        truly_empty.mkdir()
+        try:
+            ac.build_armored(truly_empty, pw, layers=2, profile=profile)
+            check("完全空的目录应被拒绝", False)
+        except ac.ArmorError:
+            check("完全空的目录被拒绝", True)
+
+        # v0.3.0 载荷没有条目标记：清单靠内容识别，填充靠前缀识别
+        legacy_zip = io.BytesIO()
+        with zipfile.ZipFile(legacy_zip, "w") as z:
+            z.writestr("main.py", b"legacy")
+            z.writestr(".manifest", json.dumps({
+                "schema": 2, "package": "x", "variant": "release",
+                "entry": "src/main.py", "build": "00", "digest": "0" * 64,
+                "notes": "auto-generated manifest"}).encode("utf-8"))
+            z.writestr(ac.PAD_PREFIX + "deadbeef.dat", b"pad")
+        legacy_out = root / "legacy_zip_out"
+        ac.safe_extract(legacy_zip.getvalue(), legacy_out)
+        check("v0.3.0 无标记载荷还原不带出清单与填充",
+              sorted(p.name for p in legacy_out.rglob("*") if p.is_file()) == ["main.py"])
 
         # ---- 伴生诱饵包 ----
         container = root / "MyApp.armored"

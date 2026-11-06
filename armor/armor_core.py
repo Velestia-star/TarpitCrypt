@@ -42,6 +42,7 @@ VERSION=2）按同一布局读取，仍可用主口令还原。
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import io
 import json
@@ -49,6 +50,7 @@ import os
 import random
 import re
 import secrets
+import shutil
 import struct
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -67,7 +69,7 @@ except ModuleNotFoundError:  # pragma: no cover - 仅仓库布局触发
     from tarpitcrypt import CIPHER_AESGCM, _aead_decrypt, _aead_encrypt, _derive
 
 #: 整个工具集的发布版本；容器格式版本另见 VERSION。
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 __all__ = [
     "__version__",
@@ -119,7 +121,18 @@ PROFILES: dict[str, tuple[int, int, int, int]] = {
 #: 诱饵包的填充上限，避免大程序包导致容器成倍膨胀。
 MAX_DECOY_PAD = 8 * 1024 * 1024
 #: 各层统一尺寸用的填充条目。真层与诱饵层都带，解包时跳过，不落进用户目录。
+#: v0.3.0 容器只靠这个名字识别填充；v0.3.1 起改用条目标记，避免误删用户文件。
 PAD_PREFIX = "__tarpit_pad/"
+
+#: zip 条目标记。「用户文件 / 工具清单 / 尺寸填充」三类靠 comment 区分，
+#: 而不是靠文件名：程序包里恰好叫 .manifest，或恰好有 __tarpit_pad/ 目录时，
+#: 用户文件一律保留。真层与诱饵层的标记分布完全一致，不产生新的剪枝线索。
+USER_TAG = b"tarpit-user-v3"
+MANIFEST_TAG = b"tarpit-manifest-v3"
+PAD_TAG = b"tarpit-pad-v3"
+_INTERNAL_TAGS = frozenset({MANIFEST_TAG, PAD_TAG})
+#: 读大文件时的流式块大小，避免把整个程序包反复堆在内存里。
+_COPY_CHUNK = 1 << 20
 
 Progress = Callable[[int, int, str], None]
 
@@ -208,30 +221,63 @@ def _random_password(rng: random.Random) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _pack_path(src: Path, zf: zipfile.ZipFile, on_progress: Progress | None) -> int:
-    """把一个文件或整个目录写进 zip，返回条目数。"""
-    if src.is_file():
-        size = src.stat().st_size
-        if size > MAX_SINGLE_FILE:
-            raise ArmorError(f"单个文件超过 {MAX_SINGLE_FILE // 1024 // 1024} MiB：{src.name}")
-        zf.writestr(src.name, src.read_bytes(), compress_type=zipfile.ZIP_DEFLATED)
-        return 1
+def _zip_entry(name: str, tag: bytes, rng: random.Random) -> zipfile.ZipInfo:
+    """构造带内部标记的 zip 条目。
 
-    files = sorted(p for p in src.rglob("*") if p.is_file())
-    total = len(files)
-    for i, path in enumerate(files, 1):
-        rel = path.relative_to(src).as_posix()
-        size = path.stat().st_size
-        if size > MAX_SINGLE_FILE:
-            raise ArmorError(f"单个文件超过 {MAX_SINGLE_FILE // 1024 // 1024} MiB：{rel}")
-        zf.writestr(rel, path.read_bytes(), compress_type=zipfile.ZIP_DEFLATED)
+    时间戳按与诱饵包相同的分布随机化：真包条目若一律是 1980 年，光看
+    zip 元数据就能把真层和诱饵层分开。还原时只取内容，不还原时间戳。
+    """
+    info = zipfile.ZipInfo(
+        name,
+        date_time=(rng.randint(2021, 2026), rng.randint(1, 12), rng.randint(1, 28),
+                   rng.randint(0, 23), rng.randint(0, 59), rng.randint(0, 59)),
+    )
+    info.compress_type = zipfile.ZIP_DEFLATED
+    info.external_attr = 0o644 << 16
+    info.comment = tag
+    return info
+
+
+def _pack_path(src: Path, zf: zipfile.ZipFile, on_progress: Progress | None) -> int:
+    """把一个文件或整个目录写进 zip，返回条目数。
+
+    空目录也写成目录条目：真实程序包常带 logs/、cache/ 这类空目录，早先只
+    打包文件会把目录结构丢掉。大文件按块流式写入，不整份读进内存。
+    """
+    rng = random.Random()
+    entries: list[tuple[str, Path | None]] = []
+    if src.is_file():
+        entries.append((src.name, src))
+    else:
+        for path in sorted(src.rglob("*")):
+            rel = path.relative_to(src).as_posix()
+            if path.is_dir():
+                entries.append((rel + "/", None))
+            elif path.is_file():
+                entries.append((rel, path))
+
+    total = len(entries)
+    for i, (rel, path) in enumerate(entries, 1):
+        info = _zip_entry(rel, USER_TAG, rng)
+        if path is None:
+            zf.writestr(info, b"")
+        else:
+            size = path.stat().st_size
+            if size > MAX_SINGLE_FILE:
+                raise ArmorError(f"单个文件超过 {MAX_SINGLE_FILE // 1024 // 1024} MiB：{rel}")
+            with path.open("rb") as reader, zf.open(info, "w") as writer:
+                shutil.copyfileobj(reader, writer, _COPY_CHUNK)
         if i % 20 == 0 or i == total:
             _notify(on_progress, i, total, f"打包中 {i}/{total}：{rel[:48]}")
     return total
 
 
-def _manifest(label: str, payload: bytes, variant: str) -> bytes:
-    """真包与诱饵包都带同结构的清单，避免从元数据上被区分。"""
+def _manifest(label: str, digest: str, variant: str) -> bytes:
+    """真包与诱饵包都带同结构的清单，避免从元数据上被区分。
+
+    *variant* 在两类层里必须取同一个值：早先真层写 "release"、诱饵层写
+    "internal-N"，解开任意一层读一眼清单就能确定真伪，等于白送剪枝信号。
+    """
     return json.dumps(
         {
             "schema": 2,
@@ -239,7 +285,7 @@ def _manifest(label: str, payload: bytes, variant: str) -> bytes:
             "variant": variant,
             "entry": "src/main.py",
             "build": secrets.token_hex(4),
-            "digest": sha256_bytes(payload),
+            "digest": digest,
             "notes": "auto-generated manifest",
         },
         ensure_ascii=False,
@@ -247,26 +293,98 @@ def _manifest(label: str, payload: bytes, variant: str) -> bytes:
     ).encode("utf-8")
 
 
-def pack_source(src: Path, on_progress: Progress | None = None) -> bytes:
+def _is_legacy_manifest(name: str, data: bytes) -> bool:
+    """识别 v0.3.0 容器里没有标记的清单条目，旧容器还原时也不该多写文件。
+
+    只认本工具生成的那份 JSON（字段集合与固定值全匹配），用户自己放一个
+    恰好叫 .manifest 的文件不会被误判。
+    """
+    if name != ".manifest" or len(data) > 4096:
+        return False
+    try:
+        obj = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return False
+    return (
+        isinstance(obj, dict)
+        and set(obj) == {"schema", "package", "variant", "entry",
+                         "build", "digest", "notes"}
+        and obj["schema"] == 2
+        and obj["entry"] == "src/main.py"
+        and obj["notes"] == "auto-generated manifest"
+        and isinstance(obj["digest"], str)
+        and len(obj["digest"]) == 64
+    )
+
+
+def _is_internal(info: zipfile.ZipInfo, data: bytes | None = None) -> bool:
+    """判断条目是否是工具自己塞进去的（清单 / 尺寸填充），而非用户文件。"""
+    if info.comment in _INTERNAL_TAGS:
+        return True
+    # v0.3.0：填充条目没有标记，只能靠前缀；带 USER_TAG 的同名用户文件除外。
+    if info.filename.startswith(PAD_PREFIX) and info.comment != USER_TAG:
+        return True
+    # v0.3.0：清单没有标记，靠内容精确识别，避免还原目录里多出 .manifest。
+    if info.comment == b"" and data is not None:
+        return _is_legacy_manifest(info.filename, data)
+    return False
+
+
+def _free_manifest_name(src: Path) -> str:
+    """挑一个不与程序包内任何文件重名的清单名。
+
+    真层与诱饵层共用同一个名字：否则「有两个 .manifest 条目」这种结构
+    差异本身就会告诉 agent 哪层装的是用户包。
+    """
+    if src.is_file():
+        used = {src.name}
+    else:
+        used = {p.relative_to(src).as_posix() for p in src.rglob("*")}
+    name = ".manifest"
+    index = 1
+    while name in used:
+        name = f".manifest.{index}"
+        index += 1
+    return name
+
+
+def pack_source(src: Path, on_progress: Progress | None = None,
+                *, manifest_name: str | None = None) -> bytes:
     """把拖入的文件/目录打成一个 zip（真层载荷）。"""
     src = Path(src)
     if not src.exists():
         raise ArmorError(f"路径不存在：{src}")
+    name = manifest_name or _free_manifest_name(src)
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         count = _pack_path(src, zf, on_progress)
         if count == 0:
-            raise ArmorError("目录里没有文件，无法加固")
-        inner = b"".join(zf.read(n) for n in zf.namelist())
-        zf.writestr(".manifest", _manifest(src.name, inner, "release"))
+            raise ArmorError("目录是空的（没有任何文件或子目录），无法加固")
+        # 按 ZipInfo 逐个读，而不是按文件名读：程序包里若本来就有
+        # .manifest，两个同名条目并存，按名字取会拿错内容。
+        digest = hashlib.sha256()
+        for info in zf.infolist():
+            if info.is_dir():
+                continue
+            with zf.open(info) as fp:
+                for chunk in iter(lambda: fp.read(_COPY_CHUNK), b""):
+                    digest.update(chunk)
+        # 清单里的包名与诱饵包同分布，不泄露真实目录名。
+        label = f"{secrets.choice(_NAME_A)}{secrets.choice(_NAME_B)}"
+        zf.writestr(_zip_entry(name, MANIFEST_TAG, random.Random()),
+                    _manifest(label, digest.hexdigest(), "release"))
     _notify(on_progress, 1, 1, "真层载荷打包完成")
     return buf.getvalue()
 
 
 def _source_stats(payload: bytes) -> dict:
-    """统计真包的可观测特征，诱饵包据此对齐，避免被按大小或结构剪枝。"""
+    """统计真包的可观测特征，诱饵包据此对齐，避免被按大小或结构剪枝。
+
+    只数用户文件：目录条目与工具清单元数据不该被当成程序包特征。
+    """
     with zipfile.ZipFile(io.BytesIO(payload)) as zf:
-        names = zf.namelist()
+        names = [i.filename for i in zf.infolist()
+                 if not i.is_dir() and i.comment == USER_TAG]
     return {
         "size": len(payload),
         "files": len(names),
@@ -388,7 +506,8 @@ def _py_source(rng: random.Random, template: int, tag: str) -> str:
                 .replace("__M__", str(rng.randint(64, 997))))
 
 
-def _make_decoy_zip(seed: bytes, index: int, stats: dict) -> bytes:
+def _make_decoy_zip(seed: bytes, index: int, stats: dict,
+                    manifest_name: str = ".manifest") -> bytes:
     """生成一份结构、命名、时间戳随机的高仿真诱饵包。
 
     文件数贴近真包，Python 源码由固定可编译模板填充常量而来，不执行任何
@@ -438,12 +557,24 @@ def _make_decoy_zip(seed: bytes, index: int, stats: dict) -> bytes:
                            f"> 维护备忘：调试入口在 {rng.choice(('r5', 'r7', 'r9'))} 之后已移除。\n")
 
     inner = "".join(files.values()).encode("utf-8")
-    files[".manifest"] = _manifest(name, inner, f"internal-{index}").decode("utf-8")
+    files[manifest_name] = _manifest(name, sha256_bytes(inner),
+                                     "release").decode("utf-8")
+
+    # 与真层同构：虚拟目录也写成显式目录条目，清单一律放最后，条目标记
+    # 也按同一套规则打。否则「有没有目录条目」本身就成了新的剪枝线索。
+    entries: dict[str, str | None] = {}
+    for path, text in files.items():
+        parts = path.split("/")
+        for i in range(1, len(parts)):
+            entries["/".join(parts[:i]) + "/"] = None
+        entries[path] = text
+    ordered = sorted(k for k in entries if k != manifest_name) + [manifest_name]
 
     year = rng.randint(2021, 2026)
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for path, text in files.items():
+        for path in ordered:
+            text = entries[path]
             info = zipfile.ZipInfo(
                 path,
                 date_time=(year, rng.randint(1, 12), rng.randint(1, 28),
@@ -451,7 +582,8 @@ def _make_decoy_zip(seed: bytes, index: int, stats: dict) -> bytes:
             )
             info.compress_type = zipfile.ZIP_DEFLATED
             info.external_attr = 0o644 << 16
-            zf.writestr(info, text)
+            info.comment = MANIFEST_TAG if path == manifest_name else USER_TAG
+            zf.writestr(info, text.encode("utf-8") if text is not None else b"")
     return buf.getvalue()
 
 
@@ -463,17 +595,25 @@ def _pad_zip(payload: bytes, target_size: int, token: bytes) -> bytes:
     """
     stem = hashlib.sha256(token).hexdigest()[:12]
     rel = PAD_PREFIX + stem + ".dat"
-    overhead = 30 + len(rel) + 46 + len(rel)
+    overhead = 30 + len(rel) + 46 + len(rel) + len(PAD_TAG)
 
     def assemble(size: int) -> bytes:
         buf = io.BytesIO()
         with zipfile.ZipFile(io.BytesIO(payload)) as src, \
                 zipfile.ZipFile(buf, "w") as dst:
             for info in src.infolist():
-                dst.writestr(info, src.read(info.filename))
+                # 按 ZipInfo 定位，不能用文件名：包里可能有多个同名条目
+                # （例如用户自己的 .manifest 和工具清单），按名字读会串味。
+                cloned = copy.copy(info)
+                if info.is_dir():
+                    dst.writestr(cloned, b"")
+                    continue
+                with src.open(info) as reader, dst.open(cloned, "w") as writer:
+                    shutil.copyfileobj(reader, writer, _COPY_CHUNK)
             if size > 0:
                 pad = zipfile.ZipInfo(rel, date_time=(2024, 1, 1, 0, 0, 0))
                 pad.compress_type = zipfile.ZIP_STORED
+                pad.comment = PAD_TAG
                 dst.writestr(pad, hashlib.shake_256(token + b"pad").digest(size))
         return buf.getvalue()
 
@@ -608,7 +748,8 @@ def build_armored(
         raise ArmorError(f"未知强度档：{profile}")
     mem, time, para, rounds = PROFILES[profile]
 
-    real = pack_source(Path(src), on_progress)
+    manifest_name = _free_manifest_name(Path(src))
+    real = pack_source(Path(src), on_progress, manifest_name=manifest_name)
     stats = _source_stats(real)
     seed = secrets.token_bytes(32)
     global_salt = secrets.token_bytes(SALT_LEN)
@@ -641,14 +782,18 @@ def build_armored(
 
     raw: list[tuple[bytes, bytes]] = [(password, real)]
     for i, dp in enumerate(decoy_pws):
-        raw.append((dp.encode("utf-8"), _make_decoy_zip(seed, i, stats)))
+        raw.append((dp.encode("utf-8"),
+                    _make_decoy_zip(seed, i, stats, manifest_name)))
     for i, dp in enumerate(dead_pws):
         # 死层也是完整可解的高仿真包，只是它的口令不出现在任何线索里。
         raw.append((dp.encode("utf-8"),
-                    _make_decoy_zip(seed, len(decoy_pws) + i, stats)))
+                    _make_decoy_zip(seed, len(decoy_pws) + i, stats,
+                                    manifest_name)))
 
     # 所有层补到同一尺寸：按大小排序挑真层这条最省事的剪枝路径就此失效。
-    target = max(len(p) for _pw, p in raw) + layout_rng.randint(0, 128)
+    # 额外留出至少一条填充条目的开销：若最大层（通常是真层）挤不下填充，
+    # 它会成为唯一没有 __tarpit_pad/ 条目的层，结构本身就把真伪标了出来。
+    target = max(len(p) for _pw, p in raw) + layout_rng.randint(256, 1024)
     payloads: list[tuple[bytes, bytes]] = [
         (pw, _pad_zip(p, target, seed + bytes([i % 256])))
         for i, (pw, p) in enumerate(raw)
@@ -790,8 +935,16 @@ def restore_armored(
     def finish(payload: bytes) -> RestoreResult:
         try:
             with zipfile.ZipFile(io.BytesIO(payload)) as zf:
-                entries = tuple(n for n in zf.namelist()
-                                if not n.startswith(PAD_PREFIX))
+                # entries 只列程序包里的文件：目录条目、尺寸填充和工具清单
+                # 都不是用户文件，计数与 GUI「已写出 N 个文件」保持一致。
+                entries = []
+                for info in zf.infolist():
+                    if info.is_dir():
+                        continue
+                    data = (zf.read(info) if info.comment == b""
+                            and info.filename == ".manifest" else None)
+                    if not _is_internal(info, data):
+                        entries.append(info.filename)
         except zipfile.BadZipFile as exc:
             raise ArmorError("解开的内容不是有效程序包") from exc
         _notify(on_progress, len(parsed), len(parsed), "还原完成")
@@ -799,7 +952,7 @@ def restore_armored(
             payload=payload,
             sha256=sha256_bytes(payload),
             file_count=len(entries),
-            entries=entries,
+            entries=tuple(entries),
         )
 
     # 内存硬 KDF 并行会把峰值内存乘以并发数，狠档一律走串行。
@@ -841,8 +994,8 @@ def safe_extract(payload: bytes, out_dir: str | Path) -> list[Path]:
     with zipfile.ZipFile(io.BytesIO(payload)) as zf:
         for info in zf.infolist():
             raw = info.filename
-            if raw.startswith(PAD_PREFIX):
-                continue
+            # 安全检查对所有条目生效，包括马上要跳过的内部条目；否则恶意
+            # 载荷只要把名字塞进内部前缀就能绕过路径校验。
             if not raw or raw.startswith(("/", "\\")) or "\\" in raw:
                 raise ArmorError(f"不安全的条目名：{raw!r}")
             parts = PurePosixPath(raw).parts
@@ -854,10 +1007,15 @@ def safe_extract(payload: bytes, out_dir: str | Path) -> list[Path]:
             target = (out / PurePosixPath(raw)).resolve()
             if not target.is_relative_to(out):
                 raise ArmorError(f"条目逃出目标目录：{raw!r}")
+            data = (zf.read(info) if info.comment == b""
+                    and raw == ".manifest" else None)
+            if _is_internal(info, data):
+                continue
             if info.is_dir():
                 target.mkdir(parents=True, exist_ok=True)
                 continue
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(zf.read(info))
+            with zf.open(info) as reader, target.open("wb") as writer:
+                shutil.copyfileobj(reader, writer, _COPY_CHUNK)
             written.append(target)
     return written
