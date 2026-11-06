@@ -1113,8 +1113,26 @@ def _run(args: argparse.Namespace) -> int:
     raise UsageError(f"未知子命令：{args.command}")
 
 
+def _configure_stdio() -> None:
+    """把标准输出/错误切到 UTF-8，避免在 cp1252 之类的控制台上打印中文即崩。
+
+    Python 3.15 起默认启用 UTF-8 模式（PEP 686），本地通常看不到问题；
+    但 3.11~3.14 的英文 Windows 控制台仍是 cp1252，一句 ``print("已加密")``
+    就会抛 ``UnicodeEncodeError`` 把进程打挂。这里统一自愈，失败也不影响主流程。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:  # pragma: no cover - 被重定向到非文本流
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):  # pragma: no cover - 个别流不支持重配
+            pass
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """CLI 入口，返回契约 4 定义的退出码。"""
+    _configure_stdio()
     parser = _build_parser()
     try:
         args = parser.parse_args(argv)

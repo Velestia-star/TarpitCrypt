@@ -434,8 +434,21 @@ class TarpitWebServer(ThreadingHTTPServer):
 # ---------------------------------------------------------------------------
 
 
+def _configure_stdio() -> None:
+    """把标准输出/错误切到 UTF-8，避免 cp1252 控制台上打印中文直接崩。"""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:  # pragma: no cover
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):  # pragma: no cover
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
     """启动本地 Web 服务。"""
+    _configure_stdio()
     parser = argparse.ArgumentParser(
         prog="tarpitcrypt-web",
         description="TarpitCrypt 本地 Web 入口：拖文件进来，加密文件出去。",
