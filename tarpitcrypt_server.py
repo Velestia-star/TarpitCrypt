@@ -636,10 +636,11 @@ INDEX_HTML = """<!doctype html>
       out.push({ file, path: prefix + file.name });
     } else if (entry.isDirectory) {
       const reader = entry.createReader();
+      const readBatch = () => new Promise((res, rej) => reader.readEntries(res, rej));
       const entries = [];
       let batch;
       do {
-        batch = await new Promise((res, rej) => reader.readEntries(res, rej));
+        batch = await readBatch();
         entries.push(...batch);
       } while (batch.length);
       for (const child of entries) await walkEntry(child, prefix + entry.name + "/", out);
@@ -649,7 +650,7 @@ INDEX_HTML = """<!doctype html>
   async function collectFromDrop(dt) {
     const out = [];
     const roots = [];
-    for (const item of dt.items) {
+    for (const item of Array.from(dt.items)) {
       const entry = item.webkitGetAsEntry && item.webkitGetAsEntry();
       if (entry) roots.push(entry);
     }
