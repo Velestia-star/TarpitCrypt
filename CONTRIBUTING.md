@@ -13,7 +13,7 @@
 
 ```bash
 pip install argon2-cffi cryptography pytest
-python -m pytest tests -o addopts=""   # 82 项：v1 单元 + 固定格式兼容 + 浏览器互解
+python -m pytest tests -o addopts=""   # 88 项：v1 单元 + 固定格式兼容 + 浏览器互解 + 编码回归
 python armor/selftest.py               # armor 端到端
 python armor/probe_agent.py            # 模拟逆向轮数对照
 ```

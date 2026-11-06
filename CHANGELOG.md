@@ -29,6 +29,9 @@
   原生消息）、跨平台打开输出目录、口令强度体检、输出覆盖二次确认、
   低内存档并行尝试各层（最多 4 线程）、源文件上限可用
   `TARPIT_MAX_SOURCE_BYTES` 调整、PyInstaller 打包脚本。
+- **CI 编码修复**：Windows runner 默认 stdout 为 cp1252，中文日志抛
+  `UnicodeEncodeError`。CI 设 `PYTHONUTF8` / `PYTHONIOENCODING`，并新增
+  `console_utf8.py` 让脚本自身在英文版 Windows 上也能兜底。
 
 ### 修复
 
@@ -43,8 +46,8 @@
 
 ### 验证
 
-- `pytest`：82 passed（42 项 v1 单元 + Web 入口 + 21 项固定格式兼容断言
-  + 4 项 keygen 覆盖保护 + 1 项浏览器 ↔ Python 双向互解）。
+- `pytest`：88 passed（42 项 v1 单元 + Web 入口 + 21 项固定格式兼容断言
+  + 4 项 keygen 覆盖保护 + 1 项浏览器互解 + 6 项控制台编码回归）。
 - `ruff check .`：All checks passed（`E4/E7/E9/F` 规则集）。
 - `armor/selftest.py`：62/62 通过。
 - GUI 无头全流程（异步加固 / 伴生 / 并行还原 / 报告页）通过。

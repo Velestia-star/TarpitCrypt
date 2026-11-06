@@ -27,6 +27,9 @@ from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from console_utf8 import ensure  # noqa: E402
+
+ensure()
 import armor_core as ac  # noqa: E402
 import probe_agent as pa  # noqa: E402
 from armor_metrics import TOKENS_PER_ROUND  # noqa: E402

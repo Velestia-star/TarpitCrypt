@@ -28,6 +28,9 @@ import zipfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from console_utf8 import ensure  # noqa: E402
+
+ensure()
 import armor_core as ac  # noqa: E402
 from tarpitcrypt import CIPHER_AESGCM, _aead_decrypt, _aead_encrypt  # noqa: E402
 
