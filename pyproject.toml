@@ -19,9 +19,10 @@ dev = ["pytest>=8.0"]
 
 [project.scripts]
 tarpitcrypt = "tarpitcrypt:main"
+tarpitcrypt-web = "tarpitcrypt_server:main"
 
 [tool.setuptools]
-py-modules = ["tarpitcrypt"]
+py-modules = ["tarpitcrypt", "tarpitcrypt_server"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

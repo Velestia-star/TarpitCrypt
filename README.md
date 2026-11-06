@@ -54,6 +54,35 @@ python tarpitcrypt.py ai-config params.json     # 先校验，看哪些被丢弃
 python tarpitcrypt.py encrypt a.txt a.tarpit --ai-config params.json
 ```
 
+---
+
+## 本地网页版（拖拽即用）
+
+不想碰命令行就用这个。零额外依赖，标准库起服务：
+
+```bash
+python tarpitcrypt_server.py --open
+# → http://127.0.0.1:8765
+```
+
+打开后：**把文件或整个文件夹拖进去** → 输口令 → 点「加密并下载」，
+浏览器直接落一个 `.tarpit` 文件。切到「解密」标签，拖回 `.tarpit` 就能解出来。
+
+- 文件夹会被打包成一个 `.tarpit`；解开后是一个 `.zip`（保留目录结构）。
+- 支持 keyfile、强度预设、PoW、AEAD 算法、诱饵层。
+- 拖入文件夹后，界面上每条文件都带相对路径，能看出结构对不对。
+
+安全边界（务必知道）：
+
+- 只监听 `127.0.0.1`，并校验 `Origin`，拒绝来自其他站点的跨源提交。
+- 口令随请求体走**本机回环 HTTP**，不落盘、不进日志、不设 cookie。
+  它只在这台机器的内存里存在几秒——但确实存在过。
+- Argon2id 是 GiB 级内存硬函数，服务端用一把全局锁把派生过程串行化，
+  避免你同时点两次直接把机器 OOM。代价是并发请求要排队。
+- 单次请求上限 512 MB（明文、密文都要在内存里过一遍）。
+- 网页版不替代 CLI：批量、脚本化、离线环境还是用 `tarpitcrypt.py`。
+
+
 AI 只允许输出下面这些键与值，其他一律丢弃并记 warning——
 **AI 永远碰不到口令、密钥、keyfile 的内容，它只产出 JSON 旋钮**：
 
@@ -164,7 +193,7 @@ Argon2id 是内存硬函数，GPU/ASIC 的并行优势被内存带宽卡死，�
 
 ```bash
 pip install pytest
-python -m pytest tests -q          # 42 passed
+python -m pytest tests          # 58 passed
 ```
 
 测试里带 **KDF 黄金向量**（`_derive` 的固定输入 → 固定输出）。
