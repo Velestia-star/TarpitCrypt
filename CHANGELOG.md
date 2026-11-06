@@ -46,8 +46,8 @@
 
 ### 验证
 
-- `pytest`：82 passed（42 项 v1 单元 + Web 入口 + 21 项固定格式兼容断言
-  + 4 项 keygen 覆盖保护 + 1 项浏览器 ↔ Python 双向互解）。
+- `pytest`：88 passed（42 项 v1 单元 + Web 入口 + 21 项固定格式兼容断言
+  + 4 项 keygen 覆盖保护 + 1 项浏览器互解 + 6 项控制台编码回归）。
 - `ruff check .`：All checks passed（`E4/E7/E9/F` 规则集）。
 - `armor/selftest.py`：62/62 通过。
 - GUI 无头全流程（异步加固 / 伴生 / 并行还原 / 报告页）通过。

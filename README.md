@@ -265,7 +265,7 @@ Argon2id 是内存硬函数，GPU/ASIC 的并行优势被内存带宽卡死，�
 
 ```bash
 pip install argon2-cffi cryptography pytest
-python -m pytest tests -o addopts=""   # 82 项：v1 单元 + 固定格式兼容 + keygen 保护 + 浏览器互解
+python -m pytest tests -o addopts=""   # 88 项：v1 单元 + 固定格式兼容 + keygen 保护 + 浏览器互解 + 控制台编码回归
 python -m pytest tests -k browser      # 单跑浏览器 ↔ Python 双向互解（无浏览器时跳过）
 python armor/selftest.py               # 62/62
 python armor/probe_agent.py            # 模拟逆向轮数对照
