@@ -23,10 +23,10 @@ TarpitCrypt 是一个**反 AI 逆向的整活项目**。底层是一个本地文
 
 | 层面 | 当前值 | 说明 |
 | --- | --- | --- |
-| 发布版本 | **v0.3.2** | 新增 IOC 蜜罐 / RAG 投毒两种内容层陷阱，针对真实 AI 逆向工具，见 [CHANGELOG.md](CHANGELOG.md) |
+| 发布版本 | **v0.3.3** | 内容层陷阱实测 + 硬化（新增 content_probe 验证工具），见 [CHANGELOG.md](CHANGELOG.md) |
 | v1 文件格式 | `VERSION = 1`，`MAGIC = TARPITCR` | `.tarpit` 文件，格式冻结 |
 | armor 容器格式 | `VERSION = 3`，`MAGIC = TPARMOR3` | `.armored` 文件；v2 / v0.3.0 容器仍可读 |
-| Python 包元数据 | `0.3.2` | `pyproject.toml` |
+| Python 包元数据 | `0.3.3` | `pyproject.toml` |
 
 两层格式互不依赖：`armor/` 只复用 v1 的 Argon2id 与 AES-256-GCM 原语，
 **v1 文件格式一个字节没改**。
@@ -271,9 +271,10 @@ Argon2id 是内存硬函数，GPU/ASIC 的并行优势被内存带宽卡死，�
 pip install argon2-cffi cryptography pytest
 python -m pytest tests -o addopts=""   # 88 项：v1 单元 + 固定格式兼容 + keygen 保护 + 浏览器互解 + 控制台编码回归
 python -m pytest tests -k browser      # 单跑浏览器 ↔ Python 双向互解（无浏览器时跳过）
-python armor/selftest.py               # 78/78
-python armor/probe_agent.py            # 模拟逆向轮数对照
+python armor/selftest.py               # 100/100
+python armor/probe_agent.py            # 模拟逆向轮数对照（加密容器层）
 python armor/agent_eval.py --runs 5    # 多轮取样 + 评估报告
+python armor/content_probe.py --poison ALL   # 内容层陷阱实测：模拟 AI 逆向 agent 打诱饵包，验证全 TRAPPED 且无真实主机泄露
 ```
 
 CI 在 3 个系统 × Python 3.11/3.12/3.13 上跑同一套命令，配置见
