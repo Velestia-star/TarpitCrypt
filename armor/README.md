@@ -82,6 +82,7 @@ AI 逆向通常先列目录、读 README 和规格文档。伴生模式在原程
 | `armor_core.py` | v3 容器：随机口令、死层、去模板化诱饵、层尺寸对齐、并行还原、安全解包；兼容读取 v2 |
 | `decoy_kit.py` | 伴生诱饵包生成器、三种投毒侧重与清单校验 |
 | `armor_metrics.py` | 本地运行报告（内存态、CSV / Markdown 导出、token 量级估算） |
+| `console_utf8.py` | 控制台编码兜底：英文版 Windows 的 cp1252 也能打印中文日志 |
 | `selftest.py` | **62 项**端到端自测，含 S 级回归、v2 兼容、并行还原、口令体检、投毒策略与报告 |
 | `probe_agent.py` | 三组模拟逆向 agent（基线 / 盲 / 读源码）轮数与剪枝对照 |
 | `agent_eval.py` | 多轮取样评估报告（Markdown，含 token 估算与局限声明） |

@@ -9,6 +9,12 @@ on:
 permissions:
   contents: read
 
+# Windows runner 默认 stdout 是 cp1252，中文日志会直接抛 UnicodeEncodeError。
+# 强制 UTF-8 让三个系统的行为一致（用户本机仍由 .bat 的 chcp 负责）。
+env:
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: "utf-8"
+
 jobs:
   test:
     name: ${{ matrix.os }} / Python ${{ matrix.python }}

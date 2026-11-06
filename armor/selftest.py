@@ -18,6 +18,9 @@ import zipfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from console_utf8 import ensure  # noqa: E402
+
+ensure()
 import armor_core as ac  # noqa: E402
 import armor_metrics as am  # noqa: E402
 import decoy_kit as dk  # noqa: E402

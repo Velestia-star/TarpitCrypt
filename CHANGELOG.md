@@ -29,6 +29,9 @@
   原生消息）、跨平台打开输出目录、口令强度体检、输出覆盖二次确认、
   低内存档并行尝试各层（最多 4 线程）、源文件上限可用
   `TARPIT_MAX_SOURCE_BYTES` 调整、PyInstaller 打包脚本。
+- **CI 编码修复**：Windows runner 默认 stdout 为 cp1252，中文日志抛
+  `UnicodeEncodeError`。CI 设 `PYTHONUTF8` / `PYTHONIOENCODING`，并新增
+  `console_utf8.py` 让脚本自身在英文版 Windows 上也能兜底。
 
 ### 修复
 
