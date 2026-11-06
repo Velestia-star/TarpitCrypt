@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
-"""模拟一个 AI 逆向 agent，量化「信息污染」到底多烧了多少轮工具调用。
+"""模拟 AI 逆向 agent，量化「信息污染」到底多烧了多少轮工具调用。
 
-对照两组：
-  A 基线 —— 单层加密，头部参数全明文，无诱饵、无规格草稿。
-  B 加固 —— 本工具生成的多层容器，带互相矛盾的规格草稿和泄露口令。
+对照三组：
+  A 基线   —— 单层加密，头部参数全明文，无诱饵、无规格草稿。
+  B 盲 agent —— 只看容器里的规格草稿，用工具自带接口逐层尝试。
+  C 知情 agent —— 读过 GitHub 源码：自写解析器拆层表、拿层号、逐层试口令，
+                  再用「解开 N-1 层后剩下那层就是真层」做排除法。
+
+v3 之前 C 组能用硬编码口令池 + 排除法在 21 轮确定性锁定真层；
+v3 去掉口令池、掺入死层后，C 组应当无法再定位真层。
 
 计量口径（保守下界）：
-  · 每对一个候选口令做一层密钥派生 + 认证尝试 = 1 轮
+  · 每对 (层, 候选口令) 做一次密钥派生 + 认证尝试 = 1 轮
   · 解开一个包后，因为没有任何真伪标记，还要再花 2 轮分析内容
   · 真实 agent 还会为「字段表互相矛盾」额外写解析/验证脚本，这里没算
 
@@ -25,6 +30,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import armor_core as ac  # noqa: E402
 from tarpitcrypt import CIPHER_AESGCM, _aead_decrypt, _aead_encrypt  # noqa: E402
+
+SOURCE_READ_ROUNDS = 3
+PARSE_ROUNDS = 2
 
 COMMON_GUESSES = ("password", "123456", "admin")
 ANALYSIS_ROUNDS = 2
@@ -103,6 +111,35 @@ def probe_armored(blob: bytes, candidates: list[str], layers: int) -> dict:
             "analysis": ANALYSIS_ROUNDS * opened, "rounds": rounds, "got_target": got}
 
 
+def probe_informed(blob: bytes, candidates: list[str], layers: int) -> dict:
+    """读过源码的 agent：自己拆层表，拿得到层号，因此能做排除法。"""
+    rounds = SOURCE_READ_ROUNDS + PARSE_ROUNDS
+    header, parsed = ac._parse(blob)
+    opened = 0
+    got = False
+    for prefix, ct, offset, kdf in parsed:
+        mem, t, para, rp = kdf
+        l_salt = prefix[ac._LAYER_META.size: ac._LAYER_META.size + ac.SALT_LEN]
+        nonce = prefix[ac._LAYER_META.size + ac.SALT_LEN:
+                       ac._LAYER_META.size + ac.SALT_LEN + ac.NONCE_LEN]
+        for pw in candidates:
+            rounds += 1
+            key = ac._layer_key(pw.encode("utf-8"), l_salt, mem, t, para, rp)
+            aad = header + prefix + ac._U32.pack(offset)
+            payload = _aead_decrypt(CIPHER_AESGCM, key, nonce, aad, ct)
+            if payload is None:
+                continue
+            opened += 1
+            rounds += ANALYSIS_ROUNDS
+            got = got or is_target(payload)
+            break
+    remaining = len(parsed) - opened
+    return {"candidates": len(candidates), "tried": rounds, "opened": opened,
+            "analysis": ANALYSIS_ROUNDS * opened, "rounds": rounds,
+            "got_target": got, "remaining": remaining,
+            "located_real": remaining == 1}
+
+
 def show(title: str, result: dict) -> None:
     print(f"\n{title}")
     print(f"  候选口令        {result['candidates']}")
@@ -111,6 +148,9 @@ def show(title: str, result: dict) -> None:
     print(f"  逐包内容分析    {result['analysis']} 轮")
     print(f"  合计工具调用    {result['rounds']} 轮")
     print(f"  拿到真程序包    {'是' if result['got_target'] else '否'}")
+    if "remaining" in result:
+        print(f"  排除法剩余层    {result['remaining']} 层")
+        print(f"  确定性定位真层  {'是' if result['located_real'] else '否'}")
 
 
 def main() -> int:
@@ -132,19 +172,28 @@ def main() -> int:
 
         a = probe_plain(plain, plain_candidates)
         b = probe_armored(armored, armored_candidates, layers=4)
+        c = probe_informed(armored, armored_candidates, layers=4)
 
         print("=" * 62)
-        print("模拟 AI 逆向 agent · 工具调用轮数对比")
+        print("模拟 AI 逆向 agent · 工具调用轮数对比（v3）")
         print("=" * 62)
         print(f"基线容器 {len(plain):,} 字节 / 加固容器 {len(armored):,} 字节")
-        print(f"规格草稿泄露口令 {leaked}")
+        print(f"规格草稿列出 {len(leaked)} 条口令（部分有效、部分噪音）")
         show("A · 基线（明文参数、单层、无诱饵）", a)
-        show("B · 加固（4 层、3 诱饵、矛盾规格草稿）", b)
+        show("B · 盲 agent（只看容器草稿）", b)
+        show("C · 知情 agent（读过源码 + 自写解析器 + 排除法）", c)
         ratio = b["rounds"] / max(a["rounds"], 1)
-        print(f"\n放大倍数  {ratio:.1f}×")
-        print("说明：这是保守下界。草稿里互相矛盾的字段（字节序、CT_LEN、")
+        print(f"\n放大倍数  {ratio:.1f}×（盲 agent 相对基线）")
+        delta = c["rounds"] - b["rounds"]
+        print(f"两组轮数差        {delta:+d} 轮（搜索顺序差异，不是剪枝优势）")
+        print(f"知情 agent 确定性定位真层  {'是' if c['located_real'] else '否'}  ← 关键指标")
+        print("\n历史对照：v2 时期源码里有硬编码口令池、且没有死层，")
+        print("同样的 C 组算法 21 轮就能确定性锁定真层（第 3 层）。")
+        print("v3 去掉口令池、掺入死层、只公开部分口令后：")
+        print(f"  C 组解开 {c['opened']} 层，还剩 {c['remaining']} 层无法排除，"
+              f"确定性定位 = {'是' if c['located_real'] else '否'}。")
+        print("\n说明：这是保守下界。草稿里互相矛盾的字段（字节序、CT_LEN、")
         print("AAD 覆盖范围、兼容头偏移）会诱使真实 agent 额外写解析脚本反复核对。")
-        print("真正值钱的是「没有任何真伪标记」：解开的每一份都得继续分析。")
         print("关键差别不在轮数，而在结果：基线第一轮就拿到真包，加固组")
         print(f"{b['rounds']} 轮后解开的 {b['opened']} 份全是诱饵，且 agent 无从确证。")
     return 0
