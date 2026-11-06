@@ -1,0 +1,64 @@
+﻿F..........................................................              [100%]
+================================== FAILURES ===================================
+___________________ test_js_and_python_are_byte_compatible ____________________
+
+served_site = 'http://127.0.0.1:60980/_selftest.html'
+tmp_path = WindowsPath('C:/Users/23216/AppData/Local/Temp/pytest-of-23216/pytest-22/test_js_and_python_are_byte_co0')
+
+    @pytest.mark.browser
+    def test_js_and_python_are_byte_compatible(served_site: str, tmp_path: Path) -> None:
+        """浏览器与 Python 必须能互相解开对方生成的文件。"""
+        browser = find_browser()
+        if browser is None:
+            pytest.skip("本机没有 Edge/Chrome，跳过浏览器兼容性测试")
+    
+        probe = subprocess.run(
+            [browser, "--headless", "--disable-gpu", "--dump-dom", "data:text/html,<h1>x</h1>"],
+            capture_output=True, text=True, timeout=90,
+        )
+        if "dump-dom" not in probe.stdout and "<h1>" not in probe.stdout:
+            pytest.skip(f"浏览器不支持 --dump-dom：{browser}")
+    
+        result = subprocess.run(
+            [
+                browser, "--headless", "--disable-gpu", "--no-first-run",
+                "--no-default-browser-check",
+                f"--user-data-dir={tmp_path / 'profile'}",
+                "--virtual-time-budget=120000",
+                "--dump-dom", served_site,
+            ],
+            capture_output=True, text=True, timeout=300,
+        )
+        match = re.search(r"RESULT(.*?)END", result.stdout, re.S)
+        assert match, f"页面没有产出结果：{result.stdout[:800]}"
+    
+        output = match.group(1)
+        fails = [line for line in output.splitlines() if line.startswith("FAIL")]
+        errors = [line for line in output.splitlines() if line.startswith("ERROR")]
+        assert not fails, f"浏览器端断言失败：{fails}\n{errors}"
+        assert not errors, f"浏览器端异常：{errors}"
+    
+        def extract(tag: str) -> bytes:
+            found = re.search(rf"{tag} ([0-9a-f]+)", output)
+            assert found, f"结果里缺少 {tag}"
+            return bytes.fromhex(found.group(1))
+    
+        # 方向一：Python 解浏览器造的文件
+>       assert tc.decrypt(extract("JSFILE"), b"js-pw") == (b"js-made-payload", False)
+                          ^^^^^^^^^^^^^^^^^
+
+tests\test_browser_compat.py:216: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+tag = 'JSFILE'
+
+    def extract(tag: str) -> bytes:
+        found = re.search(rf"{tag} ([0-9a-f]+)", output)
+>       assert found, f"结果里缺少 {tag}"
+E       AssertionError: 结果里缺少 JSFILE
+E       assert None
+
+tests\test_browser_compat.py:212: AssertionError
+=========================== short test summary info ===========================
+FAILED tests/test_browser_compat.py::test_js_and_python_are_byte_compatible
+1 failed, 58 passed in 12.69s

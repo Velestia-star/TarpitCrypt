@@ -16,13 +16,13 @@ from __future__ import annotations
 
 import base64
 import io
-import json
 import os
 import re
 import shutil
 import subprocess
 import sys
 import threading
+import time
 import zipfile
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -188,28 +188,49 @@ def test_js_and_python_are_byte_compatible(served_site: str, tmp_path: Path) -> 
     if "dump-dom" not in probe.stdout and "<h1>" not in probe.stdout:
         pytest.skip(f"浏览器不支持 --dump-dom：{browser}")
 
-    result = subprocess.run(
-        [
-            browser, "--headless", "--disable-gpu", "--no-first-run",
-            "--no-default-browser-check",
-            f"--user-data-dir={tmp_path / 'profile'}",
-            "--virtual-time-budget=120000",
-            "--dump-dom", served_site,
-        ],
-        capture_output=True, text=True, timeout=300,
-    )
-    match = re.search(r"RESULT(.*?)END", result.stdout, re.S)
-    assert match, f"页面没有产出结果：{result.stdout[:800]}"
+    def dump_once() -> tuple[str, subprocess.CompletedProcess[str]]:
+        """跑一次无头浏览器，只取 <pre id="out"> 里的文本。
 
-    output = match.group(1)
-    fails = [line for line in output.splitlines() if line.startswith("FAIL")]
-    errors = [line for line in output.splitlines() if line.startswith("ERROR")]
+        注意：不能拿整段 DOM 去正则匹配 `RESULT...END`——`--dump-dom` 会把
+        内联 `<script>` 的**源码**也吐出来，源码里同样有这两个字面量，
+        页面还没跑完时会先命中脚本源码，得到一个空结果。
+        """
+        run = subprocess.run(
+            [
+                browser, "--headless", "--disable-gpu", "--no-first-run",
+                "--no-default-browser-check",
+                f"--user-data-dir={tmp_path / 'profile'}",
+                "--virtual-time-budget=300000",
+                "--dump-dom", served_site,
+            ],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300,
+        )
+        found = re.search(r'<pre id="out">(.*?)</pre>', run.stdout, re.S)
+        return (found.group(1).strip() if found else ""), run
+
+    output = ""
+    result: subprocess.CompletedProcess[str] | None = None
+    for _attempt in range(3):
+        output, result = dump_once()
+        if output.startswith("RESULT"):
+            break
+        time.sleep(0.8)
+
+    assert output.startswith("RESULT") and result is not None, (
+        f"页面没有产出结果（dump={len(result.stdout) if result else 0}B）\n"
+        f"---- 页面文本 ----\n{output[:400]}\n"
+        f"---- 浏览器 stderr ----\n{(result.stderr[-600:] if result else '')}"
+    )
+
+    body = output[len("RESULT"):].rsplit("END", 1)[0]
+    fails = [line for line in body.splitlines() if line.startswith("FAIL")]
+    errors = [line for line in body.splitlines() if line.startswith("ERROR")]
     assert not fails, f"浏览器端断言失败：{fails}\n{errors}"
     assert not errors, f"浏览器端异常：{errors}"
 
     def extract(tag: str) -> bytes:
-        found = re.search(rf"{tag} ([0-9a-f]+)", output)
-        assert found, f"结果里缺少 {tag}"
+        found = re.search(rf"{tag} ([0-9a-f]+)", body)
+        assert found, f"结果里缺少 {tag}；页面输出：\n{body[:800]}"
         return bytes.fromhex(found.group(1))
 
     # 方向一：Python 解浏览器造的文件
@@ -226,3 +247,34 @@ def test_js_and_python_are_byte_compatible(served_site: str, tmp_path: Path) -> 
         assert archive.namelist() == ["evil.txt", "proj/a.txt"]
         assert archive.read("evil.txt") == b"E"
         assert archive.read("proj/a.txt") == b"A"
+
+
+@pytest.mark.browser
+def test_index_page_boots(served_site: str, tmp_path: Path) -> None:
+    """真实页面能被加载，且 `app.js` 模块执行到底（界面胶水没有语法错）。"""
+    browser = find_browser()
+    if browser is None:
+        pytest.skip("本机没有 Edge/Chrome，跳过浏览器兼容性测试")
+
+    url = served_site.rsplit("/", 1)[0] + "/index.html"
+    dom = ""
+    for _attempt in range(3):
+        run = subprocess.run(
+            [
+                browser, "--headless", "--disable-gpu", "--no-first-run",
+                "--no-default-browser-check",
+                f"--user-data-dir={tmp_path / 'profile2'}",
+                "--virtual-time-budget=20000",
+                "--dump-dom", url,
+            ],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180,
+        )
+        dom = run.stdout
+        if 'data-app="ready"' in dom:
+            break
+        time.sleep(0.8)
+
+    assert 'data-app="ready"' in dom, f"页面模块没有执行完：\n{dom[:600]}"
+    assert 'id="drop"' in dom
+    assert "加密并下载" in dom
+    assert "/api/" not in dom, "纯前端页面不应再引用后端接口"

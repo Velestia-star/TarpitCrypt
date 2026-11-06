@@ -313,4 +313,6 @@ function bind() {
 if (typeof document !== "undefined") {
   bind();
   switchMode("encrypt");
+  // 就绪标记：既方便人工排查，也让无头浏览器测试能确认模块真的跑完了。
+  document.documentElement.dataset.app = "ready";
 }
