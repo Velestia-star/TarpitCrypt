@@ -3,6 +3,81 @@
 版本号遵循语义化版本，但项目仍在 0.x：格式版本（`VERSION`）与发布版本
 是两回事，见 README「版本说明」。
 
+## 未发布
+
+### 安全加固：v1 解密器的不信任输入边界
+
+- `FLAGS.POW` 与 `POW_DIFF` 必须一致；不一致按格式错误拒绝，避免 `info`
+  打印一份自相矛盾的元数据。
+- `CT_LEN` / `DECOY_LEN` 必须至少容纳 16 字节认证标签，并与文件实际长度
+  对齐。截断、尾部残留的文件现在**在进入 Argon2 之前**就以 `ValueError`
+  结束，不再为明显畸形的输入付一次完整 KDF。
+- `describe()` / `info` 复用同一套段长度校验；诱饵段被截断或主密文后有多余
+  字节时直接报错，不再静默返回对不上的 `decoy_len` / `total_len`。
+- v1 文件格式、KDF、AAD 与 CLI 退出码均未改动；`tests/fixtures/` 固定样本
+  和旧文件继续可解。新增 7 个回归用例，覆盖「校验发生在 KDF 之前」这条
+  顺序约定。
+
+### 安全加固：CLI 落盘与输入边界
+
+- 加密/解密输出改为「同目录临时文件 + `fsync` + `os.replace`」的原子写；
+  中途失败不会留下半截文件，也不会先把已有文件截断。新增 `--force`，默认
+  拒绝覆盖已存在的输出。
+- 输入与输出为同一路径时直接拒绝；输出与 keyfile 路径重合时也拒绝，避免
+  一次覆盖同时弄丢密文和密钥。
+- 加密时拒绝空口令；`keyfile` 为空文件或超过 1 MiB 时拒绝。旧实现会把
+  0 字节 keyfile 静默当成「没启用 keyfile」，用户以为有第二因子，实际没有。
+- 解密仍接受空口令，保证历史上用空口令加密的文件可解；CLI / Web 读取
+  keyfile 时同样限制 1 MiB。
+- 新输出文件由 `mkstemp` 创建（POSIX 下 0600），覆盖已有文件时沿用旧权限。
+- 新增输出路径、原子写、空口令 / 空 keyfile 的回归用例。
+
+### 体验：默认只留一个口令（整活优先）
+
+- 在线版 / 本地网页版把 keyfile 移进「高级」，主表单只留 口令 / 确认 / 强度；
+  keyfile、PoW、诱饵层不打开就全部不设，不会追问任何额外秘密。
+- CLI 帮助与 README 明确默认只需要一个口令，`--keyfile` / `--decoy` 是可选
+  兼容项；v1 文件格式不变。
+- 新增 `docs/ROADMAP.md`：把「让 AI 判断不了自己是否找对」作为主线，区分
+  v1 基础加密与 armor 整活层，列出 P0~P4 与度量口径。
+
+### 安全加固：单次工作预算与 KDF 失败兜底
+
+- `encrypt` / `decrypt` 在进入 Argon2 之前检查文件头或参数的
+  `mem × time × rounds`，默认上限 16 GiB·轮；超过直接拒绝，不再让
+  91 字节的畸形文件按 `2 GiB / time=10 / rounds=8` 跑满一次 KDF。
+- 新增 `--allow-heavy` / `max_work=None` 显式放行；`info` 输出
+  `work_kib_rounds` 与 `work_over_default`，先看再决定要不要放行。
+- Argon2 的 `MemoryError` / `HashingError` 统一包装成
+  `EnvironmentSetupError`，CLI 返回退出码 4，不再打 traceback。
+- 浏览器核心同步工作量上限（`LIMITS.maxWork`）；在线版打开畸形文件时
+  在 `parseHeader` 阶段就拒绝，不会把标签页跑死。
+- 诱饵层逻辑未改动；预算只按文件头的 KDF 参数计算，主层与诱饵层共用同一上限。
+- 行为变化：此前用自定义重参数（超过 16 GiB·轮）生成的文件，解密时需要加
+  `--allow-heavy`；默认档与全部官方预设都不受影响。
+
+### 体验：弱口令提示（只警告不强制）
+
+- 新增 `check_password_strength()`，判定与 armor 的
+  `check_password_strength` 同口径（长度 ≥ 8、至少两类字符、常见弱口令表）；
+  只提示，不阻止加密。
+- CLI 在加密 / 设置诱饵口令时写 stderr 警告；网页在口令框下方显示提示，
+  切到解密页自动隐藏。
+- 浏览器核心导出 `checkPasswordStrength()`，与 Python 共用同一口径；
+  不记录口令、不联网。
+- 不改变 `encrypt` / `decrypt` 的行为；弱口令仍然可用，只是会看到提示。
+
+### 性能与兼容：浏览器 PoW 提速 + 解析器对齐
+
+- `grindPow` 改为每批 256 个并发 SHA-256 提交，本机 WebCrypto 实测 1k 次
+  约 61 ms → 20 ms（约 3 倍，具体随浏览器而异）；每 4096 次让出事件循环并
+  回调进度，在线版会显示「已试 N 次」。
+- `parseHeader` 与 Python 对齐：检查 `FLAGS.POW` / `POW_DIFF` 一致性，
+  `CT_LEN` 超过 `Number.MAX_SAFE_INTEGER` 时拒绝，避免 u64 精度问题。
+- `decrypt` 补上 `CT_LEN` / `DECOY_LEN` 至少容纳 16 字节认证标签的下限检查，
+  与 Python 的 `_validate_blob_layout` 一致。
+- 本地网页版 pow=20 的文案从「慢几秒」改为「可能几十秒」。
+
 ## v0.3.11 — 2026-11-07
 
 对容器各层做元数据统计审计后，把上一条列出的弱点逐条修掉。

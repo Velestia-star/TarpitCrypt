@@ -9,6 +9,10 @@
 <script src="vendor/argon2.umd.min.js"></script>
 </head>
 <body>
+<button class="queue-toggle" id="queueToggle" type="button" aria-controls="drawer" aria-expanded="false">
+  工作区<span class="queue-badge" id="queueBadge">0</span>
+</button>
+
 <main>
   <h1>Tarpit<span>Crypt</span></h1>
   <p class="sub">
@@ -38,9 +42,6 @@
     <label id="confirmWrap">再输一次
       <input type="password" id="password2" autocomplete="new-password">
     </label>
-    <label>keyfile（可选）
-      <input type="file" id="keyfile">
-    </label>
     <label id="presetWrap">强度预设
       <select id="preset">
         <option value="fast" selected>快速 · 256 MiB × 2 轮（约 1 秒）</option>
@@ -49,10 +50,15 @@
       </select>
     </label>
   </div>
+  <p class="hint pw-warn" id="pwWarning" hidden></p>
+  <p class="hint" id="onePwHint">默认只需要一个口令；keyfile、PoW、诱饵层都在「高级」里，通常不用动。</p>
 
   <details id="advanced">
-    <summary>高级：PoW / 诱饵层</summary>
+    <summary>高级：keyfile / PoW / 诱饵层（可全部不设）</summary>
     <div class="grid">
+      <label>keyfile（可选，兼容旧文件）
+        <input type="file" id="keyfile">
+      </label>
       <label>PoW 难度
         <select id="pow">
           <option value="0" selected>关闭</option>
@@ -67,7 +73,7 @@
         <input type="file" id="decoy">
       </label>
       <label class="decoy-only">诱饵口令
-        <input type="password" id="decoyPassword" placeholder="用别的口令才能解出诱饵">
+        <input type="password" id="decoyPassword" placeholder="选了诱饵文件才需要填">
       </label>
     </div>
   </details>
@@ -83,6 +89,75 @@
     </p>
   </footer>
 </main>
+
+<div class="drawer-backdrop" id="drawerBackdrop" hidden></div>
+
+<aside class="drawer" id="drawer" aria-hidden="true" aria-label="工作区">
+  <header class="drawer-head">
+    <div class="drawer-tabs">
+      <button class="dtab active" data-view="workspace" type="button">工作区</button>
+      <button class="dtab" data-view="history" type="button">历史</button>
+    </div>
+    <button class="drawer-close" id="drawerClose" type="button" aria-label="关闭">×</button>
+  </header>
+
+  <section class="drawer-view" id="viewWorkspace">
+    <div class="drawer-tools">
+      <label class="tool">＋ 加入文件<input type="file" id="queuePickFiles" multiple hidden></label>
+      <label class="tool">＋ 加入文件夹<input type="file" id="queuePickDir" webkitdirectory multiple hidden></label>
+      <button class="tool" id="queueDelete" type="button">删除选中</button>
+      <button class="tool" id="openPath" type="button">存放位置</button>
+    </div>
+
+    <div class="queue-cols">
+      <span class="q-check"><input type="checkbox" id="queueSelectAll" title="全选"></span>
+      <span>源文件 / 文件夹</span><span></span><span>加密结果</span>
+    </div>
+
+    <div class="queue-scroll" id="queueScroll">
+      <ul class="queue-list" id="queueList"></ul>
+      <p class="queue-empty" id="queueEmpty">
+        工作区是空的。<br>把文件或文件夹拖到这里，或点上面的「加入文件 / 加入文件夹」。
+      </p>
+    </div>
+  </section>
+
+  <section class="drawer-view" id="viewHistory" hidden>
+    <div class="drawer-tools">
+      <button class="tool" id="historyClear" type="button">清空历史</button>
+    </div>
+    <div class="queue-cols history-cols">
+      <span></span><span>过去加密的文件</span><span></span><span>结果</span><span></span>
+    </div>
+    <div class="queue-scroll">
+      <ul class="history-list" id="historyList"></ul>
+      <p class="queue-empty" id="historyEmpty">
+        还没有记录。<br>加密过的文件会自动记在这里，只存名字和时间，不存文件本身。
+      </p>
+    </div>
+  </section>
+
+  <p class="drawer-hint">
+    口令与强度沿用页面上的设置 · 把行拖到左侧大框里就会加密 · <span id="queueSummary">0 项</span>
+  </p>
+</aside>
+
+<div class="modal" id="pathModal" hidden>
+  <div class="modal-card">
+    <button class="modal-close" id="pathModalClose" type="button" aria-label="关闭">×</button>
+    <h3>文件存在哪里？</h3>
+    <p>这个页面是纯前端的，<strong>浏览器不允许网页读取或打开你的本地文件夹</strong>——
+      也正是这条限制，保证了你的文件不会离开浏览器。</p>
+    <p>你加密好的 <code>.tarpit</code> 和原来的文件，都在浏览器的下载目录里：</p>
+    <ul>
+      <li>Windows 默认：<code>C:\Users\你的用户名\Downloads</code></li>
+      <li>Edge / Chrome：设置 → 下载 → 可查看和修改「位置」</li>
+      <li>想每次自己选目录：打开「下载前询问每个文件的保存位置」</li>
+    </ul>
+    <p class="hint">想让按钮真的打开文件夹，用仓库里的命令行版或本地网页版——它们有文件系统权限。</p>
+  </div>
+</div>
+
 <script type="module" src="app.js"></script>
 </body>
 </html>

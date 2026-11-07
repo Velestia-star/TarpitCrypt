@@ -19,7 +19,9 @@ TarpitCrypt 是一个**反 AI 逆向的整活项目**。底层是一个本地文
 
 > 护城河怎么来的、针对哪些真实 AI 逆向工具、利用了它们的哪些盲区，见
 > [`armor/` 威胁模型](docs/AI_RE_THREATMODEL.md)；效果量化与待办（含真实
-> agent 实测）见 [`docs/AGENT_BENCHMARK.md`](docs/AGENT_BENCHMARK.md)。
+> agent 实测）见 [`docs/AGENT_BENCHMARK.md`](docs/AGENT_BENCHMARK.md)；
+> 整活路线与「为什么不是把 Argon2 调到无限」见
+> [`docs/ROADMAP.md`](docs/ROADMAP.md)。
 
 ---
 
@@ -45,7 +47,7 @@ TarpitCrypt 是一个**反 AI 逆向的整活项目**。底层是一个本地文
 ```bash
 pip install argon2-cffi cryptography
 
-# 加密
+# 加密（默认只需要一个口令）
 python tarpitcrypt.py encrypt notes.pdf notes.pdf.tarpit
 # 解密
 python tarpitcrypt.py decrypt notes.pdf.tarpit notes.pdf
@@ -56,7 +58,12 @@ python tarpitcrypt.py info notes.pdf.tarpit
 口令通过交互式 `getpass` 输入，或从 stdin 读（`--password-stdin`），
 **永远不作为命令行参数**——那样会被 `ps` / 命令行历史记下来。
 
-### 加一个 keyfile
+默认流程只问一个口令。`--keyfile` 和 `--decoy` 都是**可选**的高级 / 兼容项；
+不写它们，程序不会要求任何额外秘密。想让 AI 逆向更难受，用 `armor/`
+的多层容器——同样只需要一个主口令。默认档不会碰到单次工作预算；自定义到
+超过 16 GiB·轮时需要 `--allow-heavy`。
+
+### 可选：加一个 keyfile
 
 ```bash
 python tarpitcrypt.py keygen my.key           # 生成 64 字节 keyfile
@@ -66,7 +73,18 @@ python tarpitcrypt.py decrypt big.tarpit big.iso --keyfile my.key
 
 keyfile 丢了 = 数据没了。请离线备份（U 盘 / 纸）。别把它和密文放同一个目录。
 
-### 加一个诱饵层
+### 输出文件与输入边界
+
+- 默认**不覆盖**已存在的输出文件；确认覆盖请加 `--force`。
+- 输入与输出是同一个文件、或输出路径就是 keyfile 时直接拒绝——这两处
+  覆盖一次就可能同时弄丢密文和密钥。
+- 输出先写同目录临时文件、`fsync` 后再原子替换；中途失败不会留下半截文件，
+  也不会把已有文件先截断。新文件在 POSIX 上权限为 `0600`，覆盖时沿用旧权限。
+- 加密口令不能为空；`keyfile` 不能是空文件，也不能超过 1 MiB。旧版会把
+  0 字节 keyfile 静默当成「没启用 keyfile」，现在直接报错。
+- 解密仍接受空口令，历史上用空口令加密的文件还能打开。
+
+### 可选：加一个诱饵层（v1 兼容层）
 
 ```bash
 python tarpitcrypt.py encrypt real.txt out.tarpit --decoy fake.txt
@@ -78,6 +96,11 @@ python tarpitcrypt.py encrypt real.txt out.tarpit --decoy fake.txt
 代价：本工具的 `decrypt()` 命中诱饵层前会做两次派生，所以**合法用户会变慢**；
 但这不等于攻击者成本翻倍——他只攻主层就能判定一个候选口令失败，不必碰诱饵段。
 详见下文「什么情况下不安全」。
+
+v1 的诱饵层是**可见的**（文件头有 `FLAGS.bit2`，命中还会返回 `is_decoy`），
+它给的是「一个备用口令」，可否认性为零，不是反 AI 主力。想让 AI 判断不了
+自己是否拿到了真数据，用 [`armor/` 的多层容器](armor/README.md)——同样只需要
+一个主口令，层号与真伪都不会回给还原方。
 
 ### 用 AI 生成的参数
 
@@ -134,6 +157,9 @@ AAD 或字段顺序，这条测试立刻变红。
 - 强度预设上限压到 **1 GiB**：WASM 在部分设备/移动端分配不到更大的线性内存。
 - 跑 Argon2 期间页面会卡住几秒（主线程被 WASM 占满）。这是故意的等待，
   不是卡死；界面上有提示。
+- PoW 的 SHA-256 按批提交（每批 256 个），比逐个 `await` 快约 3 倍
+  （本机 WebCrypto 实测，浏览器数字会有差异）；pow=16 大约一两秒，
+  pow=20 仍可能几十秒，期间会显示已试次数。
 - 依赖 `docs/vendor/argon2.umd.min.js`（hash-wasm 4.12.0，MIT，已 vendor
   进仓库，不从 CDN 加载——加密工具不该有运行时供应链依赖）。
 
@@ -152,8 +178,13 @@ python tarpitcrypt_server.py --open
 浏览器直接落一个 `.tarpit` 文件。切到「解密」标签，拖回 `.tarpit` 就能解出来。
 
 - 文件夹会被打包成一个 `.tarpit`；解开后是一个 `.zip`（保留目录结构）。
-- 支持 keyfile、强度预设、PoW、AEAD 算法、诱饵层。
+- 主表单只需要口令；keyfile / PoW / 诱饵层都在「高级」里，默认不用动。
 - 拖入文件夹后，界面上每条文件都带相对路径，能看出结构对不对。
+- **结果会在服务端另存一份**到项目目录下的 `存放文件/`（首次启动自动创建，
+  `--out-dir` 可改），完成页给出完整路径和「打开所在目录」按钮——点了会弹出
+  系统文件管理器并选中那个文件。
+  这个按钮只认服务端自己登记的随机令牌，客户端传任意路径一律 404，不会变成
+  「打开任意文件」的入口。服务重启后旧令牌失效。
 
 安全边界（务必知道）：
 
@@ -232,15 +263,27 @@ Argon2id 是内存硬函数，GPU/ASIC 的并行优势被内存带宽卡死，�
 - **没有自创密码学**：只用 `cryptography` 提供的 AEAD / HKDF，以及
   `argon2-cffi` 的 Argon2id。口令与 keyfile 用 HKDF-SHA256 预哈希合成，
   这是标准的组合方式，不是自研 KDF。
-- **文件头先校验后使用**：`mem` / `time` / `para` / `rounds` / `POW_DIFF` 全部
-  在进入 Argon2 之前过区间检查，恶意文件没法用超大参数拖死你的机器。
+- **文件头先校验后使用**：`mem` / `time` / `para` / `rounds` / `POW_DIFF`
+  全部先过区间检查；`CT_LEN` / `DECOY_LEN` 再检查「至少装得下 16 字节认证
+  标签」并与文件实际长度对齐。截断、尾部残留、`FLAGS.POW` 与 `POW_DIFF`
+  不一致的畸形文件在进入 Argon2 之前就失败，不会为明显坏掉的文件付一次
+  完整 KDF，`info` 也不会再打印自相矛盾的元数据。
+- **单次工作预算**：解密前还会检查文件头里的 `mem × time × rounds`，默认上限
+  **16 GiB·轮**（覆盖最重的官方预设 12 GiB·轮并留约 33% 余量）。超过就拒绝，
+  需要 `--allow-heavy` 显式放行；`info` 会显示 `work_kib_rounds` 与
+  `work_over_default`。这样 91 字节的畸形文件没法让解密端按
+  `2 GiB / time=10 / rounds=8` 跑满一次 Argon2。
+- **KDF 资源失败可读**：Argon2 抛 `MemoryError` / `HashingError` 时统一转成
+  `EnvironmentSetupError`，CLI 返回退出码 4，不再打 traceback。
 
 ## 什么情况下不安全（请务必读）
 
 1. **口令熵低就全盘皆输。** Argon2 只是把每次尝试变贵，不能把弱口令变强。
-   4 位数字 PIN 在 3 秒/次下也只需几小时。用长口令或高熵口令。
-   `build_armored()` 默认强制口令体检（可用 `strict=False` 关闭，仅测试用），
-   GUI 里跳过警告需要显式确认。
+   4 位数字 PIN 在 3 秒/次下也只需几小时。用长口令或高熵口令。CLI 和网页会
+   做一次弱口令提示（长度、字符种类、常见弱口令），但只警告不阻止——它不能
+   替代你自己对熵的判断。
+   armor 的 `build_armored()` 默认强制口令体检（可用 `strict=False` 关闭，
+   仅测试用），GUI 里跳过警告需要显式确认。
 1. **容器是自包含的，可以无限次离线爆破。** 没有在线限流、没有锁定计数。
    本机实测默认「轻」档单次派生约 50 ms（32 MiB / 2 轮），约 19 次尝试/秒；
    弱口令撑不住几分钟。要更强的抵抗就选「中」/「狠」档，代价是每次还原更慢。
@@ -362,3 +405,13 @@ CI 在 3 个系统 × Python 3.11/3.12/3.13 上跑同一套命令，配置见
 ## 许可
 
 MIT，版权归 [TarpitCrypt contributors](LICENSE)。
+
+---
+
+## ☕ 请我们喝瓶饮料
+
+<img src="assets/donate-qr.jpg" alt="打赏二维码" width="220">
+
+**自愿打赏**，如果你觉得这个项目不错，可以给我们买瓶饮料，嘿嘿嘿
+
+<sub>打赏纯属心意，不解锁任何功能；项目始终 MIT 开源，全部代码都在这个仓库里。</sub>

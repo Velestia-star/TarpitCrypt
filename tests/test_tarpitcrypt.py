@@ -268,6 +268,101 @@ def test_unsupported_version_rejected() -> None:
         tc.decrypt(bytes(blob), PASSWORD)
 
 
+def _fail_derive(*_args: object, **_kwargs: object) -> bytes:
+    """一旦被调用就说明格式校验没能在 KDF 之前拦住文件。"""
+    raise AssertionError("格式校验失败得太晚：已经进入了 Argon2")
+
+
+def test_ct_len_below_tag_rejected_before_kdf(monkeypatch: pytest.MonkeyPatch) -> None:
+    """CT_LEN 装不下 16 字节标签时，必须在进 Argon2 之前就失败。"""
+    blob = bytearray(tc.encrypt(b"payload", PASSWORD, params=FAST))
+    struct.pack_into(">Q", blob, 83, tc.TAG_LEN - 1)
+    truncated = bytes(blob[: tc.HEADER_LEN + tc.TAG_LEN - 1])
+
+    monkeypatch.setattr(tc, "_derive", _fail_derive)
+    with pytest.raises(ValueError, match="CT_LEN"):
+        tc.decrypt(truncated, PASSWORD)
+
+
+def test_decoy_len_below_tag_rejected_before_kdf(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DECOY_LEN 装不下 16 字节标签时，同样不进 Argon2。"""
+    blob = bytearray(
+        tc.encrypt(
+            b"real",
+            PASSWORD,
+            params=FAST,
+            decoy_plaintext=b"fake",
+            decoy_password=DECOY_PASSWORD,
+        )
+    )
+    ct_len = struct.unpack_from(">Q", blob, 83)[0]
+    decoy_len_offset = tc.HEADER_LEN + ct_len + tc.NONCE_LEN
+    struct.pack_into(">Q", blob, decoy_len_offset, tc.TAG_LEN - 1)
+    truncated = bytes(blob[: decoy_len_offset + tc.TAG_LEN - 1])
+
+    monkeypatch.setattr(tc, "_derive", _fail_derive)
+    with pytest.raises(ValueError, match="DECOY_LEN"):
+        tc.decrypt(truncated, DECOY_PASSWORD)
+
+
+def test_pow_flag_and_pow_diff_must_agree() -> None:
+    """FLAGS.POW 与 POW_DIFF 是同一件事的两种写法，不一致就按格式错误拒绝。"""
+    no_pow = bytearray(tc.encrypt(b"payload", PASSWORD, params=FAST))
+    no_pow[18] = 16  # 声明了难度，却没置 FLAG_POW
+    with pytest.raises(ValueError, match="POW"):
+        tc.decrypt(bytes(no_pow), PASSWORD)
+
+    params = tc.CryptoParams(mem=8192, time=1, para=1, rounds=1, pow=16)
+    has_pow = bytearray(tc.encrypt(b"payload", PASSWORD, params=params))
+    assert has_pow[9] & tc.FLAG_POW
+    has_pow[18] = 0  # 置了 FLAG_POW，难度却是 0
+    with pytest.raises(ValueError, match="POW"):
+        tc.decrypt(bytes(has_pow), PASSWORD)
+
+
+def test_describe_reports_valid_decoy_len() -> None:
+    """合法文件的 info 仍要给出诱饵密文长度与总长度。"""
+    blob = tc.encrypt(
+        b"real",
+        PASSWORD,
+        params=FAST,
+        decoy_plaintext=b"fake",
+        decoy_password=DECOY_PASSWORD,
+    )
+    info = tc.describe(blob)
+    assert info["decoy_len"] == len(b"fake") + tc.TAG_LEN
+    assert info["total_len"] == len(blob)
+
+
+def test_describe_rejects_truncated_main() -> None:
+    """主密文被截断时，info 不能再打印一份看似正常的元数据。"""
+    blob = tc.encrypt(b"payload", PASSWORD, params=FAST)
+    with pytest.raises(ValueError, match="CT_LEN"):
+        tc.describe(blob[:-1])
+
+
+def test_describe_rejects_truncated_decoy() -> None:
+    """诱饵密文被截断时同样报错，而不是返回一个对不上的 decoy_len。"""
+    blob = tc.encrypt(
+        b"real",
+        PASSWORD,
+        params=FAST,
+        decoy_plaintext=b"fake",
+        decoy_password=DECOY_PASSWORD,
+    )
+    with pytest.raises(ValueError, match="DECOY_LEN"):
+        tc.describe(blob[:-1])
+
+
+def test_describe_rejects_trailing_bytes() -> None:
+    """主密文之后多出来的字节必须被 info 拒绝。"""
+    blob = tc.encrypt(b"payload", PASSWORD, params=FAST)
+    with pytest.raises(ValueError, match="多余字节"):
+        tc.describe(blob + b"junk")
+
+
 # ---------------------------------------------------------------------------
 # PoW
 # ---------------------------------------------------------------------------
@@ -478,3 +573,386 @@ def test_cli_info_works_without_password(
     captured = capsys.readouterr().out
     assert '"version": 1' in captured
     assert '"mem_kib": 8192' in captured
+
+
+# ---------------------------------------------------------------------------
+# 口令 / keyfile 输入边界
+# ---------------------------------------------------------------------------
+
+
+def test_encrypt_rejects_empty_password() -> None:
+    """空口令没有可保护的熵，必须在加密时就拒绝。"""
+    with pytest.raises(ValueError, match="口令"):
+        tc.encrypt(b"x", b"", params=FAST)
+
+
+def test_encrypt_rejects_empty_keyfile() -> None:
+    """0 字节 keyfile 不能被静默当成「没启用 keyfile」。"""
+    with pytest.raises(ValueError, match="keyfile"):
+        tc.encrypt(b"x", PASSWORD, params=FAST, keyfile=b"")
+
+
+def test_encrypt_rejects_empty_decoy_password() -> None:
+    """诱饵层也不能用空口令，否则等于留了一个零熵后门。"""
+    with pytest.raises(ValueError, match="诱饵口令"):
+        tc.encrypt(
+            b"real",
+            PASSWORD,
+            params=FAST,
+            decoy_plaintext=b"fake",
+            decoy_password=b"",
+        )
+
+
+def test_encrypt_rejects_oversized_keyfile() -> None:
+    """keyfile 上限 1 MiB，避免把大文件整个读进内存。"""
+    with pytest.raises(ValueError, match="KiB"):
+        tc.encrypt(
+            b"x", PASSWORD, params=FAST, keyfile=b"k" * (tc.MAX_KEYFILE_BYTES + 1)
+        )
+
+
+def test_decrypt_rejects_oversized_keyfile() -> None:
+    """解密端同样不接受超大 keyfile。"""
+    blob = tc.encrypt(b"x", PASSWORD, params=FAST)
+    with pytest.raises(ValueError, match="KiB"):
+        tc.decrypt(blob, PASSWORD, keyfile=b"k" * (tc.MAX_KEYFILE_BYTES + 1))
+
+
+def test_decrypt_still_accepts_empty_password_for_legacy_files() -> None:
+    """空口令只禁止「新加密」；历史上用空口令加密的文件仍要能解。"""
+    salt = bytes(range(tc.SALT_LEN))
+    nonce = bytes(range(tc.NONCE_LEN))
+    key = tc._derive(b"", b"", salt, 8192, 1, 1, 1)
+    ct_len = len(b"legacy") + tc.TAG_LEN
+    header = tc._pack_header(
+        flags=0,
+        mem=8192,
+        time=1,
+        para=1,
+        rounds=1,
+        pow_diff=0,
+        salt=salt,
+        nonce=nonce,
+        pow_nonce=b"\x00" * tc.POW_NONCE_LEN,
+        ct_len=ct_len,
+    )
+    ciphertext = tc._aead_encrypt(tc.CIPHER_AESGCM, key, nonce, header, b"legacy")
+
+    assert tc.decrypt(header + ciphertext, b"") == (b"legacy", False)
+
+
+# ---------------------------------------------------------------------------
+# CLI 落盘与输入安全
+# ---------------------------------------------------------------------------
+
+FAST_CLI = ["--mem", "8192", "--time", "1", "--para", "1", "--rounds", "1"]
+
+
+def test_cli_refuses_in_place(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """输入与输出同一个文件时直接拒绝，绝不覆盖唯一副本。"""
+    src = tmp_path / "plain.bin"
+    src.write_bytes(b"original")
+
+    code = _run_cli(
+        monkeypatch,
+        ["encrypt", str(src), str(src), "--password-stdin", *FAST_CLI],
+        stdin="pw\n",
+    )
+    assert code == tc.EXIT_USAGE
+    assert src.read_bytes() == b"original"
+
+
+def test_cli_refuses_existing_output_without_force(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """已存在的输出默认不覆盖；显式 --force 才允许。"""
+    src = tmp_path / "plain.bin"
+    src.write_bytes(b"payload")
+    out = tmp_path / "out.tarpit"
+    out.write_bytes(b"keep")
+    args = ["encrypt", str(src), str(out), "--password-stdin", *FAST_CLI]
+
+    assert _run_cli(monkeypatch, args, stdin="pw\n") == tc.EXIT_USAGE
+    assert out.read_bytes() == b"keep"
+
+    assert _run_cli(monkeypatch, args + ["--force"], stdin="pw\n") == tc.EXIT_OK
+    assert out.read_bytes()[: len(tc.MAGIC)] == tc.MAGIC
+
+
+def test_cli_empty_password_rejected(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """加密时从 stdin 读到空行 → 退出码 1，且不产生输出文件。"""
+    src = tmp_path / "plain.bin"
+    src.write_bytes(b"payload")
+    out = tmp_path / "out.tarpit"
+
+    code = _run_cli(
+        monkeypatch,
+        ["encrypt", str(src), str(out), "--password-stdin", *FAST_CLI],
+        stdin="\n",
+    )
+    assert code == tc.EXIT_USAGE
+    assert not out.exists()
+
+
+def test_cli_empty_keyfile_rejected(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """0 字节 keyfile → 环境错误，且不产生输出文件。"""
+    src = tmp_path / "plain.bin"
+    src.write_bytes(b"payload")
+    key = tmp_path / "empty.key"
+    key.write_bytes(b"")
+    out = tmp_path / "out.tarpit"
+
+    code = _run_cli(
+        monkeypatch,
+        ["encrypt", str(src), str(out), "--keyfile", str(key), "--password-stdin", *FAST_CLI],
+        stdin="pw\n",
+    )
+    assert code == tc.EXIT_ENV
+    assert not out.exists()
+
+
+def test_cli_oversized_keyfile_rejected(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """超过 1 MiB 的 keyfile → 环境错误。"""
+    src = tmp_path / "plain.bin"
+    src.write_bytes(b"payload")
+    key = tmp_path / "big.key"
+    key.write_bytes(b"k" * (tc.MAX_KEYFILE_BYTES + 1))
+    out = tmp_path / "out.tarpit"
+
+    code = _run_cli(
+        monkeypatch,
+        ["encrypt", str(src), str(out), "--keyfile", str(key), "--password-stdin", *FAST_CLI],
+        stdin="pw\n",
+    )
+    assert code == tc.EXIT_ENV
+    assert not out.exists()
+
+
+def test_cli_refuses_output_same_as_keyfile(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """输出路径就是 keyfile 时，即使 --force 也拒绝，避免一次覆盖弄丢密钥。"""
+    src = tmp_path / "plain.bin"
+    src.write_bytes(b"payload")
+    key = tmp_path / "my.key"
+    key.write_bytes(b"k" * 64)
+
+    code = _run_cli(
+        monkeypatch,
+        ["encrypt", str(src), str(key), "--keyfile", str(key),
+         "--password-stdin", "--force", *FAST_CLI],
+        stdin="pw\n",
+    )
+    assert code == tc.EXIT_USAGE
+    assert key.read_bytes() == b"k" * 64
+
+
+def test_write_output_is_atomic(tmp_path: Path) -> None:
+    """新写、拒绝覆盖、--force 覆盖三条路径都要正常，且不残留临时文件。"""
+    target = tmp_path / "out.bin"
+
+    tc._write_output(target, b"first", force=False)
+    assert target.read_bytes() == b"first"
+    assert list(tmp_path.glob(".*.tmp")) == []
+
+    with pytest.raises(tc.UsageError):
+        tc._write_output(target, b"second", force=False)
+    assert target.read_bytes() == b"first"
+
+    tc._write_output(target, b"second", force=True)
+    assert target.read_bytes() == b"second"
+    assert list(tmp_path.glob(".*.tmp")) == []
+
+
+def test_write_output_cleans_temp_on_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """原子替换失败时目标文件保持原样，临时文件必须清掉。"""
+    target = tmp_path / "out.bin"
+
+    def fail_replace(_src: str, _dst: str) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(tc.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="disk full"):
+        tc._write_output(target, b"data", force=False)
+
+    assert not target.exists()
+    assert list(tmp_path.glob(".*.tmp")) == []
+
+
+# ---------------------------------------------------------------------------
+# 单次工作预算与 KDF 失败兜底
+# ---------------------------------------------------------------------------
+
+
+def test_crypto_params_work_is_mem_times_time_times_rounds() -> None:
+    params = tc.CryptoParams(mem=8192, time=2, para=4, rounds=3)
+    assert params.work == 8192 * 2 * 3
+
+
+def test_encrypt_rejects_work_over_budget() -> None:
+    """工作量超过 max_work 时在进 Argon2 前拒绝；None 表示显式放行。"""
+    with pytest.raises(ValueError, match="工作量"):
+        tc.encrypt(b"x", PASSWORD, params=FAST, max_work=1)
+    assert tc.encrypt(b"x", PASSWORD, params=FAST, max_work=None)
+
+
+def test_decrypt_rejects_work_over_budget() -> None:
+    blob = tc.encrypt(b"x", PASSWORD, params=FAST)
+    with pytest.raises(ValueError, match="工作量"):
+        tc.decrypt(blob, PASSWORD, max_work=1)
+    assert tc.decrypt(blob, PASSWORD, max_work=None) == (b"x", False)
+
+
+def test_heavy_header_rejected_before_kdf(monkeypatch: pytest.MonkeyPatch) -> None:
+    """恶意文件声明 2 GiB / time=10 / rounds=8 时，不能进 Argon2。"""
+    blob = bytearray(tc.encrypt(b"payload", PASSWORD, params=FAST))
+    struct.pack_into(">IHBB", blob, 10, 2 * 1024 * 1024, 10, 1, 8)
+
+    monkeypatch.setattr(tc, "_derive", _fail_derive)
+    with pytest.raises(ValueError, match="工作量"):
+        tc.decrypt(bytes(blob), PASSWORD)
+
+
+def test_describe_reports_work_and_over_default() -> None:
+    """info 要给出工作量，并标出是否需要 --allow-heavy。"""
+    blob = tc.encrypt(b"x", PASSWORD, params=FAST)
+    info = tc.describe(blob)
+    assert info["work_kib_rounds"] == FAST.work
+    assert info["work_over_default"] is False
+
+    heavy = bytearray(blob)
+    struct.pack_into(">IHBB", heavy, 10, 2 * 1024 * 1024, 10, 1, 8)
+    info = tc.describe(bytes(heavy))
+    assert info["work_kib_rounds"] == 2 * 1024 * 1024 * 10 * 8
+    assert info["work_over_default"] is True
+
+
+def test_memory_error_is_wrapped(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Argon2 内存不足不应把 MemoryError 直接冒给调用方。"""
+
+    def boom(**_kwargs: object) -> bytes:
+        raise MemoryError("no memory")
+
+    monkeypatch.setattr(tc, "hash_secret_raw", boom)
+    with pytest.raises(tc.EnvironmentSetupError, match="内存"):
+        tc.encrypt(b"x", PASSWORD, params=FAST)
+
+
+def test_hashing_error_is_wrapped(monkeypatch: pytest.MonkeyPatch) -> None:
+    """argon2-cffi 的 HashingError 要转成可读的环境错误。"""
+    blob = tc.encrypt(b"x", PASSWORD, params=FAST)
+
+    def boom(**_kwargs: object) -> bytes:
+        raise tc._HashingError("argon2 failed")
+
+    monkeypatch.setattr(tc, "hash_secret_raw", boom)
+    with pytest.raises(tc.EnvironmentSetupError, match="Argon2"):
+        tc.decrypt(blob, PASSWORD)
+
+
+def test_cli_kdf_memory_error_exits_4(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Argon2 资源失败走契约 4（环境错误），而不是 traceback。"""
+    src = tmp_path / "plain.bin"
+    src.write_bytes(b"payload")
+    out = tmp_path / "out.tarpit"
+
+    def boom(**_kwargs: object) -> bytes:
+        raise MemoryError("no memory")
+
+    monkeypatch.setattr(tc, "hash_secret_raw", boom)
+    code = _run_cli(
+        monkeypatch,
+        ["encrypt", str(src), str(out), "--password-stdin", *FAST_CLI],
+        stdin="pw\n",
+    )
+    assert code == tc.EXIT_ENV
+    assert not out.exists()
+
+
+# ---------------------------------------------------------------------------
+# 口令强度提示（只警告，不阻止）
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("password", "expected"),
+    [
+        ("", False),
+        ("short", False),
+        ("alllowercase", False),
+        ("password", False),
+        ("GoodPass1", True),
+        # 空格算「符号」一类，所以 armor 的同口径判定也是合格。
+        ("correct horse battery staple", True),
+    ],
+)
+def test_check_password_strength(password: str, expected: bool) -> None:
+    ok, hint = tc.check_password_strength(password)
+    assert ok is expected
+    assert hint
+
+
+def test_password_policy_matches_armor() -> None:
+    """v1 的口令体检与 armor 必须保持同一口径。"""
+    from armor import armor_core
+
+    samples = [
+        "",
+        "short",
+        "alllowercase",
+        "password",
+        "GoodPass1",
+        "correct horse battery staple",
+    ]
+    for sample in samples:
+        assert tc.check_password_strength(sample) == armor_core.check_password_strength(sample)
+
+
+def test_cli_weak_password_warns_but_encrypts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """弱口令只写警告，不阻止加密。"""
+    src = tmp_path / "plain.bin"
+    src.write_bytes(b"payload")
+    out = tmp_path / "out.tarpit"
+
+    code = _run_cli(
+        monkeypatch,
+        ["encrypt", str(src), str(out), "--password-stdin", *FAST_CLI],
+        stdin="password\n",
+    )
+    assert code == tc.EXIT_OK
+    assert out.exists()
+    assert "偏弱" in capsys.readouterr().err
+
+
+def test_cli_strong_password_does_not_warn(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """达标口令不产生噪音。"""
+    src = tmp_path / "plain.bin"
+    src.write_bytes(b"payload")
+    out = tmp_path / "out.tarpit"
+
+    code = _run_cli(
+        monkeypatch,
+        ["encrypt", str(src), str(out), "--password-stdin", *FAST_CLI],
+        stdin="GoodPass1!\n",
+    )
+    assert code == tc.EXIT_OK
+    assert "偏弱" not in capsys.readouterr().err

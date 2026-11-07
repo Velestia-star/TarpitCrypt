@@ -50,6 +50,7 @@ export const LIMITS = {
   maxPara: 8,
   minRounds: 1,
   maxRounds: 8,
+  maxWork: 16 * 1024 * 1024,
 };
 
 export const ALLOWED_POW_BITS = [0, 16, 18, 20];
@@ -156,7 +157,40 @@ export function normalizeParams(input) {
   if (!ALLOWED_POW_BITS.includes(p.pow)) {
     throw new Error(`pow 必须是 ${ALLOWED_POW_BITS.join("/")} 之一`);
   }
+  // 与 Python 的 DEFAULT_MAX_WORK_KIB_ROUNDS 对齐：浏览器版没有 --allow-heavy，
+  // 打开一个声明了 2 GiB / time=10 / rounds=8 的畸形文件时，先在解析阶段拒绝，
+  // 不让标签页为它跑满 Argon2。
+  const work = p.mem * p.time * p.rounds;
+  if (work > LIMITS.maxWork) {
+    throw new Error(
+      `KDF 工作量 ${work} KiB·轮 超过默认上限 ${LIMITS.maxWork}，已拒绝执行`,
+    );
+  }
   return p;
+}
+
+/**
+ * 口令最低强度体检，返回 `{ ok, hint }`。
+ *
+ * 与 Python `tarpitcrypt.check_password_strength` / armor 的判定保持同一口径；
+ * 只用于提示，不阻止加密，也不记录口令。
+ */
+export function checkPasswordStrength(text) {
+  if (!text) return { ok: false, hint: "口令不能为空" };
+  if (Array.from(text).length < 8) return { ok: false, hint: "至少 8 个字符" };
+  const classes = [
+    /\p{Ll}/u,
+    /\p{Lu}/u,
+    /\p{Nd}/u,
+    /[^\p{L}\p{N}]/u,
+  ].filter((pattern) => pattern.test(text)).length;
+  if (classes < 2) {
+    return { ok: false, hint: "建议混用大小写、数字或符号中的至少两类" };
+  }
+  if (["password", "12345678", "qwertyui", "admin123"].includes(text.toLowerCase())) {
+    return { ok: false, hint: "这是常见弱口令，换一个" };
+  }
+  return { ok: true, hint: "长度与字符种类达标（不等于高熵，长口令更可靠）" };
 }
 
 /** 前导零比特数。 */
@@ -184,16 +218,38 @@ export async function powOk(key, powNonce, powBits) {
   return leadingZeroBits(await powValue(key, powNonce)) >= powBits;
 }
 
+//: 每次并发提交的 SHA-256 数量。WebCrypto 的 digest 是异步的，逐个 await
+//: 会把大部分时间花在往返上；批量提交能把吞吐拉高约 3 倍（本机 WebCrypto
+//: 实测 1k 次约 61 ms → 20 ms，浏览器数字会有差异）。再大收益递减，256 足够。
+const POW_BATCH_SIZE = 256;
+
 /** 磨一个满足前导零要求的 8 字节 nonce。 */
 export async function grindPow(key, powBits, onTick) {
   if (powBits <= 0) return randomBytes(POW_NONCE_LEN);
   const start = bytesToBigInt(randomBytes(POW_NONCE_LEN));
   const mask = (1n << 64n) - 1n;
   const limit = 1 << (powBits + 4);
-  for (let offset = 0; offset < limit; offset += 1) {
-    const nonce = bigIntToBytes((start + BigInt(offset)) & mask, POW_NONCE_LEN);
-    if (await powOk(key, nonce, powBits)) return nonce;
-    if (onTick && offset % 4096 === 0) await onTick(offset);
+  let offset = 0;
+  let sinceTick = 0;
+  while (offset < limit) {
+    const size = Math.min(POW_BATCH_SIZE, limit - offset);
+    const nonces = new Array(size);
+    const jobs = new Array(size);
+    for (let i = 0; i < size; i += 1) {
+      const nonce = bigIntToBytes((start + BigInt(offset + i)) & mask, POW_NONCE_LEN);
+      nonces[i] = nonce;
+      jobs[i] = powValue(key, nonce);
+    }
+    const digests = await Promise.all(jobs);
+    for (let i = 0; i < size; i += 1) {
+      if (leadingZeroBits(digests[i]) >= powBits) return nonces[i];
+    }
+    offset += size;
+    sinceTick += size;
+    if (onTick && sinceTick >= 4096) {
+      sinceTick = 0;
+      await onTick(offset);
+    }
   }
   throw new Error("PoW 搜索超限，请降低难度");
 }
@@ -245,8 +301,18 @@ export function parseHeader(blob) {
   if (version !== VERSION) throw new Error(`不支持的 VERSION=${version}`);
   const flags = blob[9];
   if (flags & ~KNOWN_FLAGS) throw new Error(`FLAGS 含未知位：0x${flags.toString(16)}`);
+  const powDiff = blob[18];
+  if (((flags & FLAG_POW) !== 0) !== (powDiff !== 0)) {
+    throw new Error(
+      `FLAGS.POW=${(flags & FLAG_POW) !== 0} 与 POW_DIFF=${powDiff} 不一致`,
+    );
+  }
 
   const view = new DataView(blob.buffer, blob.byteOffset, blob.byteLength);
+  const ctLenBig = view.getBigUint64(83, false);
+  if (ctLenBig > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new Error(`CT_LEN=${ctLenBig} 超出安全整数范围`);
+  }
   const header = {
     version,
     flags,
@@ -254,11 +320,11 @@ export function parseHeader(blob) {
     time: view.getUint16(14, false),
     para: blob[16],
     rounds: blob[17],
-    powDiff: blob[18],
+    powDiff,
     salt: blob.slice(19, 51),
     nonce: blob.slice(51, 75),
     powNonce: blob.slice(75, 83),
-    ctLen: Number(view.getBigUint64(83, false)),
+    ctLen: Number(ctLenBig),
   };
   // 文件头是不可信输入：参数先过区间，再进 Argon2。
   normalizeParams({ mem: header.mem, time: header.time, para: header.para,
@@ -367,6 +433,9 @@ export async function decrypt(blob, password, options = {}) {
   const header = parseHeader(blob);
 
   const ctStart = HEADER_LEN;
+  if (header.ctLen < TAG_LEN) {
+    throw new Error(`CT_LEN=${header.ctLen} 小于认证标签长度 ${TAG_LEN}`);
+  }
   const ctEnd = ctStart + header.ctLen;
   if (ctEnd > blob.length) {
     throw new Error(`CT_LEN=${header.ctLen} 超出文件剩余长度`);
@@ -380,6 +449,9 @@ export async function decrypt(blob, password, options = {}) {
     const dNonce = rest.slice(0, NONCE_LEN);
     const dLen = Number(new DataView(rest.buffer, rest.byteOffset, rest.byteLength)
       .getBigUint64(NONCE_LEN, false));
+    if (dLen < TAG_LEN) {
+      throw new Error(`DECOY_LEN=${dLen} 小于认证标签长度 ${TAG_LEN}`);
+    }
     const dPayload = rest.slice(DECOY_FIXED_LEN);
     if (dPayload.length !== dLen) throw new Error(`DECOY_LEN=${dLen} 与实长 ${dPayload.length} 不一致`);
     decoy = { nonce: dNonce, payload: dPayload };

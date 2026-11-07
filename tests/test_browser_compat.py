@@ -75,10 +75,53 @@ async function main() {
     ok("KDF rounds=2", hex(await core.derive(pw, empty, salt, { ...base, rounds: 2 })) === EXPECT.k2);
     ok("KDF keyfile", hex(await core.derive(pw, enc.encode("keyfile-bytes"), salt, base)) === EXPECT.k3);
 
+    // 工作量预算：畸形头在 parseHeader 阶段就要被拒，不能进 Argon2。
+    const heavyHeader = core.packHeader({
+      flags: 0, mem: 2 * 1024 * 1024, time: 10, para: 1, rounds: 8, powDiff: 0,
+      salt: new Uint8Array(32), nonce: new Uint8Array(24),
+      powNonce: new Uint8Array(8), ctLen: 16,
+    });
+    let heavyRejected = false;
+    try { core.parseHeader(heavyHeader); } catch (e) { heavyRejected = /工作量/.test(e.message); }
+    ok("工作量上限", heavyRejected);
+
+    ok("口令体检-短", !core.checkPasswordStrength("short").ok);
+    ok("口令体检-弱", !core.checkPasswordStrength("password").ok);
+    ok("口令体检-强", core.checkPasswordStrength("GoodPass1").ok);
+
     const params = { mem: 8192, time: 1, para: 1, rounds: 1, pow: 0 };
     const made = await core.encrypt(enc.encode("js-made-payload"), enc.encode("js-pw"), { params });
     ok("JS 自解", dec.decode((await core.decrypt(made, enc.encode("js-pw"))).data) === "js-made-payload");
     lines.push("JSFILE " + hex(made));
+
+    // 解析器对齐：CT_LEN 下限、FLAGS/POW_DIFF 一致性、u64 精度。
+    let tinyRejected = false;
+    try {
+      const tiny = new Uint8Array(made);
+      new DataView(tiny.buffer).setBigUint64(83, 0n, false);
+      await core.decrypt(tiny, enc.encode("js-pw"));
+    } catch (e) { tinyRejected = /CT_LEN/.test(e.message); }
+    ok("CT_LEN 下限", tinyRejected);
+
+    let flagRejected = false;
+    try {
+      core.parseHeader(core.packHeader({
+        flags: 0, mem: 8192, time: 1, para: 1, rounds: 1, powDiff: 16,
+        salt: new Uint8Array(32), nonce: new Uint8Array(24),
+        powNonce: new Uint8Array(8), ctLen: 16,
+      }));
+    } catch (e) { flagRejected = /POW_DIFF/.test(e.message); }
+    ok("FLAGS/POW_DIFF 一致", flagRejected);
+
+    let bigRejected = false;
+    try {
+      core.parseHeader(core.packHeader({
+        flags: 0, mem: 8192, time: 1, para: 1, rounds: 1, powDiff: 0,
+        salt: new Uint8Array(32), nonce: new Uint8Array(24),
+        powNonce: new Uint8Array(8), ctLen: 2n ** 63n,
+      }));
+    } catch (e) { bigRejected = /安全整数/.test(e.message); }
+    ok("CT_LEN 精度", bigRejected);
 
     const pyBlob = unb64(PY_B64);
     ok("解 Python 文件",
@@ -95,6 +138,17 @@ async function main() {
     ok("诱饵-主层", dec.decode(mainR.data) === "real" && mainR.isDecoy === false);
     ok("诱饵-诱饵层", dec.decode(decR.data) === "fake" && decR.isDecoy === true);
     lines.push("DECOYFILE " + hex(dBlob));
+
+    let decoyLenRejected = false;
+    try {
+      const badDecoy = new Uint8Array(dBlob);
+      const dv = new DataView(badDecoy.buffer);
+      const ctLen = Number(dv.getBigUint64(83, false));
+      const dLenOffset = core.HEADER_LEN + ctLen + core.NONCE_LEN;
+      dv.setBigUint64(dLenOffset, 15n, false);
+      await core.decrypt(badDecoy.slice(0, dLenOffset + 15), enc.encode("decoy-pw"));
+    } catch (e) { decoyLenRejected = /DECOY_LEN/.test(e.message); }
+    ok("DECOY_LEN 下限", decoyLenRejected);
 
     const kfBlob = await core.encrypt(enc.encode("kf"), enc.encode("kf-pw"),
       { params, keyfile: enc.encode("KEYFILE") });
@@ -278,3 +332,75 @@ def test_index_page_boots(served_site: str, tmp_path: Path) -> None:
     assert 'id="drop"' in dom
     assert "加密并下载" in dom
     assert "/api/" not in dom, "纯前端页面不应再引用后端接口"
+
+
+@pytest.mark.browser
+def test_queue_drawer_opens_from_hash(served_site: str, tmp_path: Path) -> None:
+    """右侧加密队列抽屉：DOM 齐全，且 `#queue` 能把它直接展开。
+
+    抽屉里的拖拽排序没法用无头浏览器模拟，这里只保证「加载后不报错、
+    抽屉能被打开」——脚本报错的话 app.js 跑不到挂 ready 标记那一步。
+    """
+    browser = find_browser()
+    if browser is None:
+        pytest.skip("本机没有 Edge/Chrome，跳过浏览器兼容性测试")
+
+    base = served_site.rsplit("/", 1)[0]
+    dom = ""
+    for _attempt in range(3):
+        run = subprocess.run(
+            [
+                browser, "--headless", "--disable-gpu", "--no-first-run",
+                "--no-default-browser-check",
+                f"--user-data-dir={tmp_path / 'profile3'}",
+                "--virtual-time-budget=20000",
+                "--dump-dom", f"{base}/index.html#queue",
+            ],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180,
+        )
+        dom = run.stdout
+        if 'data-app="ready"' in dom:
+            break
+        time.sleep(0.8)
+
+    assert 'data-app="ready"' in dom, f"页面模块没有执行完：\n{dom[:600]}"
+    for element_id in ("queueToggle", "drawer", "queueList", "queuePickDir",
+                       "queueSelectAll", "queueDelete", "openPath", "pathModal",
+                       "historyList", "historyClear", "historyEmpty"):
+        assert f'id="{element_id}"' in dom, f"缺少工作区节点 #{element_id}"
+    assert 'id="queueRun"' not in dom, "「加密全部」按钮已移除，改由拖到左侧触发加密"
+    assert 'class="drawer open"' in dom, "`#queue` 应当直接展开抽屉"
+    assert 'aria-expanded="true"' in dom
+
+
+@pytest.mark.browser
+def test_history_view_deeplink(served_site: str, tmp_path: Path) -> None:
+    """`#history` 深链：抽屉直接打开并切到历史视图。"""
+    browser = find_browser()
+    if browser is None:
+        pytest.skip("本机没有 Edge/Chrome，跳过浏览器兼容性测试")
+
+    base = served_site.rsplit("/", 1)[0]
+    dom = ""
+    for _attempt in range(3):
+        run = subprocess.run(
+            [
+                browser, "--headless", "--disable-gpu", "--no-first-run",
+                "--no-default-browser-check",
+                f"--user-data-dir={tmp_path / 'profile4'}",
+                "--virtual-time-budget=20000",
+                "--dump-dom", f"{base}/index.html#history",
+            ],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180,
+        )
+        dom = run.stdout
+        if 'data-app="ready"' in dom:
+            break
+        time.sleep(0.8)
+
+    assert 'data-app="ready"' in dom, f"页面模块没有执行完：\n{dom[:600]}"
+    assert 'class="drawer open"' in dom
+    # 历史面板可见、工作区面板隐藏
+    assert "viewWorkspace" in dom and "viewHistory" in dom
+    assert 'id="viewWorkspace" hidden' in dom, "历史视图下工作区应隐藏"
+    assert 'class="dtab active" data-view="history"' in dom, "历史标签应高亮"

@@ -11,7 +11,9 @@ import json
 import sys
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
+from urllib.parse import unquote
 import zipfile
 from collections.abc import Iterator
 from http import HTTPStatus
@@ -144,8 +146,9 @@ def test_normalize_password_matches_cli_rule() -> None:
 
 
 @pytest.fixture()
-def web_base() -> Iterator[str]:
-    """在随机端口起一个真实服务。"""
+def web_base(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
+    """在随机端口起一个真实服务；输出目录指到临时目录，别污染用户主目录。"""
+    monkeypatch.setattr(ts, "_OUT_DIR", tmp_path / "out")
     server = ts.TarpitWebServer(("127.0.0.1", 0), ts.TarpitRequestHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -270,6 +273,137 @@ def test_web_missing_password_is_400(web_base: str) -> None:
     status, _, payload = _post(f"{web_base}/api/encrypt", content_type, body)
     assert status == HTTPStatus.BAD_REQUEST
     assert "口令" in json.loads(payload)["error"]
+
+
+def _legacy_empty_password_blob(payload: bytes = b"legacy") -> bytes:
+    """手工造一份历史上「空口令加密」的 v1 文件（当前 encrypt 已拒绝空口令）。"""
+    salt = bytes(range(tc.SALT_LEN))
+    nonce = bytes(range(tc.NONCE_LEN))
+    key = tc._derive(b"", b"", salt, 8192, 1, 1, 1)
+    ct_len = len(payload) + tc.TAG_LEN
+    header = tc._pack_header(
+        flags=0,
+        mem=8192,
+        time=1,
+        para=1,
+        rounds=1,
+        pow_diff=0,
+        salt=salt,
+        nonce=nonce,
+        pow_nonce=b"\x00" * tc.POW_NONCE_LEN,
+        ct_len=ct_len,
+    )
+    return header + tc._aead_encrypt(tc.CIPHER_AESGCM, key, nonce, header, payload)
+
+
+def test_web_decrypt_accepts_legacy_empty_password(web_base: str) -> None:
+    """解密端保留空口令兼容；页面自己有非空校验，不影响普通用户。"""
+    blob = _legacy_empty_password_blob()
+    content_type, body = build_multipart(
+        {"password": ""}, [("files", "legacy.tarpit", blob)]
+    )
+    status, _, plain = _post(f"{web_base}/api/decrypt", content_type, body)
+    assert status == HTTPStatus.OK
+    assert plain == b"legacy"
+
+
+def test_web_empty_keyfile_is_400(web_base: str) -> None:
+    """0 字节 keyfile 不能被静默当成「没启用 keyfile」。"""
+    content_type, body = build_multipart(
+        {"password": "pw", "mem": "8192", "time": "1", "para": "1", "rounds": "1"},
+        [("files", "a.txt", b"data"), ("keyfile", "empty.key", b"")],
+    )
+    status, _, payload = _post(f"{web_base}/api/encrypt", content_type, body)
+    assert status == HTTPStatus.BAD_REQUEST
+    assert "keyfile" in json.loads(payload)["error"]
+
+
+def test_web_oversized_keyfile_is_400(web_base: str) -> None:
+    """超过 1 MiB 的 keyfile 在 Web 入口同样被拒。"""
+    content_type, body = build_multipart(
+        {"password": "pw", "mem": "8192", "time": "1", "para": "1", "rounds": "1"},
+        [
+            ("files", "a.txt", b"data"),
+            ("keyfile", "big.key", b"k" * (tc.MAX_KEYFILE_BYTES + 1)),
+        ],
+    )
+    status, _, payload = _post(f"{web_base}/api/encrypt", content_type, body)
+    assert status == HTTPStatus.BAD_REQUEST
+    assert "keyfile" in json.loads(payload)["error"]
+
+
+# ---------------------------------------------------------------------------
+# 另存到磁盘 + 打开所在目录
+# ---------------------------------------------------------------------------
+
+
+def _encrypt_once(web_base: str, name: str = "note.txt") -> tuple[dict, bytes]:
+    """发一次加密请求，返回 (响应头, 密文字节)。"""
+    content_type, body = build_multipart(
+        {"password": "pw", "bundle": "0", "mem": "8192", "time": "1",
+         "para": "1", "rounds": "1"},
+        [("files", name, b"data")],
+    )
+    status, headers, blob = _post(f"{web_base}/api/encrypt", content_type, body)
+    assert status == HTTPStatus.OK
+    return headers, blob
+
+
+def test_encrypt_saves_copy_to_disk(web_base: str, tmp_path: Path) -> None:
+    """加密结果要另存一份到输出目录，并把路径回给页面。"""
+    headers, blob = _encrypt_once(web_base)
+    assert "X-Tarpit-Artifact" in headers
+    saved_raw = headers.get("X-Tarpit-Saved-Path")
+    assert saved_raw, "响应里缺少保存路径"
+
+    saved = Path(unquote(saved_raw))
+    assert saved.exists() and saved.read_bytes() == blob
+    assert saved.parent == tmp_path / "out"
+    assert saved.name.endswith(".tarpit")
+
+
+def test_reveal_rejects_unknown_token(web_base: str) -> None:
+    """没登记过的令牌一律拒绝——绝不能让接口变成「打开任意路径」。"""
+    body = json.dumps({"artifact": "deadbeefdeadbeef"}).encode()
+    status, _, _ = _post(f"{web_base}/api/reveal", "application/json", body)
+    assert status == HTTPStatus.NOT_FOUND
+
+
+def test_reveal_rejects_path_like_token(web_base: str) -> None:
+    """就算把路径当令牌传进来也没用（只做字典查表）。"""
+    body = json.dumps({"artifact": "../../etc/passwd"}).encode()
+    status, _, _ = _post(f"{web_base}/api/reveal", "application/json", body)
+    assert status == HTTPStatus.NOT_FOUND
+
+
+def test_reveal_opens_known_artifact(
+    web_base: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """已登记的产物 → 调用系统文件管理器并回 200。"""
+    opened: list[Path] = []
+    monkeypatch.setattr(ts, "open_in_file_manager", lambda path: opened.append(path))
+
+    headers, _ = _encrypt_once(web_base)
+    token = headers["X-Tarpit-Artifact"]
+    body = json.dumps({"artifact": token}).encode()
+    status, _, payload = _post(f"{web_base}/api/reveal", "application/json", body)
+
+    assert status == HTTPStatus.OK
+    assert json.loads(payload)["ok"] is True
+    assert opened and opened[0].exists()
+
+
+def test_decrypt_saves_copy_and_returns_artifact(web_base: str) -> None:
+    """解密同样落盘并给出令牌。"""
+    _, blob = _encrypt_once(web_base)
+    content_type, body = build_multipart({"password": "pw"}, [("files", "note.tarpit", blob)])
+    status, headers, plain = _post(f"{web_base}/api/decrypt", content_type, body)
+
+    assert status == HTTPStatus.OK
+    assert plain == b"data"
+    assert "X-Tarpit-Artifact" in headers
+    saved = Path(unquote(headers["X-Tarpit-Saved-Path"]))
+    assert saved.exists() and saved.read_bytes() == b"data"
 
 
 def test_web_index_serves_page(web_base: str) -> None:

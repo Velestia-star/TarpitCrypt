@@ -27,6 +27,8 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import secrets
+import subprocess
 import sys
 import threading
 import time
@@ -51,6 +53,59 @@ MAX_BODY_BYTES: Final[int] = 512 * 1024 * 1024  # 512 MB
 
 #: Argon2id 是 GiB 级内存硬函数，并发跑两个大参数会直接把机器拖死。
 _CRYPTO_LOCK: Final[threading.Lock] = threading.Lock()
+
+#: 加密/解密的结果会顺手存一份到磁盘，默认放在项目目录下的 `存放文件/`。
+#: 用 __file__ 定位，换到哪个工作目录启动都指向项目里。
+_OUT_DIR: Path = Path(__file__).resolve().parent / "存放文件"
+
+#: 只有服务端自己登记过的产出物才允许被打开。令牌随机，客户端猜不到。
+_ARTIFACTS: dict[str, Path] = {}
+_ARTIFACT_LOCK: Final[threading.Lock] = threading.Lock()
+_MAX_ARTIFACTS: Final[int] = 200
+
+
+def _unique_path(directory: Path, name: str) -> Path:
+    """在同一目录里找一个不冲突的文件名。"""
+    candidate = directory / name
+    if not candidate.exists():
+        return candidate
+    stem, dot, ext = name.rpartition(".")
+    base = stem if dot else name
+    suffix = f".{ext}" if dot else ""
+    for index in range(1, 1000):
+        candidate = directory / f"{base}({index}){suffix}"
+        if not candidate.exists():
+            return candidate
+    raise OSError("同名文件太多了，换个目录吧")
+
+
+def _save_artifact(name: str, data: bytes) -> Path:
+    """把结果写进输出目录，返回落盘路径。"""
+    _OUT_DIR.mkdir(parents=True, exist_ok=True)
+    path = _unique_path(_OUT_DIR, name)
+    path.write_bytes(data)
+    return path
+
+
+def _remember_artifact(path: Path) -> str:
+    """登记一个可打开的产出物，返回令牌。"""
+    token = secrets.token_hex(8)
+    with _ARTIFACT_LOCK:
+        _ARTIFACTS[token] = path
+        while len(_ARTIFACTS) > _MAX_ARTIFACTS:
+            _ARTIFACTS.pop(next(iter(_ARTIFACTS)), None)
+    return token
+
+
+def open_in_file_manager(path: Path) -> None:
+    """用系统文件管理器打开并选中这个文件。"""
+    if sys.platform.startswith("win"):
+        subprocess.Popen(["explorer", "/select,", str(path)])
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", "-R", str(path)])
+    else:
+        subprocess.Popen(["xdg-open", str(path.parent)])
+
 
 #: 界面上的三档预设。耗时来自 README 的实测数据。
 PRESETS: Final[dict[str, dict[str, Any]]] = {
@@ -187,6 +242,24 @@ def params_from_form(fields: dict[str, str]) -> tc.CryptoParams:
     return params
 
 
+def _validate_keyfile(keyfile: bytes | None) -> bytes | None:
+    """校验上传的 keyfile；空文件或超过上限直接拒绝。
+
+    旧实现里空 keyfile 会被 ``keyfile or b""`` 当成「没启用 keyfile」，
+    用户以为多了一道因子，实际只是主口令。这里在入口把这种情况打回。
+
+    Raises:
+        ValueError: 空文件或超过 :data:`tarpitcrypt.MAX_KEYFILE_BYTES`。
+    """
+    if keyfile is None:
+        return None
+    if not keyfile:
+        raise ValueError("keyfile 是空文件（0 字节），等于没有第二个因子")
+    if len(keyfile) > tc.MAX_KEYFILE_BYTES:
+        raise ValueError(f"keyfile 超过 {tc.MAX_KEYFILE_BYTES // 1024} KiB 上限")
+    return keyfile
+
+
 def _content_disposition(filename: str) -> str:
     """生成兼容中文文件名的 ``Content-Disposition``。"""
     ascii_name = filename.encode("ascii", "ignore").decode("ascii") or "download"
@@ -289,8 +362,16 @@ class TarpitRequestHandler(BaseHTTPRequestHandler):
             return
 
         route = self.path.rstrip("/")
-        if route not in ("/api/encrypt", "/api/decrypt"):
+        if route not in ("/api/encrypt", "/api/decrypt", "/api/reveal"):
             self._fail(HTTPStatus.NOT_FOUND, "没有这个接口")
+            return
+
+        # reveal 走 JSON，不是 multipart，必须排在表单解析之前
+        if route == "/api/reveal":
+            try:
+                self._handle_reveal(body)
+            except ValueError as exc:
+                self._fail(HTTPStatus.BAD_REQUEST, str(exc))
             return
 
         try:
@@ -320,12 +401,12 @@ class TarpitRequestHandler(BaseHTTPRequestHandler):
         data_files = [(filename, data) for name, filename, data in files if name == "files"]
         password_raw = fields.get("password", "")
         if not password_raw:
-            raise ValueError("缺少口令")
+            raise ValueError("口令不能为空")
         if not data_files:
             raise ValueError("没有收到任何文件")
 
         params = params_from_form(fields)
-        keyfile = self._pick_file(files, "keyfile")
+        keyfile = _validate_keyfile(self._pick_file(files, "keyfile"))
 
         is_bundle = fields.get("bundle") == "1" or len(data_files) > 1
         payload = bundle_files(data_files) if is_bundle else data_files[0][1]
@@ -354,6 +435,8 @@ class TarpitRequestHandler(BaseHTTPRequestHandler):
             Path(sanitize_member_path(first_name)).parts[0] if is_bundle else first_name
         )
         out_name = _safe_output_name(source_name, "") + ".tarpit"
+        saved = _save_artifact(out_name, blob)
+        artifact = _remember_artifact(saved)
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Content-Length", str(len(blob)))
@@ -363,6 +446,10 @@ class TarpitRequestHandler(BaseHTTPRequestHandler):
             {"mem": params.mem, "time": params.time, "para": params.para,
              "rounds": params.rounds, "pow": params.pow, "cipher": params.cipher}
         ))
+        self.send_header("X-Tarpit-Artifact", artifact)
+        self.send_header("X-Tarpit-Saved-Path", quote(str(saved)))
+        self.send_header("Access-Control-Expose-Headers",
+                         "X-Tarpit-Elapsed, X-Tarpit-Artifact, X-Tarpit-Saved-Path")
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(blob)
@@ -373,12 +460,12 @@ class TarpitRequestHandler(BaseHTTPRequestHandler):
         """解密上传的 ``.tarpit`` 文件。"""
         data_files = [(filename, data) for name, filename, data in files if name == "files"]
         password_raw = fields.get("password", "")
-        if not password_raw:
-            raise ValueError("缺少口令")
+        # 解密不强制非空：历史上用空口令加密的文件仍要能打开。页面端有
+        # 自己的非空校验，这里放行只影响直接调 API 的脚本。
         if len(data_files) != 1:
             raise ValueError("解密一次只能上传一个 .tarpit 文件")
 
-        keyfile = self._pick_file(files, "keyfile")
+        keyfile = _validate_keyfile(self._pick_file(files, "keyfile"))
         name, blob = data_files[0]
 
         started = time.perf_counter()
@@ -392,16 +479,44 @@ class TarpitRequestHandler(BaseHTTPRequestHandler):
         if zipfile.is_zipfile(io.BytesIO(plaintext)):
             out_name = out_name if out_name.endswith(".zip") else out_name + ".zip"
 
+        safe_name = out_name or "plain.bin"
+        saved = _save_artifact(safe_name, plaintext)
+        artifact = _remember_artifact(saved)
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Content-Length", str(len(plaintext)))
         self.send_header("Content-Disposition", _content_disposition(out_name or "plain.bin"))
         self.send_header("X-Tarpit-Elapsed", f"{elapsed:.2f}")
         self.send_header("X-Tarpit-Decoy", "1" if is_decoy else "0")
-        self.send_header("Access-Control-Expose-Headers", "X-Tarpit-Elapsed, X-Tarpit-Decoy")
+        self.send_header("X-Tarpit-Artifact", artifact)
+        self.send_header("X-Tarpit-Saved-Path", quote(str(saved)))
+        self.send_header("Access-Control-Expose-Headers",
+                         "X-Tarpit-Elapsed, X-Tarpit-Decoy, X-Tarpit-Artifact, X-Tarpit-Saved-Path")
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(plaintext)
+
+    def _handle_reveal(self, body: bytes) -> None:
+        """在文件管理器里打开某个产出物（只认服务端登记过的令牌）。"""
+        try:
+            payload = json.loads(body.decode("utf-8") or "{}")
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise ValueError("请求体不是合法 JSON") from None
+        token = str(payload.get("artifact", ""))
+        with _ARTIFACT_LOCK:
+            path = _ARTIFACTS.get(token)
+        if path is None:
+            self._fail(HTTPStatus.NOT_FOUND, "没有这条产出物记录（服务重启后会失效）")
+            return
+        if not path.exists():
+            self._fail(HTTPStatus.NOT_FOUND, f"文件已经不在了：{path}")
+            return
+        try:
+            open_in_file_manager(path)
+        except OSError as exc:
+            self._fail(HTTPStatus.INTERNAL_SERVER_ERROR, f"打不开文件管理器：{exc}")
+            return
+        self._send_json(HTTPStatus.OK, {"ok": True, "path": str(path)})
 
     @staticmethod
     def _pick_file(files: list[tuple[str, str, bytes]], field: str) -> bytes | None:
@@ -448,6 +563,7 @@ def _configure_stdio() -> None:
 
 def main(argv: list[str] | None = None) -> int:
     """启动本地 Web 服务。"""
+    global _OUT_DIR
     _configure_stdio()
     parser = argparse.ArgumentParser(
         prog="tarpitcrypt-web",
@@ -456,7 +572,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--host", default=HOST, help=f"监听地址，默认 {HOST}")
     parser.add_argument("--port", type=int, default=PORT, help=f"端口，默认 {PORT}")
     parser.add_argument("--open", action="store_true", help="启动后自动打开浏览器")
+    parser.add_argument(
+        "--out-dir",
+        default=str(Path(__file__).resolve().parent / "存放文件"),
+        help="加密/解密结果另存到哪个目录，默认 ~/TarpitCrypt",
+    )
     args = parser.parse_args(argv)
+    _OUT_DIR = Path(args.out_dir).expanduser()
+    _OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     if args.host not in ("127.0.0.1", "localhost", "::1"):
         print(
@@ -467,6 +590,7 @@ def main(argv: list[str] | None = None) -> int:
     server = TarpitWebServer((args.host, args.port), TarpitRequestHandler)
     url = f"http://{args.host}:{server.server_address[1]}"
     print(f"TarpitCrypt Web 已启动：{url}")
+    print(f"加密/解密结果会另存到：{_OUT_DIR}")
     print("Ctrl+C 退出。口令只在本机内存里过一遍，不落盘、不进日志。")
     if args.open:
         threading.Timer(0.4, lambda: webbrowser.open(url)).start()
@@ -514,6 +638,7 @@ INDEX_HTML = """<!doctype html>
   .drop.over { border-color: var(--accent); background: #241d16; transform: scale(1.005); }
   .drop p { margin: 6px 0; }
   .hint { color: var(--dim); font-size: 13px; }
+  .pw-warn { color: var(--bad); margin: 6px 0 0; }
   .link { color: var(--accent); cursor: pointer; text-decoration: underline dotted; }
   .files { list-style: none; padding: 0; margin: 12px 0 0; max-height: 190px; overflow: auto; }
   .files li {
@@ -575,9 +700,6 @@ INDEX_HTML = """<!doctype html>
     <label id="confirmWrap">再输一次
       <input type="password" id="password2" autocomplete="new-password">
     </label>
-    <label>keyfile（可选）
-      <input type="file" id="keyfile">
-    </label>
     <label>强度预设
       <select id="preset">
         <option value="fast">快速 · 256 MiB × 2 轮（约 1 秒）</option>
@@ -586,16 +708,21 @@ INDEX_HTML = """<!doctype html>
       </select>
     </label>
   </div>
+  <p class="hint pw-warn" id="pwWarning" hidden></p>
+  <p class="hint" id="onePwHint">默认只需要一个口令；keyfile、PoW、诱饵层都在「高级」里，通常不用动。</p>
 
   <details id="advanced">
-    <summary>高级：PoW / 算法 / 诱饵层</summary>
+    <summary>高级：keyfile / PoW / 算法 / 诱饵层（可全部不设）</summary>
     <div class="grid">
+      <label>keyfile（可选，兼容旧文件）
+        <input type="file" id="keyfile">
+      </label>
       <label>PoW 难度
         <select id="pow">
           <option value="0" selected>关闭</option>
           <option value="16">16 bit</option>
           <option value="18">18 bit</option>
-          <option value="20">20 bit（造文件会慢几秒）</option>
+          <option value="20">20 bit（可能几十秒）</option>
         </select>
       </label>
       <label>AEAD 算法
@@ -608,7 +735,7 @@ INDEX_HTML = """<!doctype html>
         <input type="file" id="decoy">
       </label>
       <label class="decoy-only">诱饵口令
-        <input type="password" id="decoyPassword" placeholder="用别的口令才能解出诱饵">
+        <input type="password" id="decoyPassword" placeholder="选了诱饵文件才需要填">
       </label>
     </div>
   </details>
@@ -713,6 +840,14 @@ INDEX_HTML = """<!doctype html>
       $("confirmWrap").style.display = enc ? "" : "none";
       $("preset").closest("label").style.display = enc ? "" : "none";
       $("advanced").style.display = enc ? "" : "none";
+      const pwWarning = $("pwWarning");
+      pwWarning.style.display = enc ? "" : "none";
+      if (enc) {
+        updatePasswordHint();
+      } else {
+        pwWarning.hidden = true;
+        pwWarning.textContent = "";
+      }
       $("go").textContent = enc ? "加密并下载" : "解密并下载";
       $("dropHint").textContent = enc
         ? "支持多文件；文件夹会打包成一个 .tarpit"
@@ -726,6 +861,33 @@ INDEX_HTML = """<!doctype html>
     status.className = "status" + (kind ? " " + kind : "");
     status.textContent = text;
   }
+
+  /** 与 Python / tarpit_core.js 同一口径；只提示，不阻止。 */
+  function checkPasswordStrength(text) {
+    if (!text) return { ok: false, hint: "口令不能为空" };
+    if (Array.from(text).length < 8) return { ok: false, hint: "至少 8 个字符" };
+    const classes = [/\\p{Ll}/u, /\\p{Lu}/u, /\\p{Nd}/u, /[^\\p{L}\\p{N}]/u]
+      .filter((pattern) => pattern.test(text)).length;
+    if (classes < 2) return { ok: false, hint: "建议混用大小写、数字或符号中的至少两类" };
+    if (["password", "12345678", "qwertyui", "admin123"].includes(text.toLowerCase())) {
+      return { ok: false, hint: "这是常见弱口令，换一个" };
+    }
+    return { ok: true, hint: "长度与字符种类达标（不等于高熵，长口令更可靠）" };
+  }
+
+  function updatePasswordHint() {
+    const box = $("pwWarning");
+    if (!box) return;
+    const text = $("password").value;
+    if (!text) { box.hidden = true; box.textContent = ""; return; }
+    const result = checkPasswordStrength(text);
+    if (result.ok) { box.hidden = true; box.textContent = ""; return; }
+    box.hidden = false;
+    box.textContent = `口令偏弱：${result.hint}。仍可继续，但 Argon2 挡不住弱口令。`;
+  }
+
+  $("password").addEventListener("input", updatePasswordHint);
+  updatePasswordHint();
 
   $("go").addEventListener("click", async () => {
     result.className = "result";
@@ -807,6 +969,44 @@ INDEX_HTML = """<!doctype html>
       hint.className = "hint";
       hint.textContent = "解密时请用对应的口令" + (mode === "encrypt" ? "和 keyfile" : "") + "。";
       result.append(hint);
+      const artifact = res.headers.get("X-Tarpit-Artifact");
+      const savedPath = res.headers.get("X-Tarpit-Saved-Path");
+      if (artifact && savedPath) {
+        const box = document.createElement("p");
+        box.className = "hint";
+        box.append(document.createTextNode("另外存了一份到："));
+        const pathCode = document.createElement("code");
+        pathCode.textContent = decodeURIComponent(savedPath);
+        box.append(pathCode);
+        const openBtn = document.createElement("button");
+        openBtn.type = "button";
+        openBtn.textContent = "打开所在目录";
+        openBtn.style.cssText =
+          "margin-left:10px;padding:6px 12px;border-radius:8px;" +
+          "border:1px solid #3a2f22;background:#241d16;color:#d9a25f;" +
+          "cursor:pointer;font-size:13px";
+        openBtn.addEventListener("click", async () => {
+          openBtn.disabled = true;
+          try {
+            const reply = await fetch("/api/reveal", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ artifact }),
+            });
+            if (!reply.ok) {
+              const detail = await reply.json().catch(() => ({}));
+              throw new Error(detail.error || ("HTTP " + reply.status));
+            }
+          } catch (error) {
+            alert("打不开：" + error.message);
+          } finally {
+            openBtn.disabled = false;
+          }
+        });
+        box.append(openBtn);
+        result.append(box);
+      }
+
       result.className = "result show";
     } catch (err) {
       clearInterval(tick);
