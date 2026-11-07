@@ -167,12 +167,17 @@ AAD 或字段顺序，这条测试立刻变红。
 
 ## 本地网页版（拖拽即用）
 
-不想碰命令行就用这个。零额外依赖，标准库起服务：
+不想碰命令行就用这个。零额外依赖，标准库起服务，**启动后会自动打开浏览器**：
 
 ```bash
-python tarpitcrypt_server.py --open
-# → http://127.0.0.1:8765
+python tarpitcrypt_server.py
+# → 自动打开 http://127.0.0.1:8765
+# 不想自动开：python tarpitcrypt_server.py --no-open
 ```
+
+本地版不再维护一份单独的页面，而是直接复用 `docs/` 这套在线前端：
+同一套界面、同一个口令提示，只是把加密 / 解密请求交给本机 Python 进程，
+所以浏览器主线程不会被 Argon2 卡住。
 
 打开后：**把文件或整个文件夹拖进去** → 输口令 → 点「加密并下载」，
 浏览器直接落一个 `.tarpit` 文件。切到「解密」标签，拖回 `.tarpit` 就能解出来。
@@ -198,6 +203,22 @@ python tarpitcrypt_server.py --open
 - 单次请求上限 512 MB（明文、密文都要在内存里过一遍）；负数 / 非法
   `Content-Length` 直接 400，不会让线程一直等连接。
 - 网页版不替代 CLI：批量、脚本化、离线环境还是用 `tarpitcrypt.py`。
+
+### 本地 Web 的 armor 后端（下一阶段接 UI）
+
+本地服务已经提供 armor 异步任务接口，计算在后台单独 worker 里串行执行，
+不会卡住浏览器；网页页签还在接入中。接口：
+
+| 方法 | 路径 | 作用 |
+|---|---|---|
+| `GET` | `/api/armor/profiles` | 可选层数 / 强度 / 投毒侧重 / 拟态风格 |
+| `POST` | `/api/armor/pack` | 上传源包，提交加固任务，返回 `job` |
+| `GET` | `/api/armor/jobs/<id>` | 查询进度 / 结果 / 错误 |
+| `POST` | `/api/armor/restore` | 上传 `.armored` + 口令，提交还原任务 |
+| `POST` | `/api/armor/inspect` | 只读容器摘要，不需要口令 |
+
+加固结果保存到 `存放文件/`，包括 `.armored`、伴生目录和它的下载 zip；
+同名文件自动加序号，不覆盖。
 
 ---
 

@@ -27,10 +27,14 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import mimetypes
 import os
+import queue
 import secrets
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unicodedata
@@ -42,7 +46,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Final
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 import tarpitcrypt as tc
 
@@ -51,6 +55,11 @@ __all__ = ["TarpitWebServer", "build_handler", "main", "parse_form"]
 HOST: Final[str] = "127.0.0.1"
 PORT: Final[int] = 8765
 MAX_BODY_BYTES: Final[int] = 512 * 1024 * 1024  # 512 MB
+
+#: 本地版直接复用 docs/ 这一份前端，避免和 tarpitcrypt_server.py 里
+#: 内嵌的旧页面漂移。服务端只注入一个 TARPIT_LOCAL 标记，把加密操作
+#: 切到本地 Python 核心。
+DOCS_DIR: Final[Path] = (Path(__file__).resolve().parent / "docs").resolve()
 
 #: Argon2id 是 GiB 级内存硬函数，并发跑两个大参数会直接把机器拖死。
 _CRYPTO_LOCK: Final[threading.Lock] = threading.Lock()
@@ -110,6 +119,274 @@ def _remember_artifact(path: Path) -> str:
         while len(_ARTIFACTS) > _MAX_ARTIFACTS:
             _ARTIFACTS.pop(next(iter(_ARTIFACTS)), None)
     return token
+
+
+# ---------------------------------------------------------------------------
+# armor 异步任务：本地 Web 的「算力在 Python」入口
+# ---------------------------------------------------------------------------
+
+_ARMOR_JOBS: dict[str, dict[str, Any]] = {}
+_ARMOR_JOBS_LOCK: Final[threading.Lock] = threading.Lock()
+_ARMOR_QUEUE = queue.Queue()
+_ARMOR_WORKER: threading.Thread | None = None
+_ARMOR_JOB_LIMIT: Final[int] = 100
+
+
+def _armor_modules() -> tuple[Any, Any]:
+    """延迟导入 armor 核心，没用到 armor 的启动不额外加载它。
+
+    armor/ 里的模块按「桌面版」布局互相用顶层名导入（``import armor_core``），
+    所以这里把 armor/ 放进 sys.path 再按顶层名加载，和 GUI 的加载方式一致。
+    """
+    armor_dir = Path(__file__).resolve().parent / "armor"
+    armor_path = str(armor_dir)
+    if armor_path not in sys.path:
+        sys.path.insert(0, armor_path)
+    import armor_core
+    import decoy_kit
+
+    return armor_core, decoy_kit
+
+
+def _set_armor_job(job_id: str, **fields: Any) -> None:
+    with _ARMOR_JOBS_LOCK:
+        job = _ARMOR_JOBS.get(job_id)
+        if job is not None:
+            job.update(fields)
+
+
+def _public_armor_job(job: dict[str, Any]) -> dict[str, Any]:
+    """去掉口令 / 源包等私有载荷后再回给客户端。"""
+    return {key: value for key, value in job.items() if not key.startswith("_")}
+
+
+def _armor_progress(job_id: str):
+    def update(done: int, total: int, message: str) -> None:
+        percent = (done / total) if total else 0.0
+        _set_armor_job(
+            job_id,
+            progress=round(max(0.0, min(1.0, percent)), 4),
+            message=str(message),
+        )
+
+    return update
+
+
+def _new_armor_job(kind: str, **payload: Any) -> str:
+    job_id = secrets.token_hex(8)
+    job = {
+        "id": job_id,
+        "kind": kind,
+        "status": "queued",
+        "progress": 0.0,
+        "message": "排队中",
+        "error": None,
+        "result": None,
+        "created": time.time(),
+        "_payload": payload,
+    }
+    with _ARMOR_JOBS_LOCK:
+        _ARMOR_JOBS[job_id] = job
+        while len(_ARMOR_JOBS) > _ARMOR_JOB_LIMIT:
+            oldest = min(_ARMOR_JOBS, key=lambda key: _ARMOR_JOBS[key]["created"])
+            if oldest == job_id:
+                break
+            _ARMOR_JOBS.pop(oldest, None)
+    _ensure_armor_worker()
+    _ARMOR_QUEUE.put(job_id)
+    return job_id
+
+
+def _ensure_armor_worker() -> None:
+    """只启动一个 worker，Argon2 层叠时不要并发打满内存。"""
+    global _ARMOR_WORKER
+    with _ARMOR_JOBS_LOCK:
+        if _ARMOR_WORKER is not None:
+            return
+        _ARMOR_WORKER = threading.Thread(target=_armor_worker, name="armor-worker", daemon=True)
+        worker = _ARMOR_WORKER
+    worker.start()
+
+
+def _armor_worker() -> None:
+    while True:
+        job_id = _ARMOR_QUEUE.get()
+        with _ARMOR_JOBS_LOCK:
+            job = _ARMOR_JOBS.get(job_id)
+        if job is None:
+            continue
+        _set_armor_job(job_id, status="running", message="开始…", error=None)
+        try:
+            result = _run_armor_job(job)
+            _set_armor_job(job_id, status="done", progress=1.0, message="完成", result=result)
+        except Exception as exc:  # noqa: BLE001 - 单个任务失败不能带垮 worker
+            _set_armor_job(job_id, status="error", error=str(exc), message="失败")
+        finally:
+            with _ARMOR_JOBS_LOCK:
+                if job_id in _ARMOR_JOBS:
+                    _ARMOR_JOBS[job_id].pop("_payload", None)
+
+
+def _armor_tmp_root() -> Path:
+    root = _OUT_DIR / ".armor-tmp"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _unique_directory(prefix: str) -> Path:
+    _OUT_DIR.mkdir(parents=True, exist_ok=True)
+    for index in range(1000):
+        candidate = _OUT_DIR / (prefix if index == 0 else f"{prefix}({index})")
+        try:
+            candidate.mkdir()
+        except FileExistsError:
+            continue
+        return candidate
+    raise OSError("同名目录太多了，换个目录吧")
+
+
+def _zip_directory(directory: Path) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for path in sorted(directory.rglob("*")):
+            if path.is_file():
+                archive.write(path, path.relative_to(directory).as_posix())
+    return buffer.getvalue()
+
+
+def _materialize_source(
+    work: Path, files: list[tuple[str, str, bytes]]
+) -> tuple[Path, str]:
+    """把浏览器上传的文件还原成 armor 能吃的文件或目录。
+
+    - 单文件且没有相对路径：保持文件形态，还原后也是文件；
+    - 多文件 / 带目录：还原成目录，空目录不参与（浏览器 folder upload 不传空目录）。
+    """
+    if not files:
+        raise ValueError("没有收到任何文件")
+
+    taken: set[str] = set()
+    entries: list[tuple[str, bytes]] = []
+    for _field, filename, data in files:
+        rel = sanitize_member_path(filename or "unnamed")
+        if rel in taken:
+            stem, dot, ext = rel.rpartition(".")
+            base = stem if dot else rel
+            suffix = f".{ext}" if dot else ""
+            index = 1
+            while f"{base}({index}){suffix}" in taken:
+                index += 1
+            rel = f"{base}({index}){suffix}"
+        taken.add(rel)
+        entries.append((rel, data))
+
+    if len(entries) == 1 and "/" not in entries[0][0]:
+        name = entries[0][0]
+        target = work / name
+        target.write_bytes(entries[0][1])
+        return target, name
+
+    tops = {rel.split("/", 1)[0] for rel, _data in entries}
+    if len(tops) == 1 and all("/" in rel for rel, _data in entries):
+        top = next(iter(tops))
+        root = work / top
+        display = top
+        rel_entries = [(rel.split("/", 1)[1], data) for rel, data in entries]
+    else:
+        root = work / "package"
+        display = "package"
+        rel_entries = entries
+
+    root.mkdir(parents=True, exist_ok=True)
+    root_resolved = root.resolve()
+    for rel, data in rel_entries:
+        target = (root / rel).resolve()
+        if target != root_resolved and root_resolved not in target.parents:
+            raise ValueError(f"非法的源文件路径：{rel}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+    return root, display
+
+
+def _run_armor_job(job: dict[str, Any]) -> dict[str, Any]:
+    if job["kind"] == "pack":
+        return _run_armor_pack(job)
+    if job["kind"] == "restore":
+        return _run_armor_restore(job)
+    raise ValueError(f"未知的 armor 任务：{job['kind']}")
+
+
+def _run_armor_pack(job: dict[str, Any]) -> dict[str, Any]:
+    armor_core, decoy_kit = _armor_modules()
+    payload = job["_payload"]
+    work = Path(tempfile.mkdtemp(prefix="src-", dir=_armor_tmp_root()))
+    try:
+        src, display = _materialize_source(work, payload["files"])
+        armored = armor_core.build_armored(
+            src,
+            payload["password"],
+            layers=payload["layers"],
+            profile=payload["profile"],
+            on_progress=_armor_progress(job["id"]),
+            strict=True,
+        )
+        saved = _save_artifact(display + ".armored", armored)
+        info = armor_core.inspect_armored(armored)
+        result: dict[str, Any] = {
+            "artifact": _remember_artifact(saved),
+            "savedPath": str(saved),
+            "layers": info.layers,
+            "size": info.total_size,
+            "digest": info.digest,
+        }
+
+        if payload["sidecar"]:
+            try:
+                kit_dir = _unique_directory(saved.stem + "-kit")
+                kit = decoy_kit.build_sidecar(
+                    src,
+                    out_dir=kit_dir,
+                    armored=saved,
+                    layers=payload["layers"],
+                    style=payload["style"],
+                    poison=payload["poison"],
+                    injection=payload["injection"],
+                    on_progress=_armor_progress(job["id"]),
+                )
+                kit_root = Path(getattr(kit, "root", kit_dir))
+                kit_zip = _save_artifact(
+                    saved.stem + "-sidecar.zip", _zip_directory(kit_root)
+                )
+                result["sidecarArtifact"] = _remember_artifact(kit_zip)
+                result["sidecarPath"] = str(kit_root)
+                result["sidecarZipPath"] = str(kit_zip)
+            except Exception as exc:  # noqa: BLE001 - 容器已生成，伴生失败不整单回滚
+                result["sidecarError"] = str(exc)
+        return result
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def _run_armor_restore(job: dict[str, Any]) -> dict[str, Any]:
+    armor_core, _decoy_kit = _armor_modules()
+    payload = job["_payload"]
+    restored = armor_core.restore_armored(
+        payload["blob"],
+        payload["password"],
+        on_progress=_armor_progress(job["id"]),
+        parallel=False,
+    )
+    base = Path(payload.get("name") or "restored").name
+    if base.endswith(".armored"):
+        base = base[: -len(".armored")]
+    saved = _save_artifact((base or "restored") + ".zip", restored.payload)
+    return {
+        "artifact": _remember_artifact(saved),
+        "savedPath": str(saved),
+        "sha256": restored.sha256,
+        "fileCount": restored.file_count,
+        "size": len(restored.payload),
+    }
 
 
 def open_in_file_manager(path: Path) -> None:
@@ -374,14 +651,75 @@ class TarpitRequestHandler(BaseHTTPRequestHandler):
     # -- 路由 -------------------------------------------------------------
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler 约定
-        """只提供首页与 favicon。"""
-        if self.path in ("/", "/index.html"):
-            self._send_bytes(HTTPStatus.OK, INDEX_HTML.encode("utf-8"), "text/html; charset=utf-8")
+        """提供 docs/ 里的同一份前端；首页注入本地模式标记。"""
+        path = unquote(self.path.split("?", 1)[0])
+        if path in ("/", "/index.html"):
+            try:
+                html = (DOCS_DIR / "index.html").read_text(encoding="utf-8")
+            except OSError:
+                self._fail(HTTPStatus.INTERNAL_SERVER_ERROR, "找不到 docs/index.html")
+                return
+            html = html.replace(
+                "</head>",
+                "<script>window.TARPIT_LOCAL = true;</script>\n</head>",
+                1,
+            )
+            self._send_bytes(HTTPStatus.OK, html.encode("utf-8"), "text/html; charset=utf-8")
             return
-        if self.path == "/favicon.ico":
+        if path == "/favicon.ico":
             self._send_bytes(HTTPStatus.OK, b"", "image/gif")
             return
-        self._fail(HTTPStatus.NOT_FOUND, "没有这个地址")
+
+        if path == "/api/armor/profiles":
+            armor_core, decoy_kit = _armor_modules()
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "ok": True,
+                    "profiles": list(armor_core.PROFILES),
+                    "poisons": list(decoy_kit.POISON_PROFILES),
+                    "styles": list(decoy_kit.STYLES),
+                    "injections": list(decoy_kit.INJECTION_LEVELS),
+                    "defaults": {
+                        "layers": 4,
+                        "profile": next(iter(armor_core.PROFILES)),
+                        "poison": decoy_kit.DEFAULT_POISON,
+                        "style": decoy_kit.DEFAULT_STYLE,
+                        "injection": decoy_kit.DEFAULT_INJECTION,
+                        "sidecar": True,
+                    },
+                },
+            )
+            return
+
+        if path.startswith("/api/armor/jobs/"):
+            job_id = path.rsplit("/", 1)[-1]
+            with _ARMOR_JOBS_LOCK:
+                job = _ARMOR_JOBS.get(job_id)
+            if job is None:
+                self._fail(HTTPStatus.NOT_FOUND, "没有这个任务")
+                return
+            self._send_json(HTTPStatus.OK, {"ok": True, "job": _public_armor_job(job)})
+            return
+
+        try:
+            target = (DOCS_DIR / path.lstrip("/")).resolve()
+            target.relative_to(DOCS_DIR)
+        except (OSError, ValueError):
+            self._fail(HTTPStatus.NOT_FOUND, "没有这个地址")
+            return
+        if not target.is_file():
+            self._fail(HTTPStatus.NOT_FOUND, "没有这个地址")
+            return
+
+        content_type = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
+        if content_type.startswith("text/") or content_type in (
+            "application/javascript",
+            "application/json",
+            "image/svg+xml",
+        ):
+            content_type += "; charset=utf-8"
+        self._send_bytes(HTTPStatus.OK, target.read_bytes(), content_type)
 
     def do_POST(self) -> None:  # noqa: N802
         """加密 / 解密两个接口。
@@ -418,7 +756,14 @@ class TarpitRequestHandler(BaseHTTPRequestHandler):
             return
 
         route = self.path.rstrip("/")
-        if route not in ("/api/encrypt", "/api/decrypt", "/api/reveal"):
+        if route not in (
+            "/api/encrypt",
+            "/api/decrypt",
+            "/api/reveal",
+            "/api/armor/pack",
+            "/api/armor/restore",
+            "/api/armor/inspect",
+        ):
             self._fail(HTTPStatus.NOT_FOUND, "没有这个接口")
             return
 
@@ -428,8 +773,14 @@ class TarpitRequestHandler(BaseHTTPRequestHandler):
             return
 
         fields, files = parse_form(self.headers.get("Content-Type", ""), body)
-        handler = self._handle_encrypt if route == "/api/encrypt" else self._handle_decrypt
-        handler(fields, files)
+        handlers = {
+            "/api/encrypt": self._handle_encrypt,
+            "/api/decrypt": self._handle_decrypt,
+            "/api/armor/pack": self._handle_armor_pack,
+            "/api/armor/restore": self._handle_armor_restore,
+            "/api/armor/inspect": self._handle_armor_inspect,
+        }
+        handlers[route](fields, files)
 
     # -- 业务 -------------------------------------------------------------
 
@@ -535,6 +886,108 @@ class TarpitRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(plaintext)
 
+    def _handle_armor_pack(
+        self, fields: dict[str, str], files: list[tuple[str, str, bytes]]
+    ) -> None:
+        """提交一次 armor 加固任务；真正计算在后台 worker 里跑。"""
+        armor_core, decoy_kit = _armor_modules()
+        password_raw = fields.get("password", "")
+        if not password_raw:
+            raise ValueError("口令不能为空")
+        data_files = [
+            (name, filename, data)
+            for name, filename, data in files
+            if name == "files"
+        ]
+        if not data_files:
+            raise ValueError("没有收到任何文件")
+
+        strong, hint = armor_core.check_password_strength(password_raw)
+        if not strong:
+            raise ValueError(f"口令偏弱：{hint}")
+
+        try:
+            layers = int(fields.get("layers", "4"))
+        except ValueError:
+            raise ValueError("层数必须是整数") from None
+        if not 2 <= layers <= 8:
+            raise ValueError("层数必须在 2~8 之间")
+
+        profile = fields.get("profile") or next(iter(armor_core.PROFILES))
+        if profile not in armor_core.PROFILES:
+            raise ValueError(f"未知加固强度：{profile}")
+        poison = fields.get("poison") or decoy_kit.DEFAULT_POISON
+        if poison not in decoy_kit.POISON_PROFILES:
+            raise ValueError(f"未知投毒侧重：{poison}")
+        style = fields.get("style") or decoy_kit.DEFAULT_STYLE
+        if style not in decoy_kit.STYLES:
+            raise ValueError(f"未知拟态风格：{style}")
+        injection = fields.get("injection") or decoy_kit.DEFAULT_INJECTION
+        if injection not in decoy_kit.INJECTION_LEVELS:
+            raise ValueError(f"未知注入强度：{injection}")
+        sidecar = fields.get("sidecar", "1").lower() not in ("0", "false", "no", "off", "")
+
+        job = _new_armor_job(
+            "pack",
+            files=data_files,
+            password=normalize_password(password_raw),
+            layers=layers,
+            profile=profile,
+            sidecar=sidecar,
+            poison=poison,
+            style=style,
+            injection=injection,
+        )
+        self._send_json(HTTPStatus.ACCEPTED, {"ok": True, "job": job})
+
+    def _handle_armor_restore(
+        self, fields: dict[str, str], files: list[tuple[str, str, bytes]]
+    ) -> None:
+        """提交一次 .armored 还原任务。"""
+        password_raw = fields.get("password", "")
+        if not password_raw:
+            raise ValueError("口令不能为空")
+        armored = self._pick_file(files, "files") or self._pick_file(files, "armored")
+        if armored is None:
+            raise ValueError("没有收到 .armored 文件")
+        name = next(
+            (
+                filename
+                for field, filename, _data in files
+                if field in ("files", "armored")
+            ),
+            "restore.armored",
+        )
+        job = _new_armor_job(
+            "restore",
+            blob=armored,
+            password=normalize_password(password_raw),
+            name=name,
+        )
+        self._send_json(HTTPStatus.ACCEPTED, {"ok": True, "job": job})
+
+    def _handle_armor_inspect(
+        self, fields: dict[str, str], files: list[tuple[str, str, bytes]]
+    ) -> None:
+        """只读容器摘要，不需要口令。"""
+        armor_core, _decoy_kit = _armor_modules()
+        blob = self._pick_file(files, "files") or self._pick_file(files, "armored")
+        if blob is None:
+            raise ValueError("没有收到 .armored 文件")
+        info = armor_core.inspect_armored(blob)
+        self._send_json(
+            HTTPStatus.OK,
+            {
+                "ok": True,
+                "version": info.version,
+                "layers": info.layers,
+                "totalSize": info.total_size,
+                "noteSize": info.note_size,
+                "layerSizes": list(info.layer_sizes),
+                "digest": info.digest,
+            },
+        )
+
     def _handle_reveal(self, body: bytes) -> None:
         """在文件管理器里打开某个产出物（只认服务端登记过的令牌）。"""
         try:
@@ -611,7 +1064,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--host", default=HOST, help=f"监听地址，默认 {HOST}（只允许回环）")
     parser.add_argument("--port", type=int, default=PORT, help=f"端口，默认 {PORT}")
-    parser.add_argument("--open", action="store_true", help="启动后自动打开浏览器")
+    parser.add_argument(
+        "--open",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="启动后自动打开浏览器（默认开；用 --no-open 关闭）",
+    )
     parser.add_argument(
         "--allow-remote",
         action="store_true",
@@ -638,6 +1096,14 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
 
+    if not (DOCS_DIR / "index.html").is_file():
+        print(
+            f"找不到本地前端：{DOCS_DIR / 'index.html'}\n"
+            "本地网页版需要从仓库目录运行（或把 docs/ 一起分发）。",
+            file=sys.stderr,
+        )
+        return 2
+
     _OUT_DIR = Path(args.out_dir).expanduser()
     _OUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -655,425 +1121,6 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         server.server_close()
     return 0
-
-
-INDEX_HTML = """<!doctype html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>TarpitCrypt · 焦油坑加密</title>
-<style>
-  :root {
-    --bg: #12100e; --panel: #1b1815; --line: #2e2a25;
-    --fg: #e8e2d8; --dim: #9a9188; --accent: #d9a25f; --ok: #7fb069; --bad: #d96f5f;
-  }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0; min-height: 100vh; background:
-      radial-gradient(1200px 600px at 15% -10%, #241d16 0%, transparent 60%), var(--bg);
-    color: var(--fg); font: 15px/1.6 "Segoe UI", system-ui, -apple-system, sans-serif;
-  }
-  main { max-width: 780px; margin: 0 auto; padding: 40px 20px 80px; }
-  h1 { font-size: 26px; margin: 0 0 6px; letter-spacing: .5px; }
-  h1 span { color: var(--accent); }
-  .sub { color: var(--dim); margin: 0 0 26px; font-size: 14px; }
-  code { background: #000; padding: 1px 5px; border-radius: 4px; font-size: .92em; }
-  .tabs { display: flex; gap: 8px; margin-bottom: 16px; }
-  .tab {
-    flex: 1; padding: 10px; background: var(--panel); color: var(--dim);
-    border: 1px solid var(--line); border-radius: 10px; cursor: pointer; font-size: 15px;
-  }
-  .tab.active { color: var(--fg); border-color: var(--accent); background: #241d16; }
-  .drop {
-    border: 2px dashed var(--line); border-radius: 14px; padding: 34px 20px;
-    text-align: center; background: var(--panel); transition: .15s; cursor: pointer;
-  }
-  .drop.over { border-color: var(--accent); background: #241d16; transform: scale(1.005); }
-  .drop p { margin: 6px 0; }
-  .hint { color: var(--dim); font-size: 13px; }
-  .pw-warn { color: var(--bad); margin: 6px 0 0; }
-  .link { color: var(--accent); cursor: pointer; text-decoration: underline dotted; }
-  .files { list-style: none; padding: 0; margin: 12px 0 0; max-height: 190px; overflow: auto; }
-  .files li {
-    display: flex; justify-content: space-between; gap: 12px; padding: 6px 12px;
-    background: var(--panel); border: 1px solid var(--line); border-radius: 8px; margin-bottom: 6px;
-    font-size: 13px;
-  }
-  .files li span:last-child { color: var(--dim); flex: none; }
-  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 18px; }
-  label { display: flex; flex-direction: column; gap: 6px; font-size: 13px; color: var(--dim); }
-  input[type=password], input[type=text], select {
-    width: 100%; padding: 10px 12px; background: #0e0c0a; color: var(--fg);
-    border: 1px solid var(--line); border-radius: 9px; font-size: 15px;
-  }
-  input[type=file] { color: var(--dim); font-size: 12px; }
-  details { margin-top: 16px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; }
-  summary { cursor: pointer; color: var(--dim); font-size: 13px; }
-  button.go {
-    width: 100%; margin-top: 22px; padding: 13px; border: 0; border-radius: 11px;
-    background: var(--accent); color: #1a1207; font-size: 16px; font-weight: 700; cursor: pointer;
-  }
-  button.go:disabled { opacity: .55; cursor: progress; }
-  .status { margin-top: 16px; font-size: 14px; min-height: 22px; }
-  .status.ok { color: var(--ok); } .status.bad { color: var(--bad); }
-  .result { margin-top: 14px; padding: 14px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; display: none; }
-  .result.show { display: block; }
-  .result a { color: var(--accent); font-weight: 600; }
-  .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; background: #3a2417; color: var(--accent); }
-  .spin { display: inline-block; width: 11px; height: 11px; border: 2px solid var(--dim);
-          border-top-color: var(--accent); border-radius: 50%; animation: s .8s linear infinite; }
-  @keyframes s { to { transform: rotate(360deg); } }
-  footer { margin-top: 40px; color: #5d554d; font-size: 12px; }
-</style>
-</head>
-<body>
-<main>
-  <h1>Tarpit<span>Crypt</span></h1>
-  <p class="sub">拖进来，拿走一份 <code>.tarpit</code>。破解者每猜一次口令，都得跑一遍完整的 Argon2id。</p>
-
-  <div class="tabs">
-    <button class="tab active" data-mode="encrypt">加密</button>
-    <button class="tab" data-mode="decrypt">解密</button>
-  </div>
-
-  <div class="drop" id="drop">
-    <p><strong>把文件或整个文件夹拖到这里</strong></p>
-    <p class="hint">
-      或 <label class="link">选择文件<input type="file" id="pickFiles" multiple hidden></label>
-      · <label class="link">选择文件夹<input type="file" id="pickDir" webkitdirectory multiple hidden></label>
-    </p>
-    <p class="hint" id="dropHint">支持多文件；文件夹会打包成一个 .tarpit</p>
-  </div>
-  <ul class="files" id="fileList"></ul>
-
-  <div class="grid">
-    <label>口令
-      <input type="password" id="password" autocomplete="new-password" placeholder="长一点，别用生日">
-    </label>
-    <label id="confirmWrap">再输一次
-      <input type="password" id="password2" autocomplete="new-password">
-    </label>
-    <label>强度预设
-      <select id="preset">
-        <option value="fast">快速 · 256 MiB × 2 轮（约 1 秒）</option>
-        <option value="standard" selected>标准 · 1 GiB × 2 轮（约 3 秒）</option>
-        <option value="hard">硬核 · 1 GiB × 3 轮（约 6 秒）</option>
-      </select>
-    </label>
-  </div>
-  <p class="hint pw-warn" id="pwWarning" hidden></p>
-  <p class="hint" id="onePwHint">默认只需要一个口令；keyfile、PoW、诱饵层都在「高级」里，通常不用动。</p>
-
-  <details id="advanced">
-    <summary>高级：keyfile / PoW / 算法 / 诱饵层（可全部不设）</summary>
-    <div class="grid">
-      <label>keyfile（可选，兼容旧文件）
-        <input type="file" id="keyfile">
-      </label>
-      <label>PoW 难度
-        <select id="pow">
-          <option value="0" selected>关闭</option>
-          <option value="16">16 bit</option>
-          <option value="18">18 bit</option>
-          <option value="20">20 bit（可能几十秒）</option>
-        </select>
-      </label>
-      <label>AEAD 算法
-        <select id="cipher">
-          <option value="aes-256-gcm" selected>aes-256-gcm</option>
-          <option value="xchacha20-poly1305">xchacha20-poly1305（当前会降级）</option>
-        </select>
-      </label>
-      <label class="decoy-only">诱饵明文（可选）
-        <input type="file" id="decoy">
-      </label>
-      <label class="decoy-only">诱饵口令
-        <input type="password" id="decoyPassword" placeholder="选了诱饵文件才需要填">
-      </label>
-    </div>
-  </details>
-
-  <button class="go" id="go">加密并下载</button>
-  <div class="status" id="status"></div>
-  <div class="result" id="result"></div>
-
-  <footer>本地运行 · 口令不会离开这台机器 · 单次上限 512 MB</footer>
-</main>
-
-<script>
-(() => {
-  const $ = (id) => document.getElementById(id);
-  const drop = $("drop"), fileList = $("fileList"), status = $("status"), result = $("result");
-  let mode = "encrypt";
-  let picked = [];          // [{file, path}]
-  let isFolder = false;
-
-  const fmtSize = (n) => n > 1048576 ? (n / 1048576).toFixed(1) + " MB"
-                   : n > 1024 ? (n / 1024).toFixed(1) + " KB" : n + " B";
-
-  function render() {
-    fileList.innerHTML = "";
-    picked.forEach(({ file, path }) => {
-      const li = document.createElement("li");
-      const a = document.createElement("span");
-      a.textContent = path;
-      const b = document.createElement("span");
-      b.textContent = fmtSize(file.size);
-      li.append(a, b);
-      fileList.append(li);
-    });
-    drop.querySelector("p strong").textContent = picked.length
-      ? `已选 ${picked.length} 个文件`
-      : "把文件或整个文件夹拖到这里";
-  }
-
-  function setFiles(list, folder) {
-    picked = list;
-    isFolder = folder || list.some((it) => it.path.includes("/"));
-    render();
-  }
-
-  // 从 drop 的 DataTransfer 里递归展开目录
-  async function walkEntry(entry, prefix, out) {
-    if (entry.isFile) {
-      const file = await new Promise((res, rej) => entry.file(res, rej));
-      out.push({ file, path: prefix + file.name });
-    } else if (entry.isDirectory) {
-      const reader = entry.createReader();
-      const readBatch = () => new Promise((res, rej) => reader.readEntries(res, rej));
-      const entries = [];
-      let batch;
-      do {
-        batch = await readBatch();
-        entries.push(...batch);
-      } while (batch.length);
-      for (const child of entries) await walkEntry(child, prefix + entry.name + "/", out);
-    }
-  }
-
-  async function collectFromDrop(dt) {
-    const out = [];
-    const roots = [];
-    for (const item of Array.from(dt.items)) {
-      const entry = item.webkitGetAsEntry && item.webkitGetAsEntry();
-      if (entry) roots.push(entry);
-    }
-    for (const entry of roots) await walkEntry(entry, "", out);
-    return out;
-  }
-
-  drop.addEventListener("click", (e) => {
-    if (!e.target.closest("label")) $("pickFiles").click();
-  });
-  drop.addEventListener("dragover", (e) => { e.preventDefault(); drop.classList.add("over"); });
-  drop.addEventListener("dragleave", () => drop.classList.remove("over"));
-  drop.addEventListener("drop", async (e) => {
-    e.preventDefault();
-    drop.classList.remove("over");
-    try {
-      setFiles(await collectFromDrop(e.dataTransfer), false);
-    } catch (err) {
-      status.textContent = "读取拖入的内容失败：" + err.message;
-    }
-  });
-
-  $("pickFiles").addEventListener("change", (e) => {
-    setFiles([...e.target.files].map((f) => ({ file: f, path: f.name })), false);
-  });
-  $("pickDir").addEventListener("change", (e) => {
-    setFiles([...e.target.files].map((f) => ({ file: f, path: f.webkitRelativePath || f.name })), true);
-  });
-
-  document.querySelectorAll(".tab").forEach((tab) => {
-    tab.addEventListener("click", () => {
-      document.querySelectorAll(".tab").forEach((t) => t.classList.remove("active"));
-      tab.classList.add("active");
-      mode = tab.dataset.mode;
-      const enc = mode === "encrypt";
-      $("confirmWrap").style.display = enc ? "" : "none";
-      $("preset").closest("label").style.display = enc ? "" : "none";
-      $("advanced").style.display = enc ? "" : "none";
-      const pwWarning = $("pwWarning");
-      pwWarning.style.display = enc ? "" : "none";
-      if (enc) {
-        updatePasswordHint();
-      } else {
-        pwWarning.hidden = true;
-        pwWarning.textContent = "";
-      }
-      $("go").textContent = enc ? "加密并下载" : "解密并下载";
-      $("dropHint").textContent = enc
-        ? "支持多文件；文件夹会打包成一个 .tarpit"
-        : "一次请上传一个 .tarpit 文件";
-      $("pickDir").disabled = !enc;
-      result.className = "result"; status.textContent = "";
-    });
-  });
-
-  function say(text, kind) {
-    status.className = "status" + (kind ? " " + kind : "");
-    status.textContent = text;
-  }
-
-  /** 与 Python / tarpit_core.js 同一口径；只提示，不阻止。 */
-  function checkPasswordStrength(text) {
-    if (!text) return { ok: false, hint: "口令不能为空" };
-    if (Array.from(text).length < 8) return { ok: false, hint: "至少 8 个字符" };
-    const classes = [/\\p{Ll}/u, /\\p{Lu}/u, /\\p{Nd}/u, /[^\\p{L}\\p{N}]/u]
-      .filter((pattern) => pattern.test(text)).length;
-    if (classes < 2) return { ok: false, hint: "建议混用大小写、数字或符号中的至少两类" };
-    if (["password", "12345678", "qwertyui", "admin123"].includes(text.toLowerCase())) {
-      return { ok: false, hint: "这是常见弱口令，换一个" };
-    }
-    return { ok: true, hint: "长度与字符种类达标（不等于高熵，长口令更可靠）" };
-  }
-
-  function updatePasswordHint() {
-    const box = $("pwWarning");
-    if (!box) return;
-    const text = $("password").value;
-    if (!text) { box.hidden = true; box.textContent = ""; return; }
-    const result = checkPasswordStrength(text);
-    if (result.ok) { box.hidden = true; box.textContent = ""; return; }
-    box.hidden = false;
-    box.textContent = `口令偏弱：${result.hint}。仍可继续，但 Argon2 挡不住弱口令。`;
-  }
-
-  $("password").addEventListener("input", updatePasswordHint);
-  updatePasswordHint();
-
-  $("go").addEventListener("click", async () => {
-    result.className = "result";
-    if (!picked.length) return say("先拖点东西进来", "bad");
-    const pw = $("password").value;
-    if (!pw) return say("口令不能为空", "bad");
-    if (mode === "encrypt" && $("password2").value !== pw) return say("两次口令不一致", "bad");
-    if (mode === "decrypt" && picked.length !== 1) return say("解密一次只能上传一个文件", "bad");
-
-    const fd = new FormData();
-    fd.append("password", pw);
-    fd.append("preset", $("preset").value);
-    fd.append("bundle", isFolder || picked.length > 1 ? "1" : "0");
-    if (mode === "encrypt") {
-      fd.append("pow", $("pow").value);
-      fd.append("cipher", $("cipher").value);
-      const kf = $("keyfile").files[0];
-      if (kf) fd.append("keyfile", kf, "keyfile");
-      const decoy = $("decoy").files[0];
-      if (decoy) {
-        fd.append("decoy", decoy, "decoy");
-        fd.append("decoy_password", $("decoyPassword").value);
-      }
-    } else {
-      const kf = $("keyfile").files[0];
-      if (kf) fd.append("keyfile", kf, "keyfile");
-    }
-    picked.forEach(({ file, path }) => fd.append("files", file, path));
-
-    const btn = $("go");
-    btn.disabled = true;
-    const t0 = performance.now();
-    const tick = setInterval(() => {
-      const s = ((performance.now() - t0) / 1000).toFixed(0);
-      say(`正在跑 Argon2id… ${s}s（这是在故意烧时间）`);
-    }, 250);
-    say("处理中…");
-
-    try {
-      const res = await fetch(mode === "encrypt" ? "/api/encrypt" : "/api/decrypt", {
-        method: "POST", body: fd,
-      });
-      clearInterval(tick);
-      if (!res.ok) {
-        let msg = `HTTP ${res.status}`;
-        try { msg = (await res.json()).error || msg; } catch (e) {}
-        return say("失败：" + msg, "bad");
-      }
-      const elapsed = (performance.now() - t0) / 1000;
-      const isDecoy = res.headers.get("X-Tarpit-Decoy") === "1";
-      const blob = await res.blob();
-      const cd = res.headers.get("Content-Disposition") || "";
-      const m = /filename\\*=UTF-8''([^;]+)/.exec(cd);
-      const name = m ? decodeURIComponent(m[1]) : (mode === "encrypt" ? "output.tarpit" : "output.bin");
-
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url; a.download = name;
-      document.body.append(a); a.click(); a.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 60000);
-
-      say(`完成，用时 ${elapsed.toFixed(1)}s`, "ok");
-      result.innerHTML = "";
-      if (isDecoy) {
-        const p = document.createElement("p");
-        const badge = document.createElement("span");
-        badge.className = "badge";
-        badge.textContent = "诱饵层";
-        p.append(badge, document.createTextNode(" 你解出的是诱饵内容。"));
-        result.append(p);
-      }
-      const line = document.createElement("p");
-      const link = document.createElement("a");
-      link.href = url; link.download = name; link.textContent = name;
-      line.append(document.createTextNode("已下载 "), link,
-                  document.createTextNode(`（${fmtSize(blob.size)}）`));
-      result.append(line);
-      const hint = document.createElement("p");
-      hint.className = "hint";
-      hint.textContent = "解密时请用对应的口令" + (mode === "encrypt" ? "和 keyfile" : "") + "。";
-      result.append(hint);
-      const artifact = res.headers.get("X-Tarpit-Artifact");
-      const savedPath = res.headers.get("X-Tarpit-Saved-Path");
-      if (artifact && savedPath) {
-        const box = document.createElement("p");
-        box.className = "hint";
-        box.append(document.createTextNode("另外存了一份到："));
-        const pathCode = document.createElement("code");
-        pathCode.textContent = decodeURIComponent(savedPath);
-        box.append(pathCode);
-        const openBtn = document.createElement("button");
-        openBtn.type = "button";
-        openBtn.textContent = "打开所在目录";
-        openBtn.style.cssText =
-          "margin-left:10px;padding:6px 12px;border-radius:8px;" +
-          "border:1px solid #3a2f22;background:#241d16;color:#d9a25f;" +
-          "cursor:pointer;font-size:13px";
-        openBtn.addEventListener("click", async () => {
-          openBtn.disabled = true;
-          try {
-            const reply = await fetch("/api/reveal", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ artifact }),
-            });
-            if (!reply.ok) {
-              const detail = await reply.json().catch(() => ({}));
-              throw new Error(detail.error || ("HTTP " + reply.status));
-            }
-          } catch (error) {
-            alert("打不开：" + error.message);
-          } finally {
-            openBtn.disabled = false;
-          }
-        });
-        box.append(openBtn);
-        result.append(box);
-      }
-
-      result.className = "result show";
-    } catch (err) {
-      clearInterval(tick);
-      say("请求失败：" + err.message, "bad");
-    } finally {
-      btn.disabled = false;
-    }
-  });
-})();
-</script>
-</body>
-</html>
-"""
 
 
 if __name__ == "__main__":

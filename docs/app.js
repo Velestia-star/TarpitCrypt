@@ -5,9 +5,10 @@
  * 密码学实现见 `tarpit_core.js`，与 Python 版逐字节兼容。
  */
 
-import * as core from "./tarpit_core.js";
+import * as core from "./core_adapter.js";
 
 const $ = (id) => document.getElementById(id);
+const LOCAL = globalThis.TARPIT_LOCAL === true;
 
 const state = {
   mode: "encrypt",
@@ -217,7 +218,13 @@ async function runEncrypt() {
     decoyPassword = passwordBytes(text);
   }
 
-  status("正在跑 Argon2id…（页面会卡住几秒，这是故意的）");
+  const sourceName = state.isFolder || state.picked.length > 1
+    ? String(state.picked[0].path).split("/")[0]
+    : baseName(state.picked[0].path);
+
+  status(LOCAL
+    ? "正在本地 Python 进程里跑 Argon2id…"
+    : "正在跑 Argon2id…（页面会卡住几秒，这是故意的）");
   await nextPaint();
 
   const blob = await core.encrypt(payload, passwordBytes(passwordText), {
@@ -225,13 +232,11 @@ async function runEncrypt() {
     keyfile,
     decoyPlaintext,
     decoyPassword,
+    filename: sourceName,
     onProgress: (done) => status(`正在磨 PoW… 已试 ${done.toLocaleString()} 次`),
   });
 
-  const sourceName = state.isFolder || state.picked.length > 1
-    ? String(state.picked[0].path).split("/")[0]
-    : baseName(state.picked[0].path);
-  return { bytes: blob, filename: `${sourceName}.tarpit` };
+  return { bytes: blob, filename: `${sourceName}.tarpit`, localMeta: blob.localMeta };
 }
 
 async function runDecrypt() {
@@ -242,16 +247,27 @@ async function runDecrypt() {
   const keyfileFile = $("keyfile").files[0];
   const keyfile = keyfileFile ? await readBytes(keyfileFile) : new Uint8Array(0);
   const blob = await readBytes(state.picked[0].file);
+  const inputName = baseName(state.picked[0].path);
 
-  status("正在跑 Argon2id…（页面会卡住几秒，这是故意的）");
+  status(LOCAL
+    ? "正在本地 Python 进程里跑 Argon2id…"
+    : "正在跑 Argon2id…（页面会卡住几秒，这是故意的）");
   await nextPaint();
 
-  const { data, isDecoy } = await core.decrypt(blob, passwordBytes(passwordText), { keyfile });
+  const { data, isDecoy } = await core.decrypt(blob, passwordBytes(passwordText), {
+    keyfile,
+    filename: inputName,
+  });
 
-  let filename = baseName(state.picked[0].path);
+  let filename = inputName;
   if (filename.endsWith(".tarpit")) filename = filename.slice(0, -".tarpit".length);
   if (core.isZip(data) && !filename.endsWith(".zip")) filename += ".zip";
-  return { bytes: data, filename: filename || "plain.bin", isDecoy };
+  return {
+    bytes: data,
+    filename: filename || "plain.bin",
+    isDecoy,
+    localMeta: data.localMeta,
+  };
 }
 
 async function onSubmit() {
@@ -263,7 +279,9 @@ async function onSubmit() {
   const started = performance.now();
   let timer = setInterval(() => {
     const seconds = ((performance.now() - started) / 1000).toFixed(0);
-    status(`正在跑 Argon2id… ${seconds}s（这是在故意烧时间）`);
+    status(LOCAL
+      ? `本地 Python 正在计算… ${seconds}s`
+      : `正在跑 Argon2id… ${seconds}s（这是在故意烧时间）`);
   }, 400);
 
   try {
@@ -299,6 +317,43 @@ async function onSubmit() {
       ? "口令和 keyfile 丢了就永远解不开，没有后门。"
       : "解密成功。";
     box.append(hint);
+
+    if (outcome.localMeta && outcome.localMeta.artifact) {
+      const saved = outcome.localMeta.savedPath
+        ? decodeURIComponent(outcome.localMeta.savedPath)
+        : "";
+      if (saved) {
+        const savedLine = document.createElement("p");
+        savedLine.className = "hint";
+        savedLine.textContent = `本地版已另存一份：${saved}`;
+        box.append(savedLine);
+      }
+      const openLine = document.createElement("p");
+      const openButton = document.createElement("button");
+      openButton.type = "button";
+      openButton.textContent = "打开所在目录";
+      openButton.style.cssText = [
+        "background:none", "border:0", "padding:0", "font:inherit",
+        "color:var(--accent)", "cursor:pointer", "text-decoration:underline dotted",
+      ].join(";");
+      openButton.addEventListener("click", async () => {
+        try {
+          const response = await fetch("/api/reveal", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ artifact: outcome.localMeta.artifact }),
+          });
+          const data = await response.json().catch(() => ({}));
+          if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+          status("已在文件管理器中打开", "ok");
+        } catch (error) {
+          status(`打开失败：${error.message}`, "bad");
+        }
+      });
+      openLine.append(openButton);
+      box.append(openLine);
+    }
+
     box.className = "result show";
   } catch (error) {
     clearInterval(timer);
@@ -879,6 +934,7 @@ async function encryptWorkspaceItem(item) {
       keyfile,
       decoyPlaintext,
       decoyPassword: decoyPlaintext ? passwordBytes(decoyText) : null,
+      filename: item.name,
       onProgress: (done) => status(`正在磨 PoW… 已试 ${done.toLocaleString()} 次`),
     });
     const payloadBlob = new Blob([blob], { type: "application/octet-stream" });
@@ -1224,6 +1280,27 @@ function bind() {
 }
 
 if (typeof document !== "undefined") {
+  if (LOCAL) {
+    document.title = "TarpitCrypt · 本地版";
+    const sub = document.querySelector(".sub");
+    if (sub) {
+      sub.innerHTML =
+        "本地版：运算在你自己电脑的 Python 进程里完成，文件只经 127.0.0.1，不会外传。" +
+        "<br><strong>结果会自动另存到项目的 存放文件/。</strong>";
+    }
+    const modal = $("pathModal");
+    if (modal) {
+      const card = modal.querySelector(".modal-card");
+      if (card) {
+        card.innerHTML = `
+          <button class="modal-close" id="pathModalClose" type="button" aria-label="关闭">×</button>
+          <h3>文件存在哪里？</h3>
+          <p>本地版会把结果另存到项目的 <code>存放文件/</code>，完成页可以直接点「打开所在目录」。</p>
+          <p>原始文件只在本机，不会发到外网。</p>
+        `;
+      }
+    }
+  }
   bind();
   switchMode("encrypt");
   // 就绪标记：既方便人工排查，也让无头浏览器测试能确认模块真的跑完了。

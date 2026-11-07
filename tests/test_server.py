@@ -10,6 +10,7 @@ import io
 import json
 import sys
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -193,6 +194,14 @@ def test_save_artifact_is_race_safe(
 def test_main_refuses_non_loopback() -> None:
     """非回环地址默认拒绝启动，必须显式 --allow-remote。"""
     assert ts.main(["--host", "0.0.0.0", "--port", "9"]) == 2
+
+
+def test_main_refuses_missing_docs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """没有 docs/ 时本地 Web 要明确报错，而不是起一个空服务。"""
+    monkeypatch.setattr(ts, "DOCS_DIR", tmp_path)
+    assert ts.main(["--no-open", "--port", "9"]) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -477,10 +486,126 @@ def test_decrypt_saves_copy_and_returns_artifact(web_base: str) -> None:
 
 
 def test_web_index_serves_page(web_base: str) -> None:
-    """首页能打开，且不泄漏任何服务端路径。"""
+    """首页直接复用 docs/，并注入本地模式标记；不泄漏服务端路径。"""
     with urllib.request.urlopen(f"{web_base}/", timeout=10) as response:
         html = response.read().decode("utf-8")
     assert response.status == HTTPStatus.OK
     assert "Tarpit" in html
     assert "drop" in html
-    assert "/api/encrypt" in html
+    assert "window.TARPIT_LOCAL = true" in html
+    assert "app.js" in html
+    assert "/api/encrypt" not in html
+
+
+def test_web_serves_docs_assets(web_base: str) -> None:
+    """本地服务要能把 docs/ 的脚本、样式和适配器一起发出去。"""
+    for path, needle in (
+        ("/app.js", "./core_adapter.js"),
+        ("/core_adapter.js", "TARPIT_LOCAL"),
+        ("/style.css", "--accent"),
+    ):
+        with urllib.request.urlopen(f"{web_base}{path}", timeout=10) as response:
+            body = response.read().decode("utf-8")
+        assert response.status == HTTPStatus.OK
+        assert needle in body, f"{path} 内容不对"
+
+
+def test_web_rejects_static_path_traversal(web_base: str) -> None:
+    """docs/ 静态路由不能把仓库里的其他文件带出去。"""
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(f"{web_base}/%2e%2e/README.md", timeout=10)
+    assert exc.value.code == HTTPStatus.NOT_FOUND
+
+
+# ---------------------------------------------------------------------------
+# armor 后端 API
+# ---------------------------------------------------------------------------
+
+
+def _wait_armor_job(web_base: str, job_id: str, timeout: float = 120.0) -> dict:
+    """轮询 armor 任务，直到 done / error。"""
+    deadline = time.time() + timeout
+    last: dict = {}
+    while time.time() < deadline:
+        with urllib.request.urlopen(
+            f"{web_base}/api/armor/jobs/{job_id}", timeout=15
+        ) as response:
+            last = json.load(response)["job"]
+        if last.get("status") in ("done", "error"):
+            return last
+        time.sleep(0.2)
+    raise AssertionError(f"armor 任务超时：{last}")
+
+
+def test_armor_profiles_endpoint(web_base: str) -> None:
+    with urllib.request.urlopen(f"{web_base}/api/armor/profiles", timeout=10) as response:
+        data = json.load(response)
+    assert data["ok"] is True
+    assert data["defaults"]["profile"] in data["profiles"]
+    assert data["defaults"]["poison"] in data["poisons"]
+
+
+def test_armor_pack_rejects_weak_password(web_base: str) -> None:
+    content_type, body = build_multipart(
+        {"password": "password", "layers": "2", "sidecar": "0"},
+        [("files", "a.txt", b"x")],
+    )
+    status, _, payload = _post(f"{web_base}/api/armor/pack", content_type, body)
+    assert status == HTTPStatus.BAD_REQUEST
+    assert "口令" in json.loads(payload)["error"]
+
+
+def test_armor_pack_inspect_restore_roundtrip(web_base: str) -> None:
+    """web 端走的 armor 闭环：加固 → 检查 → 还原。"""
+    content_type, body = build_multipart(
+        {
+            "password": "ArmorPass1!",
+            "layers": "2",
+            "profile": "轻（秒级）",
+            "sidecar": "0",
+        },
+        [("files", "hello.txt", b"armor payload")],
+    )
+    status, _, payload = _post(f"{web_base}/api/armor/pack", content_type, body)
+    assert status == HTTPStatus.ACCEPTED
+    job = _wait_armor_job(web_base, json.loads(payload)["job"])
+    assert job["status"] == "done", job
+    saved = Path(job["result"]["savedPath"])
+    assert saved.exists()
+    armored = saved.read_bytes()
+    assert armored[:8] == b"TPARMOR3"
+
+    content_type, body = build_multipart({}, [("files", saved.name, armored)])
+    status, _, payload = _post(f"{web_base}/api/armor/inspect", content_type, body)
+    assert status == HTTPStatus.OK
+    info = json.loads(payload)
+    assert info["layers"] == 2
+
+    content_type, body = build_multipart(
+        {"password": "ArmorPass1!"}, [("files", saved.name, armored)]
+    )
+    status, _, payload = _post(f"{web_base}/api/armor/restore", content_type, body)
+    assert status == HTTPStatus.ACCEPTED
+    job = _wait_armor_job(web_base, json.loads(payload)["job"])
+    assert job["status"] == "done", job
+    restored = Path(job["result"]["savedPath"])
+    with zipfile.ZipFile(io.BytesIO(restored.read_bytes())) as archive:
+        assert archive.read("hello.txt") == b"armor payload"
+
+
+def test_armor_pack_with_sidecar(web_base: str) -> None:
+    """伴生诱饵目录和它的下载 zip 都要真的落盘。"""
+    content_type, body = build_multipart(
+        {"password": "ArmorPass1!", "layers": "2", "sidecar": "1"},
+        [("files", "hello.txt", b"sidecar payload")],
+    )
+    status, _, payload = _post(f"{web_base}/api/armor/pack", content_type, body)
+    assert status == HTTPStatus.ACCEPTED
+    job = _wait_armor_job(web_base, json.loads(payload)["job"])
+    assert job["status"] == "done", job
+    result = job["result"]
+    assert Path(result["sidecarPath"]).is_dir()
+    sidecar_zip = Path(result["sidecarZipPath"])
+    assert sidecar_zip.is_file()
+    with zipfile.ZipFile(sidecar_zip) as archive:
+        assert archive.namelist()

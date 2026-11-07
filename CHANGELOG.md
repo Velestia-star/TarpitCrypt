@@ -5,6 +5,31 @@
 
 ## 未发布
 
+### 本地 Web：复用 docs 前端 + 自动打开浏览器（P1）
+
+- `tarpitcrypt_server.py` 不再内嵌一份会漂移的旧页面：`GET /` 直接服务
+  `docs/`，并注入 `window.TARPIT_LOCAL = true`。
+- 新增 `docs/core_adapter.js`：本地模式下把 `encrypt` / `decrypt` 转到本地
+  Python 核心，在线版仍然走浏览器 WASM；界面、工作区、历史、弱口令提示
+  因此全部同步。
+- 本地模式的完成页会显示「已另存一份」和「打开所在目录」；在线文案不再
+  误说「浏览器里完成」。
+- 启动后默认自动打开浏览器；用 `--no-open` 关闭。
+- 新增 `docs/` 静态路由（含路径穿越防护）与对应测试。
+
+### 本地 Web：armor 异步任务 API（P2）
+
+- 新增 `GET /api/armor/profiles`、`POST /api/armor/pack`、
+  `GET /api/armor/jobs/<id>`、`POST /api/armor/restore`、
+  `POST /api/armor/inspect`。
+- 后台单 worker 串行执行多层 Argon2，进度通过任务轮询读取；浏览器主线程
+  不参与计算。
+- 加固结果写到 `存放文件/`：`.armored`、伴生目录、伴生包 zip；同名自动
+  加序号，不覆盖。
+- 源包上传支持单文件 / 目录结构，做路径净化与临时目录清理；口令沿用
+  armor 的强度体检。
+- 网页「加固 / 还原」页签留到下一阶段（P3）；当前 API 已有端到端测试。
+
 ### 安全加固：实证审计 F–K 缺陷修复（v0.3.12）
 
 对 v0.3.11 做了一次实证审计，确认六处可被剪枝 / 自伤的缺陷并全部修复：
