@@ -271,7 +271,7 @@ Argon2id 是内存硬函数，GPU/ASIC 的并行优势被内存带宽卡死，�
 pip install argon2-cffi cryptography pytest
 python -m pytest tests -o addopts=""   # 88 项：v1 单元 + 固定格式兼容 + keygen 保护 + 浏览器互解 + 控制台编码回归
 python -m pytest tests -k browser      # 单跑浏览器 ↔ Python 双向互解（无浏览器时跳过）
-python armor/selftest.py               # 191 项
+python armor/selftest.py               # 194 项
 python armor/probe_agent.py            # 模拟逆向轮数对照（加密容器层）
 python armor/agent_eval.py --runs 5    # 多轮取样 + 评估报告
 python armor/content_probe.py --poison ALL   # 内容层陷阱实测：模拟 AI 逆向 agent 打诱饵包，验证全 TRAPPED 且无真实主机泄露
@@ -285,7 +285,7 @@ python -m armor.runtime_check           # 还原保真度与可运行性矩阵�
 报错，却会让程序行为悄悄变掉。
 
 ```bash
-python -m armor.runtime_check                      # 跑内置矩阵（14 项）
+python -m armor.runtime_check                      # 跑内置矩阵（16 项）
 python -m armor.runtime_check <程序目录>            # 验证真实程序包
 python -m armor.runtime_check <程序目录> --run "python main.py"   # 顺带比对运行结果
 ```

@@ -50,6 +50,12 @@ jobs:
       - name: armor 端到端自测
         run: python armor/selftest.py
 
+      - name: 还原保真度与可运行性矩阵
+        # 矩阵也已并入 selftest，这里单独跑一遍便于快速定位失败。
+        # 权限位、只读属性、执行位这些坑在 Linux/macOS 上才会真正咬人
+        # （Windows 没有执行位），所以三平台都要跑。
+        run: python -m armor.runtime_check
+
       - name: 模拟逆向冒烟（轮数对照 + 评估报告）
         run: |
           python armor/probe_agent.py
