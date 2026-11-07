@@ -109,7 +109,7 @@ RFC 2606/6761/6762 文档地址段（`example.com/net/org`、`invalid`、
 ## 四、仍待补强（下一轮可做）
 
 - **真实 agent 实测的广度**：内容层已在本机 ollama（qwen25vl3b）跑通七种侧重，
-  6/7 命中（见 `AGENT_BENCHMARK.md`），但样本单一。仍需用
+  6~7/7 命中（见 `AGENT_BENCHMARK.md`，15:30 复测为 7/7），但样本单一。仍需用
   BINNY / kernagent / ReverseCore_MCP 这类真实工具跑一遍，验证实际空转/误判率。
 - **诱饵层内嵌假 IOC**：当前内容陷阱主要在伴生包（针对「读项目目录」那一轮）。
   若要让「已破解容器、拿到诱饵层」的 agent 也撞上假 IOC，可在 `armor_core`
