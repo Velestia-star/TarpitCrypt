@@ -11,8 +11,8 @@ import subprocess
 import urllib.error
 import urllib.request
 
-REPO = "wei238982377/TarpitCrypt"
-SITE = "https://wei238982377.github.io/TarpitCrypt/"
+REPO = "Velestia-star/TarpitCrypt"
+SITE = "https://Velestia-star.github.io/TarpitCrypt/"
 
 BLOCK = (
     "\n\n---\n\n"

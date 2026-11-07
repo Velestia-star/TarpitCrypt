@@ -18,10 +18,10 @@ dependencies = [
 dev = ["pytest>=8.0", "ruff>=0.6"]
 
 [project.urls]
-Homepage = "https://wei238982377.github.io/TarpitCrypt/"
-Repository = "https://github.com/wei238982377/TarpitCrypt"
-Changelog = "https://github.com/wei238982377/TarpitCrypt/blob/main/CHANGELOG.md"
-Issues = "https://github.com/wei238982377/TarpitCrypt/issues"
+Homepage = "https://Velestia-star.github.io/TarpitCrypt/"
+Repository = "https://github.com/Velestia-star/TarpitCrypt"
+Changelog = "https://github.com/Velestia-star/TarpitCrypt/blob/main/CHANGELOG.md"
+Issues = "https://github.com/Velestia-star/TarpitCrypt/issues"
 
 [project.scripts]
 tarpitcrypt = "tarpitcrypt:main"

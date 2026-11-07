@@ -1,6 +1,6 @@
 # TarpitCrypt
 
-**🌐 在线版（打开即用）→ [wei238982377.github.io/TarpitCrypt](https://wei238982377.github.io/TarpitCrypt/)**
+**🌐 在线版（打开即用）→ [Velestia-star.github.io/TarpitCrypt](https://Velestia-star.github.io/TarpitCrypt/)**
 —— 拖文件进去就能加解密，运算全在你自己浏览器里，文件不上传。
 
 > 不是让数据「解不开」，而是让**逆向方判断不了自己是不是找对了**。
@@ -104,7 +104,7 @@ AI 只允许输出下面这些键与值，其他一律丢弃并记 warning——
 把 `docs/` 目录发布成 GitHub Pages 后，可以直接在浏览器里用：
 
 ```
-https://wei238982377.github.io/TarpitCrypt/
+https://Velestia-star.github.io/TarpitCrypt/
 ```
 
 **首次启用**：仓库 → Settings → Pages → Source 选 `Deploy from a branch` →
@@ -333,7 +333,7 @@ CI 在 3 个系统 × Python 3.11/3.12/3.13 上跑同一套命令，配置见
 
 ## 作者与贡献者
 
-- [@wei238982377](https://github.com/wei238982377) — 仓库所有者、v1 加密核心与本地 Web 入口
+- [@Velestia-star](https://github.com/Velestia-star) — 仓库所有者、v1 加密核心与本地 Web 入口
 - [@yanmoren](https://github.com/yanmoren) — `armor/` 加固层、GUI、工程化与发布
 
 完整的逐提交记录见仓库 Contributors 页面。欢迎通过 PR 参与，协作约定见
