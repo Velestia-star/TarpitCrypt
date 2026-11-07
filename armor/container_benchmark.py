@@ -41,7 +41,9 @@ from console_utf8 import ensure  # noqa: E402
 ensure()
 import armor_core as ac  # noqa: E402
 
-MAX_TURNS = 10
+#: 候选口令现在有 8~12 条，轮数上限要留足余量，否则会话被截断在
+#: 「达到上限」而不是「候选耗尽」，放大倍数会被低估。
+MAX_TURNS = 40
 PASSWORD = b"ab-bench-pw-2026"
 
 SYSTEM = (

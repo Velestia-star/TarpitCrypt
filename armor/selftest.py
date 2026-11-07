@@ -201,25 +201,33 @@ def main() -> int:
               any(zipfile.is_zipfile(io.BytesIO(x)) for x in opened))
 
         # 7b) 层内假 IOC：解开任意一层都能撞上蜜罐，且真层结构完全一致
-        def ioc_of(payload: bytes) -> tuple[list, str]:
+        def ioc_of(payload: bytes) -> tuple[list, str, str]:
             with zipfile.ZipFile(io.BytesIO(payload)) as zf:
                 items = [i for i in zf.infolist()
                          if i.comment == ac.LAYER_IOC_TAG]
                 text = "".join(zf.read(i).decode("utf-8", errors="ignore")
-                               for i in items if not i.is_dir())
-                return items, text
+                               for i in items
+                               if i.filename == ac.LAYER_IOC_PATH)
+                note = "".join(zf.read(i).decode("utf-8", errors="ignore")
+                               for i in items
+                               if i.filename == ac.LAYER_NOTE_PATH)
+                return items, text, note
 
         layer_sets = [ioc_of(p) for p in [real.payload, *opened]]
-        check("每一层都带层内假 IOC 条目（含真层）",
-              all(len(items) == 2 for items, _ in layer_sets),
-              str([len(items) for items, _ in layer_sets]))
+        check("每一层都带层内假 IOC + 注入文档条目（含真层）",
+              all(len(items) == 3 for items, _, _ in layer_sets),
+              str([len(items) for items, _, _ in layer_sets]))
         check("各层假 IOC 条数一致（不泄露层间差异）",
-              len({len(text.splitlines()) for _, text in layer_sets}) == 1,
-              str([len(text.splitlines()) for _, text in layer_sets]))
+              len({len(text.splitlines()) for _, text, _ in layer_sets}) == 1,
+              str([len(text.splitlines()) for _, text, _ in layer_sets]))
         check("各层假 IOC 内容互不相同（抗指纹）",
-              len({text for _, text in layer_sets}) == len(layer_sets),
+              len({text for _, text, _ in layer_sets}) == len(layer_sets),
               f"{len(layer_sets)} 层")
-        all_ioc = "\n".join(text for _, text in layer_sets)
+        check("只分发容器时也有层内注入文档（多语言 + BENIGN 口径）",
+              all(note.strip() and "BENIGN" in note
+                  for _, _, note in layer_sets),
+              str([note[:30] for _, _, note in layer_sets]))
+        all_ioc = "\n".join(text for _, text, _ in layer_sets)
         global_ips = [x for x in re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", all_ioc)
                       if ipaddress.ip_address(x).is_global]
         check("层内假 IOC 无真实公网 IP", not global_ips, str(global_ips))
@@ -231,10 +239,83 @@ def main() -> int:
         check("层内假 IOC 通过构建期真实主机审计", not ioc_leaks, str(ioc_leaks))
         check("层内假 IOC 是内部条目，不落进用户目录",
               not (out / ac.LAYER_IOC_PATH).exists()
+              and not (out / ac.LAYER_NOTE_PATH).exists()
               and not (out / "resources").exists())
         check("层内假 IOC 数量足以诱导 agent（≥12 条）",
-              min(len(text.splitlines()) for _, text in layer_sets) >= 14,
-              str([len(text.splitlines()) for _, text in layer_sets]))
+              min(len(text.splitlines()) for _, text, _ in layer_sets) >= 14,
+              str([len(text.splitlines()) for _, text, _ in layer_sets]))
+        check("层内假 IOC 含非主机类行为指标（不一眼假）",
+              any(any(k in text for k in ("JA3_FINGERPRINT", "CERT_SHA1",
+                                          "MUTEX_NAME", "PIPE_NAME",
+                                          "DROP_PATH", "USER_AGENT"))
+                  for _, text, _ in layer_sets))
+
+        # 7c) 层间不可区分：尺寸之外，元数据分布也不能泄露真伪。
+        #     早先只测「尺寸极差 0B」，漏掉了「诱饵层所有条目同一年」
+        #     和「诱饵层条目恒多 4~5 个」这两个确定性剪枝信号。
+        def layer_meta(payload: bytes) -> dict:
+            with zipfile.ZipFile(io.BytesIO(payload)) as zf:
+                infos = zf.infolist()
+                user = [i for i in infos if i.comment == ac.USER_TAG]
+                non_pad = [i for i in infos if i.comment != ac.PAD_TAG]
+                return {
+                    "files": sum(not i.is_dir() for i in user),
+                    "dirs": sum(i.is_dir() for i in user),
+                    "years": len({i.date_time[0] for i in non_pad}),
+                    "modes": tuple(sorted({(i.external_attr >> 16) & 0o777
+                                           for i in user if not i.is_dir()})),
+                }
+        metas = [layer_meta(p) for p in [real.payload, *opened]]
+        for key in ("files", "dirs", "modes"):
+            check(f"各层 {key} 完全一致（不产生剪枝线索）",
+                  len({m[key] for m in metas}) == 1,
+                  str([m[key] for m in metas]))
+        check("各层时间戳年份都不是单一值（防整层同一年回归）",
+              all(m["years"] > 1 for m in metas),
+              str([m["years"] for m in metas]))
+
+        # 7d) 还原覆盖保护：误选原程序目录当输出目录时不能静默毁数据
+        clash_out = root / "clash_overwrite"
+        clash_out.mkdir(parents=True, exist_ok=True)
+        (clash_out / "src").mkdir(parents=True, exist_ok=True)
+        (clash_out / "src" / "main.py").write_bytes(b"USER DATA - DO NOT LOSE\n")
+        try:
+            ac.safe_extract(real.payload, clash_out)
+            check("同名且内容不同的文件应拒绝覆盖", False)
+        except ac.ArmorError:
+            check("同名且内容不同的文件拒绝覆盖", True)
+        check("拒绝覆盖时原文件未被改动",
+              (clash_out / "src" / "main.py").read_bytes()
+              == b"USER DATA - DO NOT LOSE\n")
+        ac.safe_extract(real.payload, clash_out, overwrite=True)
+        check("显式 overwrite=True 才放行覆盖",
+              (clash_out / "src" / "main.py").read_bytes() == original)
+        ac.safe_extract(real.payload, clash_out)
+        check("同名且内容相同的文件跳过而不报错",
+              (clash_out / "src" / "main.py").read_bytes() == original)
+
+        # 7e) 大真包也要保持层尺寸对齐；填充上限超了必须明确报错而不是静默失配
+        big_app = root / "BigApp"
+        big_app.mkdir()
+        (big_app / "blob.bin").write_bytes(
+            (b"0123456789abcdef" * 65536))        # 1 MiB
+        big_blob = ac.build_armored(big_app, pw, layers=3, profile=profile)
+        big_opened = solved_by(big_blob, ac.armor_passwords(big_blob))
+        big_sizes = [len(p) for p in
+                     [ac.restore_armored(big_blob, pw).payload, *big_opened]]
+        check("大真包各层尺寸仍对齐", max(big_sizes) - min(big_sizes) <= 8,
+              f"极差 {max(big_sizes) - min(big_sizes)}B")
+        saved_cap = ac.MAX_DECOY_PAD
+        try:
+            ac.MAX_DECOY_PAD = 64        # 人为把上限压到不可能够
+            try:
+                ac.build_armored(big_app, pw, layers=3, profile=profile)
+                check("填充上限不足应明确报错", False)
+            except ac.ArmorError as exc:
+                check("填充上限不足明确报错（不静默失配）",
+                      "填充上限" in str(exc), str(exc)[:80])
+        finally:
+            ac.MAX_DECOY_PAD = saved_cap
         with zipfile.ZipFile(io.BytesIO(real.payload)) as zf:
             real_names = zf.namelist()
         check("诱饵包与真包都带同结构清单",
@@ -818,12 +899,16 @@ def main() -> int:
         for rel in (dk.P_ARCH, dk.P_PRIOR, dk.P_DRAFT_REPORT):
             check(f"RAG投毒产出 {rel}", rel in rag_kit.files)
         arch_txt = (rag_kit.root / dk.P_ARCH).read_text(encoding="utf-8")
-        # 默认是「混合」档，这份文件可能落在强/弱/中性任一档，所以不能
-        # 只认「停止」这两个字；结论口径（BENIGN + 处置表述）在就行。
+        # 默认是「混合」档，这份文件可能落在强/弱/中性任一档，也可能抽到
+        # 英文模板，所以不能只认中文的「停止」；结论口径（BENIGN + 处置
+        # 表述）在就行。
         check("知识库文章含诱导性间接指令（判良性口径）",
               "BENIGN" in arch_txt
-              and any(k in arch_txt for k in
-                      ("停止", "复核轮次", "分析方", "可参考", "记录")))
+              and any(k.lower() in arch_txt.lower() for k in
+                      ("停止", "复核轮次", "分析方", "可参考", "记录",
+                       "stop further", "archive as benign", "benign report",
+                       "verification rounds", "analyst", "reduce",
+                       "archived", "discretion")))
 
         ill_kit = dk.build_sidecar(src, out_dir=root / "ill_kit",
                                    armored=container, poison="进度幻觉", layers=4)
