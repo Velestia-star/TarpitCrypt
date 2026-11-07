@@ -51,6 +51,7 @@ import random
 import re
 import secrets
 import shutil
+import stat
 import struct
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -69,7 +70,7 @@ except ModuleNotFoundError:  # pragma: no cover - 仅仓库布局触发
     from tarpitcrypt import CIPHER_AESGCM, _aead_decrypt, _aead_encrypt, _derive
 
 #: 整个工具集的发布版本；容器格式版本另见 VERSION。
-__version__ = "0.3.8"
+__version__ = "0.3.9"
 
 __all__ = [
     "__version__",
@@ -221,11 +222,16 @@ def _random_password(rng: random.Random) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _zip_entry(name: str, tag: bytes, rng: random.Random) -> zipfile.ZipInfo:
+def _zip_entry(name: str, tag: bytes, rng: random.Random,
+               mode: int = 0o644) -> zipfile.ZipInfo:
     """构造带内部标记的 zip 条目。
 
     时间戳按与诱饵包相同的分布随机化：真包条目若一律是 1980 年，光看
     zip 元数据就能把真层和诱饵层分开。还原时只取内容，不还原时间戳。
+
+    *mode* 是条目的 Unix 权限位（存进 external_attr 高 16 位）。真实
+    程序包里可执行脚本占 755、只读配置占 444，若一律写成 644，
+    还原出来的 .sh / ELF 会失去执行位 —— 程序直接跑不起来。
     """
     info = zipfile.ZipInfo(
         name,
@@ -233,9 +239,64 @@ def _zip_entry(name: str, tag: bytes, rng: random.Random) -> zipfile.ZipInfo:
                    rng.randint(0, 23), rng.randint(0, 59), rng.randint(0, 59)),
     )
     info.compress_type = zipfile.ZIP_DEFLATED
-    info.external_attr = 0o644 << 16
+    info.external_attr = mode << 16
     info.comment = tag
     return info
+
+
+#: 归档里允许出现的三种权限模式。
+#:
+#: 只保留这三类，是因为它们能覆盖真实程序包的全部情形，而 setuid /
+#: setgid / sticky 这类特殊位**绝不能**带进容器 —— 归档不该携带提权位，
+#: 还原时把它们写回磁盘等于凭空造出一个提权入口。
+MODE_EXEC = 0o755
+MODE_READONLY = 0o444
+MODE_NORMAL = 0o644
+
+#: 不进容器的目录名：各类工具缓存。
+_SKIP_DIR_NAMES = frozenset({".pytest_cache", ".mypy_cache", ".ruff_cache"})
+
+#: 字节码后缀。**不是**一律排除 —— 见 _is_regenerable_bytecode。
+_SKIP_SUFFIXES = frozenset({".pyc", ".pyo"})
+
+
+def _is_regenerable_bytecode(path: Path) -> bool:
+    """这个字节码文件是不是「丢了也能再生」的缓存？
+
+    * 同名 `.py` 源码在旁边 → 是。Python 下次运行会自己重新编译，
+      而且字节码头部嵌了**编译它的机器与原始路径**，带进容器等于泄露
+      部署路径，白占体积。
+    * 没有对应源码 → 不是。它是**唯一的代码**（生产环境常见的 pyc-only
+      部署、Docker 镜像裁剪），丢了程序就直接 import 失败。
+    """
+    if path.suffix not in _SKIP_SUFFIXES:
+        return False
+    stem = path.name.split(".")[0]
+    # 字节码通常躺在 __pycache__ 里，源码在它的**上一级**目录。
+    src_dir = path.parent.parent if path.parent.name == "__pycache__" else path.parent
+    for src_name in (stem + ".py", stem + ".pyw"):
+        if (src_dir / src_name).is_file():
+            return True
+    return False
+
+
+def _source_mode(path: Path) -> int:
+    """把源文件的权限折算成归档里存的模式位。
+
+    * 有任一执行位 → 755（脚本入口、可执行文件）
+    * 完全没有写权限 → 444（只读配置；Windows 上表现为只读属性）
+    * 其余 → 644
+    """
+    try:
+        st = path.stat()
+    except OSError:
+        return MODE_NORMAL
+    mode = stat.S_IMODE(st.st_mode)
+    if mode & 0o111:
+        return MODE_EXEC
+    if not mode & 0o222:
+        return MODE_READONLY
+    return MODE_NORMAL
 
 
 #: 伴生诱饵目录的构建清单文件名。带这个文件的目录属于本工具生成的诱饵，
@@ -259,11 +320,75 @@ def _under_any(path: Path, dirs: set[Path]) -> bool:
     return False
 
 
+def _collect_entries(src: Path) -> list[tuple[str, Path | None]]:
+    """列出要打包的条目：[(相对路径, 源文件或 None)]，None 表示目录条目。
+
+    符号链接单独处理。容器是加密归档，还原时链接会退化成普通文件 —— 行为
+    已经变了，所以这里不让链接原样进包：
+
+    * 指向**包内**文件 → 按目标真实内容打包（还原后是等价的普通文件）；
+    * 指向**包内**目录 → 把目录内容挂在链接名下打包；
+    * 指向**包外** → 直接拒绝加固。否则一次「打包整个家目录」式的误操作
+      就能把包外的文件卷进容器，还原后等于泄露。
+
+    目录递归带 visited 集合，链接成环（a -> b -> a）时不会无限展开。
+    """
+    src_real = src.resolve()
+    entries: list[tuple[str, Path | None]] = []
+    visited: set[Path] = {src_real}
+
+    def walk(directory: Path, prefix: str) -> None:
+        try:
+            children = sorted(directory.iterdir(), key=lambda p: p.name)
+        except OSError:
+            return
+        for child in children:
+            rel = f"{prefix}{child.name}"
+            if child.name in _SKIP_DIR_NAMES:
+                continue
+            if child.suffix in _SKIP_SUFFIXES and _is_regenerable_bytecode(child):
+                continue
+            if child.is_symlink():
+                real = child.resolve()
+                if not real.is_relative_to(src_real):
+                    raise ArmorError(
+                        f"程序包里有指向包外的符号链接，拒绝加固：{rel}")
+                if real.is_dir():
+                    entries.append((rel + "/", None))
+                    if real not in visited:
+                        visited.add(real)
+                        walk(real, rel + "/")
+                else:
+                    entries.append((rel, real))
+            elif child.is_dir():
+                if child.name == "__pycache__":
+                    # 整目录缓存：里面的字节码若都有源码可再生，整个目录
+                    # 都不进包；只有「无源字节码」（pyc-only 部署）才留。
+                    keep = [f for f in child.iterdir()
+                            if f.is_file()
+                            and not _is_regenerable_bytecode(f)]
+                    if not keep:
+                        continue
+                entries.append((rel + "/", None))
+                real = child.resolve()
+                if real not in visited:
+                    visited.add(real)
+                    walk(child, rel + "/")
+            elif child.is_file():
+                entries.append((rel, child))
+
+    walk(src_real, "")
+    return entries
+
+
 def _pack_path(src: Path, zf: zipfile.ZipFile, on_progress: Progress | None) -> int:
     """把一个文件或整个目录写进 zip，返回条目数。
 
     空目录也写成目录条目：真实程序包常带 logs/、cache/ 这类空目录，早先只
     打包文件会把目录结构丢掉。大文件按块流式写入，不整份读进内存。
+
+    条目权限按源文件如实记录（可执行 755 / 只读 444 / 普通 644），
+    否则还原出来的脚本会失去执行位，程序直接跑不起来。
 
     本工具自己生成的伴生诱饵目录（带 .build-meta.json 清单）一律跳过：
     诱饵不属于用户程序，不该进容器；否则还原出来会多出一堆假文件，
@@ -276,18 +401,17 @@ def _pack_path(src: Path, zf: zipfile.ZipFile, on_progress: Progress | None) -> 
     else:
         # 先找出所有伴生诱饵目录（带本工具的构建清单），其下的内容一律不进包。
         kit_dirs = {p for p in src.rglob("*") if p.is_dir() and _is_sidecar_dir(p)}
-        for path in sorted(src.rglob("*")):
-            rel = path.relative_to(src).as_posix()
-            if _under_any(path, kit_dirs):
+        for rel, path in _collect_entries(src):
+            # 目录条目也要排除：只挡文件的话，伴生诱饵目录会以空目录形式
+            # 混进容器，还原后用户目录里就多出一堆空壳子。
+            if _under_any(src / rel, kit_dirs):
                 continue
-            if path.is_dir():
-                entries.append((rel + "/", None))
-            elif path.is_file():
-                entries.append((rel, path))
+            entries.append((rel, path))
 
     total = len(entries)
     for i, (rel, path) in enumerate(entries, 1):
-        info = _zip_entry(rel, USER_TAG, rng)
+        mode = _source_mode(path) if path is not None else MODE_EXEC
+        info = _zip_entry(rel, USER_TAG, rng, mode)
         if path is None:
             zf.writestr(info, b"")
         else:
@@ -412,13 +536,22 @@ def _source_stats(payload: bytes) -> dict:
     只数用户文件：目录条目与工具清单元数据不该被当成程序包特征。
     """
     with zipfile.ZipFile(io.BytesIO(payload)) as zf:
-        names = [i.filename for i in zf.infolist()
-                 if not i.is_dir() and i.comment == USER_TAG]
+        names: list[str] = []
+        execs = 0
+        for info in zf.infolist():
+            if info.is_dir() or info.comment != USER_TAG:
+                continue
+            names.append(info.filename)
+            if (info.external_attr >> 16) & 0o111:
+                execs += 1
     return {
         "size": len(payload),
         "files": len(names),
         "depth": max((n.count("/") for n in names), default=0),
         "exts": tuple(sorted({Path(n).suffix or ".bin" for n in names})),
+        # 可执行条目占比：真包里几个入口脚本带执行位，诱饵包也得有同样比例，
+        # 否则「哪些条目是 755」本身就是一层剪枝线索。
+        "exec_ratio": (execs / len(names)) if names else 0.0,
     }
 
 
@@ -601,6 +734,11 @@ def _make_decoy_zip(seed: bytes, index: int, stats: dict,
 
     year = rng.randint(2021, 2026)
     buf = io.BytesIO()
+    # 权限分布与真包对齐：真包里有几个可执行入口，诱饵包也得有同样比例。
+    exec_ratio = float(stats.get("exec_ratio", 0.0))
+    file_paths = [p for p in ordered if p != manifest_name]
+    n_exec = min(len(file_paths), round(exec_ratio * len(file_paths)))
+    exec_set = set(rng.sample(file_paths, n_exec)) if n_exec else set()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for path in ordered:
             text = entries[path]
@@ -610,7 +748,12 @@ def _make_decoy_zip(seed: bytes, index: int, stats: dict,
                            rng.randint(0, 23), rng.randint(0, 59), rng.randint(0, 59)),
             )
             info.compress_type = zipfile.ZIP_DEFLATED
-            info.external_attr = 0o644 << 16
+            if path.endswith("/"):
+                info.external_attr = MODE_EXEC << 16
+            elif path in exec_set:
+                info.external_attr = MODE_EXEC << 16
+            else:
+                info.external_attr = MODE_NORMAL << 16
             info.comment = MANIFEST_TAG if path == manifest_name else USER_TAG
             zf.writestr(info, text.encode("utf-8") if text is not None else b"")
     return buf.getvalue()
@@ -1015,11 +1158,47 @@ def restore_armored(
     raise ArmorError("口令无法解开任何层")
 
 
+#: Windows 设备保留名。这些名字（连同任意扩展名）无法作为文件创建，
+#: 写下去会变成设备或直接报错。
+_WIN_RESERVED = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{i}" for i in range(1, 10)}
+    | {f"LPT{i}" for i in range(1, 10)}
+)
+#: Windows 传统 MAX_PATH。超过后即使开了长路径支持也可能失败。
+_WIN_PATH_LIMIT = 240
+
+
+def _check_windows_path(raw: str, target: Path) -> None:
+    """Windows 上注定创建不出来的路径，提前给出可读的错误。"""
+    name = PurePosixPath(raw).name
+    stem = name.split(".")[0].upper()
+    if stem in _WIN_RESERVED:
+        raise ArmorError(
+            f"条目名在 Windows 上是设备保留名，无法还原：{raw!r}")
+    if len(str(target)) > _WIN_PATH_LIMIT:
+        raise ArmorError(
+            f"还原路径过长（{len(str(target))} 字符，Windows 上限约 "
+            f"{_WIN_PATH_LIMIT}）：{raw!r}。请换一个更短的输出目录。")
+
+
 def safe_extract(payload: bytes, out_dir: str | Path) -> list[Path]:
-    """把还原出的 zip 解到目录，拒绝路径穿越、绝对路径与符号链接。"""
+    """把还原出的 zip 解到目录，拒绝路径穿越、绝对路径与符号链接。
+
+    还原出来的目录要与原程序行为一致：权限位如实恢复（可执行脚本保住
+    执行位，只读配置保住只读位），内容逐字节照抄（行尾、BOM 都不动）。
+
+    Windows 上有些路径**根本无法创建**（超长路径、设备保留名）。这类条目
+    在源机器上多半来自 WSL / 挂载盘，直接写会抛一个看不懂的 OSError；
+    这里提前拦下并说清楚是哪一条。
+    """
     out = Path(out_dir).resolve()
     out.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
+    # Windows 上文件名大小写不敏感、尾部的点与空格会被裁掉，于是
+    # Linux 上的 A.py 与 a.py 还原到 Windows 会互相覆盖 —— 静默丢数据。
+    # 这里提前拦下并说清楚是哪两条撞了。
+    seen_names: dict[str, str] = {}
     with zipfile.ZipFile(io.BytesIO(payload)) as zf:
         for info in zf.infolist():
             raw = info.filename
@@ -1033,18 +1212,51 @@ def safe_extract(payload: bytes, out_dir: str | Path) -> list[Path]:
             mode = info.external_attr >> 16
             if mode & 0o170000 == 0o120000:
                 raise ArmorError(f"拒绝符号链接条目：{raw!r}")
+            # 只保留 rwx 三组权限位：setuid / setgid / sticky 一律丢掉。
+            # 归档来自用户程序，但条目也可能来自被篡改的容器，把提权位
+            # 原样写回磁盘等于凭空造出一个提权入口。
+            file_mode = mode & 0o777
             target = (out / PurePosixPath(raw)).resolve()
             if not target.is_relative_to(out):
                 raise ArmorError(f"条目逃出目标目录：{raw!r}")
+            if os.name == "nt":
+                _check_windows_path(raw, target)
+                key = (str(target.parent).lower() + "/"
+                       + PurePosixPath(raw).name.lower().rstrip(". "))
+                prev = seen_names.get(key)
+                if prev is not None and prev != raw:
+                    raise ArmorError(
+                        f"条目名在 Windows 上会互相覆盖（大小写或尾点冲突）："
+                        f"{prev!r} 与 {raw!r}")
+                seen_names[key] = raw
             data = (zf.read(info) if info.comment == b""
                     and raw == ".manifest" else None)
             if _is_internal(info, data):
                 continue
             if info.is_dir():
                 target.mkdir(parents=True, exist_ok=True)
+                if file_mode:
+                    os.chmod(target, file_mode)
                 continue
             target.parent.mkdir(parents=True, exist_ok=True)
+            head = b""
             with zf.open(info) as reader, target.open("wb") as writer:
-                shutil.copyfileobj(reader, writer, _COPY_CHUNK)
+                while True:
+                    chunk = reader.read(_COPY_CHUNK)
+                    if not chunk:
+                        break
+                    if len(head) < 2:
+                        head += chunk[:2 - len(head)]
+                    writer.write(chunk)
+            if file_mode and not (file_mode & 0o111) and head.startswith(b"#!"):
+                # 带 shebang 的入口脚本：即使归档里没记执行位也补上。
+                # v0.3.8 之前的容器把所有条目一律记成 644，靠这条把旧容器
+                # 还原出来的 .sh / 带 shebang 的 .py 救回来 —— 没有执行位
+                # 的入口脚本是跑不起来的。
+                file_mode = MODE_EXEC
+            if file_mode:
+                # 还原权限：可执行脚本要保住执行位，否则程序跑不起来；
+                # 只读配置要保住只读位，否则程序行为被改变。
+                os.chmod(target, file_mode)
             written.append(target)
     return written
