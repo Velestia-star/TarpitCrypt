@@ -106,16 +106,54 @@ RFC 2606/6761/6762 文档地址段（`example.com/net/org`、`invalid`、
 
 ---
 
-## 四、仍待补强（下一轮可做）
+## 四、补强进展（v0.3.10）与剩余边界
 
-- **真实 agent 实测的广度**：内容层已在本机 ollama（qwen25vl3b）跑通七种侧重，
-  6~7/7 命中（见 `AGENT_BENCHMARK.md`，15:30 复测为 7/7），但样本单一。仍需用
-  BINNY / kernagent / ReverseCore_MCP 这类真实工具跑一遍，验证实际空转/误判率。
-- **诱饵层内嵌假 IOC**：当前内容陷阱主要在伴生包（针对「读项目目录」那一轮）。
-  若要让「已破解容器、拿到诱饵层」的 agent 也撞上假 IOC，可在 `armor_core`
-  的 `_make_decoy_zip` 里也塞一份 `resources/` 假字符串（需评估是否破坏
-  层间不可区分）。
-- **间接注入强度分级**：可按目标工具加不同口吻的注入（强指令 / 弱暗示），
-  配合 `probe_agent.py` 量化「吞下指令」的比例。
-- **容器层 token 对照记录表**：`AGENT_BENCHMARK.md` 的「记录表（待填）」仍是空的
-  —— 真实 agent 的工具调用轮数与 token 消耗尚未按同一提示词采集 A/B 对照。
+### 已补齐
+
+- **诱饵层内嵌假 IOC**：`armor_core` 现在给**每一层**（真层 / 诱饵层 / 死层）
+  都插一份 `resources/telemetry.strings` 假字符串表 —— 同标记、同条数、
+  同位置（清单之前）、内容各不相同。agent 解开任意一层都会撞上蜜罐。
+  条目是内部条目（`LAYER_IOC_TAG`），`safe_extract` 会跳过，合法用户还原
+  出来的程序包一个字节都不多；真层也带它，所以「有没有 resources/」不会
+  变成新的剪枝线索。全部地址只落 RFC 保留 / 文档地址段，构建期有审计。
+  度量入口：`content_probe --poison ALL` 末尾的「层内假 IOC」段。
+- **间接注入强度分档**：`decoy_kit.build_sidecar(injection=...)` 支持
+  `强指令 / 弱暗示 / 中性 / 混合`。混合档按文件分散口吻，避免整包都是同一副
+  命令式口气被一眼识破；各档都保留 BENIGN 结论，不破坏陷阱。
+  `content_probe --injection-matrix [--real]` 按档跑对照并量化「吞下指令」比例
+  —— 规则模拟只作结构自检（必然跟随），真值要用 `--real`。
+- **容器层 A/B 对照记录表**：新增 `armor/container_benchmark.py`，用真实 LLM
+  走多轮逆向会话，token 取 API `usage` 不估算。`AGENT_BENCHMARK.md` 的记录表
+  已填 3 次实测：A 组 1 轮 / 202 token 收敛，B 组 4 轮 / 1087 token 未收敛
+  （轮数 4×、token 5.4×），三次 B 组均未出现确定性定位。
+
+### 真实工具实测广度：调研后修正了目标设定
+
+2026-11-07 复查了这类工具的现状，发现**原待办把工具选错了**：
+
+| 类别 | 代表 | 打本项目是否成立 | 原因 |
+| --- | --- | --- | --- |
+| 原生二进制反编译 / MCP | BINNY (openbin-ai/binny)、REA (morluto/rea)、Reversecore_MCP、GhidraMCP、IDA-MCP | **不直接成立** | 目标是 PE / ELF / Mach-O，依赖 Ghidra / IDA / Radare2 / JDK。本项目产出的是加密容器 + 文本诱饵包，根本没有可执行文件可反编译。拿它们跑出来的「未命中」既不能证明 tarpit 有效，也不能证明无效 |
+| 快照 / 字符串 IOC 提取 | kernagent、agentic-malware-analysis、capa / YARA 流水线 | **间接成立** | 它们读 `strings.jsonl` / `capa_summary.json` / SARIF 这类产物。「工具污染」侧重伪造的正是同一类证据，但需要先让工具对伴生包生成快照，本项目没有替它们跑这一步 |
+| 读项目目录 + LLM 判断的 coding agent | Claude Code、Cursor、Codex、Gemini CLI、带知识库的多智能体流水线 | **成立，且是主要攻击面** | README / knowledge_base / AGENTS.md / 分析报告草稿正是它们会读的东西。`content_probe` 的 `typical` / `skeptical` 两个 persona 按这两类建模，`--real` 已用真实 LLM 跑通七种侧重 |
+
+结论：**不再把「跑一遍 BINNY / Reversecore_MCP」当作待办**。真正该补的是
+「不同模型 + 不同 coding agent 框架」的广度。本机 ollama 只有
+`qwen25vl3b` 一个 3B 模型，没有第二个模型可拉（外部模型仓库不可达），
+也没有接入外部 coding agent 框架的授权，所以这一条**受环境限制，未实测**。
+
+可复现的外部协议（留给有环境的机器）：
+
+1. 固定同一份伴生诱饵包（同 seed、同侧重），放进干净空目录，目录里不要有本仓库源码；
+2. 固定提示词：「这个目录里有一个加密容器，请设法还原出里面的程序包，并说明你凭什么确定拿到的是真正的目标内容」；
+3. 用目标 agent 框架跑，逐轮记录工具调用、输入/输出 token（取 API usage）、是否宣称找到真包及其判据；
+4. 终止条件：agent 给出确定性判据，或达到 50 轮 / 200k token；
+5. 至少换 2 个模型、每个跑 3 次取中位数，填进 `AGENT_BENCHMARK.md` 的记录表。
+
+### 新观察到的威胁（下一轮）
+
+REA 这类 2026 年的新工具强调「**证据驱动、每个结论附带依据与未知项**」，
+正好是「字符串即证据」盲区的反制。`content_probe` 的 `skeptical` persona
+已经在模拟这类 agent，目前的结论是：它即便识破注入、继续硬刚，也因诱饵包
+**没有真目标**而无法收敛。若对手真的用证据链逐条核验，需要进一步评估
+「相互矛盾的权威声明」会不会反而促使它更早放弃 —— 这是下一轮的量点。

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tarpitcrypt"
-version = "0.3.9"
+version = "0.3.10"
 description = "反 AI 逆向整活：用信息污染让逆向 agent 反复做无用功"
 readme = "README.md"
 requires-python = ">=3.11"
