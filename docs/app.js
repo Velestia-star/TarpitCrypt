@@ -272,10 +272,34 @@ async function onSubmit() {
 }
 
 // ---------------------------------------------------------------------------
-// 右侧加密队列
+// 右侧工作区（存放与管理）
 // ---------------------------------------------------------------------------
 
-const queue = { items: [], seq: 0 };
+const HISTORY_KEY = "tarpitcrypt.history.v1";
+const HISTORY_LIMIT = 200;
+const ITEM_MIME = "application/x-tarpit-item";
+
+const workspace = { items: [], seq: 0, view: "workspace" };
+let historyEntries = loadHistory();
+
+/** 读历史记录（只存名字/时间/大小，绝不存文件内容）。 */
+function loadHistory() {
+  try {
+    const raw = localStorage.getItem(HISTORY_KEY);
+    const list = raw ? JSON.parse(raw) : [];
+    return Array.isArray(list) ? list : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveHistory(list) {
+  try {
+    localStorage.setItem(HISTORY_KEY, JSON.stringify(list.slice(0, HISTORY_LIMIT)));
+  } catch {
+    /* 隐私模式下写不了，忽略即可，不影响加密 */
+  }
+}
 
 /** 打开右侧抽屉。 */
 function openDrawer() {
@@ -285,7 +309,8 @@ function openDrawer() {
   $("drawerBackdrop").hidden = false;
   requestAnimationFrame(() => $("drawerBackdrop").classList.add("show"));
   document.body.classList.add("drawer-open");
-  if (location.hash !== "#queue") history.replaceState(null, "", "#queue");
+  const target = "#" + workspace.view;
+  if (location.hash !== target) history.replaceState(null, "", target);
 }
 
 /** 关闭右侧抽屉。 */
@@ -296,7 +321,7 @@ function closeDrawer() {
   $("drawerBackdrop").classList.remove("show");
   setTimeout(() => { $("drawerBackdrop").hidden = true; }, 200);
   document.body.classList.remove("drawer-open");
-  if (location.hash === "#queue") {
+  if (["#workspace", "#history", "#queue"].includes(location.hash)) {
     history.replaceState(null, "", location.pathname + location.search);
   }
 }
@@ -305,65 +330,99 @@ function drawerOpen() {
   return $("drawer").classList.contains("open");
 }
 
-/** 队列里所有文件的总字节数。 */
-function queueItemSize(item) {
+function formatTime(ms) {
+  const d = new Date(ms);
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function itemSize(item) {
   return item.files.reduce((sum, entry) => sum + entry.file.size, 0);
 }
 
-function queueNote(text) {
+function workspaceNote(text) {
   $("queueSummary").textContent = text;
 }
 
-/** 把若干项加入队列。 */
-function addQueueEntries(entries) {
+/** 切换「工作区 / 历史」。 */
+function setView(view) {
+  workspace.view = view;
+  for (const tab of document.querySelectorAll(".dtab")) {
+    tab.classList.toggle("active", tab.dataset.view === view);
+  }
+  $("viewWorkspace").hidden = view !== "workspace";
+  $("viewHistory").hidden = view !== "history";
+  if (view === "history") renderHistory();
+  if (drawerOpen()) history.replaceState(null, "", "#" + view);
+}
+
+/** 往工作区加项。 */
+function addWorkspaceEntries(entries) {
   if (!entries.length) return;
   for (const entry of entries) {
-    queue.items.push({
-      id: ++queue.seq,
+    workspace.items.push({
+      id: ++workspace.seq,
       kind: entry.kind,
       name: entry.name,
       files: entry.files,
       status: "pending",
       output: null,
       error: null,
+      selected: false,
     });
   }
-  renderQueue();
+  renderWorkspace();
 }
 
-/** 重新渲染整个队列。 */
-function renderQueue() {
+function selectedItems() {
+  return workspace.items.filter((item) => item.selected);
+}
+
+function renderWorkspace() {
   const list = $("queueList");
-  const done = queue.items.filter((item) => item.status === "done").length;
-  $("queueBadge").textContent = String(queue.items.length);
-  $("queueEmpty").hidden = queue.items.length > 0;
+  const done = workspace.items.filter((item) => item.status === "done").length;
+  const selected = selectedItems().length;
+
+  $("queueBadge").textContent = String(workspace.items.length);
+  $("queueEmpty").hidden = workspace.items.length > 0;
   list.innerHTML = "";
-  for (const item of queue.items) list.append(buildQueueRow(item));
-  queueNote(
-    queue.items.length
-      ? `${queue.items.length} 项 · ${done} 项已加密`
-      : "0 项",
-  );
+  for (const item of workspace.items) list.append(buildWorkspaceRow(item));
+
+  $("queueSelectAll").checked = workspace.items.length > 0 && selected === workspace.items.length;
+  $("queueDelete").disabled = selected === 0;
+  $("queueDelete").textContent = selected ? `删除选中（${selected}）` : "删除选中";
+  workspaceNote(`${workspace.items.length} 项 · ${done} 项已加密 · 选中 ${selected}`);
 }
 
-/** 构建一行：左源文件 → 箭头 → 右加密结果。 */
-function buildQueueRow(item) {
+/** 一行：勾选 · 源 · 箭头 · 结果。 */
+function buildWorkspaceRow(item) {
   const li = document.createElement("li");
-  li.className = `queue-row ${item.status}`;
+  li.className = `queue-row ${item.status}${item.selected ? " selected" : ""}`;
   li.draggable = true;
   li.dataset.id = String(item.id);
+
+  const check = document.createElement("span");
+  check.className = "q-check";
+  const box = document.createElement("input");
+  box.type = "checkbox";
+  box.checked = Boolean(item.selected);
+  box.addEventListener("change", () => {
+    item.selected = box.checked;
+    renderWorkspace();
+  });
+  check.append(box);
 
   const source = document.createElement("div");
   source.className = "q-src";
   const name = document.createElement("span");
   name.className = "q-name";
   name.textContent = item.name;
-  name.title = item.name;
+  name.title = `${item.name}（拖到左侧可重新加密）`;
   const meta = document.createElement("span");
   meta.className = "q-meta";
   meta.textContent = item.kind === "dir"
-    ? `文件夹 · ${item.files.length} 个文件 · ${formatSize(queueItemSize(item))}`
-    : `文件 · ${formatSize(queueItemSize(item))}`;
+    ? `文件夹 · ${item.files.length} 个文件 · ${formatSize(itemSize(item))}`
+    : `文件 · ${formatSize(itemSize(item))}`;
   source.append(name, meta);
 
   const arrow = document.createElement("div");
@@ -390,14 +449,72 @@ function buildQueueRow(item) {
     error.textContent = item.error || "失败";
     output.append(error);
   }
-  // 未加密时右侧保持空白——这是有意为之。
+  // 未加密时右侧保持空白——有意为之。
 
-  li.append(source, arrow, output);
+  li.append(check, source, arrow, output);
   return li;
 }
 
-/** 把拖进抽屉的文件/文件夹收成队列项。 */
-async function collectQueueEntries(dataTransfer) {
+/** 渲染历史记录。 */
+function renderHistory() {
+  const list = $("historyList");
+  $("historyEmpty").hidden = historyEntries.length > 0;
+  list.innerHTML = "";
+  for (const entry of historyEntries) {
+    const li = document.createElement("li");
+    li.className = "history-row";
+
+    const dot = document.createElement("span");
+    dot.className = "history-empty-dot";
+    dot.title = "已加密";
+
+    const source = document.createElement("div");
+    source.className = "q-src";
+    const name = document.createElement("span");
+    name.className = "q-name";
+    name.textContent = entry.name;
+    name.title = entry.name;
+    const meta = document.createElement("span");
+    meta.className = "q-meta";
+    meta.textContent = `${formatTime(entry.at)} · ${formatSize(entry.sizeIn)}`;
+    source.append(name, meta);
+
+    const arrow = document.createElement("div");
+    arrow.className = "q-arrow";
+    arrow.textContent = "→";
+
+    const output = document.createElement("div");
+    output.className = "q-out";
+    const outName = document.createElement("span");
+    outName.className = "q-name";
+    outName.textContent = entry.outName;
+    outName.title = entry.outName;
+    const outMeta = document.createElement("span");
+    outMeta.className = "q-meta";
+    outMeta.textContent = formatSize(entry.sizeOut);
+    const del = document.createElement("button");
+    del.className = "history-del";
+    del.type = "button";
+    del.textContent = "×";
+    del.title = "从历史里删掉这条记录（不影响已下载的文件）";
+    del.addEventListener("click", () => {
+      historyEntries = historyEntries.filter((item) => item.at !== entry.at);
+      saveHistory(historyEntries);
+      renderHistory();
+    });
+    output.append(outName, outMeta);
+
+    const tail = document.createElement("div");
+    tail.append(del);
+
+    li.append(dot, source, arrow, output);
+    li.append(tail);
+    list.append(li);
+  }
+}
+
+/** 把拖进抽屉的文件/文件夹收成工作区条目。 */
+async function collectWorkspaceEntries(dataTransfer) {
   const roots = [];
   for (const item of Array.from(dataTransfer.items || [])) {
     const entry = item.webkitGetAsEntry && item.webkitGetAsEntry();
@@ -418,7 +535,7 @@ async function collectQueueEntries(dataTransfer) {
 }
 
 /** 取出一项待加密的明文（文件夹打 zip，单文件直传）。 */
-async function queueItemPayload(item) {
+async function workspaceItemPayload(item) {
   if (item.kind === "dir" || item.files.length > 1) {
     const entries = [];
     for (const entry of item.files) {
@@ -429,20 +546,16 @@ async function queueItemPayload(item) {
   return readBytes(item.files[0].file);
 }
 
-/** 逐项加密队列里待处理的项，结果留在右侧。 */
-async function runQueue() {
-  const pending = queue.items.filter((item) => item.status === "pending");
+/** 逐项加密，结果留在右侧，同时写入历史。 */
+async function runWorkspace() {
+  const pending = workspace.items.filter((item) => item.status === "pending");
   if (!pending.length) {
-    queueNote(queue.items.length ? "没有待加密的项" : "队列是空的");
+    workspaceNote(workspace.items.length ? "没有待加密的项" : "工作区是空的");
     return;
   }
   const passwordText = $("password").value;
   if (!passwordText) {
-    queueNote("先在上面表单里填口令");
-    return;
-  }
-  if (passwordText !== $("password2").value && state.mode === "encrypt") {
-    queueNote("两次口令不一致");
+    workspaceNote("先在上面表单里填口令");
     return;
   }
 
@@ -453,7 +566,7 @@ async function runQueue() {
   const decoyPlaintext = decoyFile ? await readBytes(decoyFile) : null;
   const decoyText = $("decoyPassword").value;
   if (decoyPlaintext && !decoyText) {
-    queueNote("选了诱饵文件就要填诱饵口令");
+    workspaceNote("选了诱饵文件就要填诱饵口令");
     return;
   }
 
@@ -463,11 +576,11 @@ async function runQueue() {
     index += 1;
     item.status = "running";
     item.error = null;
-    renderQueue();
-    queueNote(`正在加密 ${index}/${pending.length}：${item.name}`);
+    renderWorkspace();
+    workspaceNote(`正在加密 ${index}/${pending.length}：${item.name}`);
     await nextPaint();
     try {
-      const payload = await queueItemPayload(item);
+      const payload = await workspaceItemPayload(item);
       const blob = await core.encrypt(payload, passwordBytes(passwordText), {
         params,
         keyfile,
@@ -480,29 +593,50 @@ async function runQueue() {
         size: blob.length,
       };
       item.status = "done";
+      historyEntries.unshift({
+        name: item.name,
+        kind: item.kind,
+        sizeIn: itemSize(item),
+        outName: item.output.name,
+        sizeOut: item.output.size,
+        at: Date.now(),
+      });
+      historyEntries = historyEntries.slice(0, HISTORY_LIMIT);
+      saveHistory(historyEntries);
     } catch (error) {
       item.status = "error";
       item.error = error.message;
     }
-    renderQueue();
+    renderWorkspace();
   }
   $("queueRun").disabled = false;
 }
 
-/** 把 fromId 移到 toId 之前或之后。 */
-function moveQueueItem(fromId, toId, after) {
-  const from = queue.items.findIndex((item) => item.id === fromId);
-  const to = queue.items.findIndex((item) => item.id === toId);
-  if (from < 0 || to < 0 || from === to) return;
-  const [moved] = queue.items.splice(from, 1);
-  let target = queue.items.findIndex((item) => item.id === toId);
-  if (after) target += 1;
-  queue.items.splice(target, 0, moved);
-  renderQueue();
+/** 删除选中的行（只删记录，不动已下载的文件）。 */
+function deleteSelected() {
+  const selected = new Set(selectedItems().map((item) => item.id));
+  if (!selected.size) return;
+  for (const item of workspace.items) {
+    if (selected.has(item.id) && item.output) URL.revokeObjectURL(item.output.url);
+  }
+  workspace.items = workspace.items.filter((item) => !selected.has(item.id));
+  renderWorkspace();
 }
 
-/** 绑定队列相关事件。 */
-function bindQueue() {
+/** 把 fromId 移到 toId 之前或之后。 */
+function moveWorkspaceItem(fromId, toId, after) {
+  const from = workspace.items.findIndex((item) => item.id === fromId);
+  const to = workspace.items.findIndex((item) => item.id === toId);
+  if (from < 0 || to < 0 || from === to) return;
+  const [moved] = workspace.items.splice(from, 1);
+  let target = workspace.items.findIndex((item) => item.id === toId);
+  if (after) target += 1;
+  workspace.items.splice(target, 0, moved);
+  renderWorkspace();
+}
+
+/** 绑定工作区相关事件。 */
+function bindWorkspace() {
   $("queueToggle").addEventListener("click", () => {
     if (drawerOpen()) closeDrawer();
     else openDrawer();
@@ -513,13 +647,27 @@ function bindQueue() {
     if (event.key === "Escape" && drawerOpen()) closeDrawer();
   });
 
-  $("queueRun").addEventListener("click", () => { void runQueue(); });
-  $("queueClear").addEventListener("click", () => {
-    for (const item of queue.items) {
-      if (item.output) URL.revokeObjectURL(item.output.url);
-    }
-    queue.items = [];
-    renderQueue();
+  for (const tab of document.querySelectorAll(".dtab")) {
+    tab.addEventListener("click", () => setView(tab.dataset.view));
+  }
+
+  $("queueRun").addEventListener("click", () => { void runWorkspace(); });
+  $("queueDelete").addEventListener("click", deleteSelected);
+  $("queueSelectAll").addEventListener("change", (event) => {
+    for (const item of workspace.items) item.selected = event.target.checked;
+    renderWorkspace();
+  });
+
+  $("historyClear").addEventListener("click", () => {
+    historyEntries = [];
+    saveHistory(historyEntries);
+    renderHistory();
+  });
+
+  $("openPath").addEventListener("click", () => { $("pathModal").hidden = false; });
+  $("pathModalClose").addEventListener("click", () => { $("pathModal").hidden = true; });
+  $("pathModal").addEventListener("click", (event) => {
+    if (event.target === $("pathModal")) $("pathModal").hidden = true;
   });
 
   $("queuePickFiles").addEventListener("change", (event) => {
@@ -528,7 +676,7 @@ function bindQueue() {
       name: file.name,
       files: [{ file, path: file.name }],
     }));
-    addQueueEntries(entries);
+    addWorkspaceEntries(entries);
     event.target.value = "";
   });
 
@@ -540,13 +688,13 @@ function bindQueue() {
       if (!groups.has(root)) groups.set(root, []);
       groups.get(root).push({ file, path: relative });
     }
-    addQueueEntries(
+    addWorkspaceEntries(
       [...groups].map(([name, files]) => ({ kind: "dir", name, files })),
     );
     event.target.value = "";
   });
 
-  // 拖进抽屉 = 加入队列
+  // 拖进抽屉 = 加入工作区
   const drawer = $("drawer");
   let dragDepth = 0;
   drawer.addEventListener("dragenter", (event) => {
@@ -567,13 +715,13 @@ function bindQueue() {
     if (!event.dataTransfer.types.includes("Files")) return;
     event.preventDefault();
     try {
-      addQueueEntries(await collectQueueEntries(event.dataTransfer));
+      addWorkspaceEntries(await collectWorkspaceEntries(event.dataTransfer));
     } catch (error) {
-      queueNote(`读取失败：${error.message}`);
+      workspaceNote(`读取失败：${error.message}`);
     }
   });
 
-  // 行内拖拽排序
+  // 行内拖拽排序；拖到左侧主区域则交给上面绑定的事件重新加密
   let dragId = null;
   const list = $("queueList");
   list.addEventListener("dragstart", (event) => {
@@ -581,7 +729,9 @@ function bindQueue() {
     if (!row) return;
     dragId = Number(row.dataset.id);
     row.classList.add("dragging");
-    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.effectAllowed = "copyMove";
+    event.dataTransfer.setData(ITEM_MIME, String(dragId));
+    event.dataTransfer.setData("text/plain", String(dragId));
   });
   list.addEventListener("dragend", () => {
     dragId = null;
@@ -606,12 +756,23 @@ function bindQueue() {
     event.preventDefault();
     const rect = row.getBoundingClientRect();
     const after = event.clientY > rect.top + rect.height / 2;
-    moveQueueItem(dragId, Number(row.dataset.id), after);
+    moveWorkspaceItem(dragId, Number(row.dataset.id), after);
     dragId = null;
   });
 
-  if (location.hash === "#queue") openDrawer();
-  renderQueue();
+  if (location.hash === "#history") {
+    setView("history");
+    openDrawer();
+  } else if (location.hash === "#workspace" || location.hash === "#queue") {
+    openDrawer();
+  }
+  renderWorkspace();
+  renderHistory();
+}
+
+/** 从工作区拖出来的条目 → 找回对应的 item。 */
+function workspaceItemById(id) {
+  return workspace.items.find((item) => item.id === Number(id)) || null;
 }
 
 // ---------------------------------------------------------------------------
@@ -631,6 +792,16 @@ function bind() {
   drop.addEventListener("drop", async (event) => {
     event.preventDefault();
     drop.classList.remove("over");
+    // 从工作区里拖出来的一行 → 直接放到左侧，走「加密并下载」原来的流程
+    const itemId = event.dataTransfer.getData(ITEM_MIME);
+    if (itemId) {
+      const item = workspaceItemById(itemId);
+      if (item) {
+        setFiles(item.files, item.kind === "dir");
+        status(`已从工作区取出「${item.name}」，可以直接加密`, "ok");
+      }
+      return;
+    }
     try {
       setFiles(await collectFromDrop(event.dataTransfer), false);
     } catch (error) {
@@ -651,7 +822,7 @@ function bind() {
     tab.addEventListener("click", () => switchMode(tab.dataset.mode));
   }
   $("go").addEventListener("click", onSubmit);
-  bindQueue();
+  bindWorkspace();
 }
 
 if (typeof document !== "undefined") {

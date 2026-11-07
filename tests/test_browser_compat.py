@@ -310,7 +310,42 @@ def test_queue_drawer_opens_from_hash(served_site: str, tmp_path: Path) -> None:
         time.sleep(0.8)
 
     assert 'data-app="ready"' in dom, f"页面模块没有执行完：\n{dom[:600]}"
-    for element_id in ("queueToggle", "drawer", "queueList", "queueRun", "queuePickDir"):
-        assert f'id="{element_id}"' in dom, f"缺少队列抽屉节点 #{element_id}"
+    for element_id in ("queueToggle", "drawer", "queueList", "queueRun", "queuePickDir",
+                       "queueSelectAll", "queueDelete", "openPath", "pathModal",
+                       "historyList", "historyClear", "queueSelectAll"):
+        assert f'id="{element_id}"' in dom, f"缺少工作区节点 #{element_id}"
     assert 'class="drawer open"' in dom, "`#queue` 应当直接展开抽屉"
     assert 'aria-expanded="true"' in dom
+
+
+@pytest.mark.browser
+def test_history_view_deeplink(served_site: str, tmp_path: Path) -> None:
+    """`#history` 深链：抽屉直接打开并切到历史视图。"""
+    browser = find_browser()
+    if browser is None:
+        pytest.skip("本机没有 Edge/Chrome，跳过浏览器兼容性测试")
+
+    base = served_site.rsplit("/", 1)[0]
+    dom = ""
+    for _attempt in range(3):
+        run = subprocess.run(
+            [
+                browser, "--headless", "--disable-gpu", "--no-first-run",
+                "--no-default-browser-check",
+                f"--user-data-dir={tmp_path / 'profile4'}",
+                "--virtual-time-budget=20000",
+                "--dump-dom", f"{base}/index.html#history",
+            ],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180,
+        )
+        dom = run.stdout
+        if 'data-app="ready"' in dom:
+            break
+        time.sleep(0.8)
+
+    assert 'data-app="ready"' in dom, f"页面模块没有执行完：\n{dom[:600]}"
+    assert 'class="drawer open"' in dom
+    # 历史面板可见、工作区面板隐藏
+    assert "viewWorkspace" in dom and "viewHistory" in dom
+    assert 'id="viewWorkspace" hidden' in dom, "历史视图下工作区应隐藏"
+    assert 'class="dtab active" data-view="history"' in dom, "历史标签应高亮"
