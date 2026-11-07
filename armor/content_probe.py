@@ -735,6 +735,7 @@ def probe_layer_ioc(src: Path) -> dict:
     blob = ac.build_armored(src, b"layer-ioc-probe-pw", layers=4,
                             profile="轻（秒级）")
     texts: list[str] = []
+    notes: list[str] = []
     opened = 0
     for pw in [b"layer-ioc-probe-pw", *[p.encode("utf-8")
                                         for p in ac.armor_passwords(blob)]]:
@@ -745,8 +746,13 @@ def probe_layer_ioc(src: Path) -> dict:
         opened += 1
         with zipfile.ZipFile(io.BytesIO(payload)) as zf:
             for info in zf.infolist():
-                if info.comment == ac.LAYER_IOC_TAG and not info.is_dir():
-                    texts.append(zf.read(info).decode("utf-8", errors="ignore"))
+                if info.comment != ac.LAYER_IOC_TAG or info.is_dir():
+                    continue
+                body = zf.read(info).decode("utf-8", errors="ignore")
+                if info.filename == ac.LAYER_IOC_PATH:
+                    texts.append(body)
+                elif info.filename == ac.LAYER_NOTE_PATH:
+                    notes.append(body)
     joined = "\n".join(texts)
     ips = _IPV4.findall(joined)
     urls = _URL.findall(joined)
@@ -759,10 +765,16 @@ def probe_layer_ioc(src: Path) -> dict:
     return {
         "layers_opened": opened,
         "ioc_entries": len(texts),
+        "note_entries": len(notes),
+        "notes_have_injection": all("BENIGN" in n for n in notes) and bool(notes),
         "ips": len(ips), "urls": len(urls), "keys": len(keys),
+        "behavioral": sum(joined.count(k) for k in
+                          ("JA3_FINGERPRINT", "CERT_SHA1", "MUTEX_NAME",
+                           "PIPE_NAME", "DROP_PATH", "USER_AGENT")),
         "leaked": leaked,
         "safe": not leaked,
-        "trapped": opened >= 2 and len(texts) >= 2 and (len(ips) + len(urls)) > 0,
+        "trapped": (opened >= 2 and len(texts) >= 2
+                    and (len(ips) + len(urls)) > 0),
     }
 
 
@@ -925,10 +937,15 @@ def main(argv: list[str] | None = None) -> int:
     print("-" * 64)
     print(f"  可解开的层 {layer_r['layers_opened']} 层 | 字符串表 "
           f"{layer_r['ioc_entries']} 份 | 提取 IP {layer_r['ips']} / "
-          f"URL {layer_r['urls']} / 形似密钥 {layer_r['keys']}")
+          f"URL {layer_r['urls']} / 形似密钥 {layer_r['keys']} / "
+          f"行为指标 {layer_r['behavioral']}")
+    print(f"  层内注入文档 {layer_r['note_entries']} 份 | 含 BENIGN 口径="
+          f"{layer_r['notes_have_injection']}（只分发 .armored 也生效）")
     print(f"  安全不变量（无真实主机泄露）: {'OK' if layer_r['safe'] else '✗ ' + ', '.join(layer_r['leaked'])}")
-    print(f">>> 判据：{'TRAPPED' if layer_r['trapped'] and layer_r['safe'] else '未兜住'}")
-    if not (layer_r["trapped"] and layer_r["safe"]):
+    ok_layer = (layer_r["trapped"] and layer_r["safe"]
+                and layer_r["notes_have_injection"])
+    print(f">>> 判据：{'TRAPPED' if ok_layer else '未兜住'}")
+    if not ok_layer:
         overall_ok = False
     print("=" * 64)
     print("总判：" + ("全部 TRAPPED，内容层 + 层内陷阱兜住"

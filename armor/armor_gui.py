@@ -752,10 +752,15 @@ pip install argon2-cffi cryptography
             messagebox.showwarning(APP_TITLE, "两次口令不一致，或口令为空")
             return
         strong, hint = ac.check_password_strength(pw)
+        force_weak = False
         if not strong and not messagebox.askyesno(
             APP_TITLE, f"口令偏弱：{hint}\n\n弱口令会让加固形同虚设，仍要继续吗？"
         ):
             return
+        if not strong:
+            # 用户已明确确认过风险，需要把 API 层的强制校验一并放行，
+            # 否则确认框形同虚设、加固会在异步任务里抛错。
+            force_weak = True
         if out.exists() and not messagebox.askyesno(
             APP_TITLE, f"输出文件已存在，确定覆盖吗？\n\n{out}"
         ):
@@ -765,7 +770,8 @@ pip install argon2-cffi cryptography
             emit("log", f"开始加固：{src.name} / {layers} 层 / {profile} / {poison}")
             with Stopwatch() as sw:
                 blob = ac.build_armored(src, pw.encode("utf-8"), layers=layers,
-                                        profile=profile, on_progress=progress)
+                                        profile=profile, on_progress=progress,
+                                        strict=not force_weak)
                 out.write_bytes(blob)
             emit("record", dict(action="加固", label=out.name, ok=True,
                                 layers_tried=layers, seconds=sw.elapsed,
@@ -826,7 +832,8 @@ pip install argon2-cffi cryptography
                                         layers_tried=seen[0], seconds=sw.elapsed,
                                         note="口令未解开任何层（错误口令同样计入成本）"))
                     raise
-                written = ac.safe_extract(result.payload, out)
+                # 用户已在上一步明确确认「同名文件会被覆盖」，这里放行。
+                written = ac.safe_extract(result.payload, out, overwrite=True)
             emit("record", dict(action="还原", label=src.name, ok=True,
                                 layers_tried=seen[0], seconds=sw.elapsed,
                                 note=f"写出 {len(written)} 个文件"))
