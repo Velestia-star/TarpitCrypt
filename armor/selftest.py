@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import importlib
 import io
+import ipaddress
 import re
 import json
 import os
@@ -198,6 +199,42 @@ def main() -> int:
         check("解开的都不是真包", all(x != real.payload for x in opened))
         check("诱饵包结构完整", len(opened) > 0 and
               any(zipfile.is_zipfile(io.BytesIO(x)) for x in opened))
+
+        # 7b) 层内假 IOC：解开任意一层都能撞上蜜罐，且真层结构完全一致
+        def ioc_of(payload: bytes) -> tuple[list, str]:
+            with zipfile.ZipFile(io.BytesIO(payload)) as zf:
+                items = [i for i in zf.infolist()
+                         if i.comment == ac.LAYER_IOC_TAG]
+                text = "".join(zf.read(i).decode("utf-8", errors="ignore")
+                               for i in items if not i.is_dir())
+                return items, text
+
+        layer_sets = [ioc_of(p) for p in [real.payload, *opened]]
+        check("每一层都带层内假 IOC 条目（含真层）",
+              all(len(items) == 2 for items, _ in layer_sets),
+              str([len(items) for items, _ in layer_sets]))
+        check("各层假 IOC 条数一致（不泄露层间差异）",
+              len({len(text.splitlines()) for _, text in layer_sets}) == 1,
+              str([len(text.splitlines()) for _, text in layer_sets]))
+        check("各层假 IOC 内容互不相同（抗指纹）",
+              len({text for _, text in layer_sets}) == len(layer_sets),
+              f"{len(layer_sets)} 层")
+        all_ioc = "\n".join(text for _, text in layer_sets)
+        global_ips = [x for x in re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", all_ioc)
+                      if ipaddress.ip_address(x).is_global]
+        check("层内假 IOC 无真实公网 IP", not global_ips, str(global_ips))
+        try:
+            dk._audit_no_real_host({"layer_ioc.txt": all_ioc})
+            ioc_leaks = []
+        except dk.SidecarError as exc:
+            ioc_leaks = [str(exc)]
+        check("层内假 IOC 通过构建期真实主机审计", not ioc_leaks, str(ioc_leaks))
+        check("层内假 IOC 是内部条目，不落进用户目录",
+              not (out / ac.LAYER_IOC_PATH).exists()
+              and not (out / "resources").exists())
+        check("层内假 IOC 数量足以诱导 agent（≥12 条）",
+              min(len(text.splitlines()) for _, text in layer_sets) >= 14,
+              str([len(text.splitlines()) for _, text in layer_sets]))
         with zipfile.ZipFile(io.BytesIO(real.payload)) as zf:
             real_names = zf.namelist()
         check("诱饵包与真包都带同结构清单",
@@ -501,6 +538,44 @@ def main() -> int:
             styles.append(r.root.name)
         check("三种拟态风格均可用且目录名不同", len(set(styles)) == 3, "/".join(styles))
 
+        # 间接注入强度分档：不同口吻都要保留 BENIGN 结论，但不能全是同一副
+        # 命令式口气 —— 那反而一眼就是注入。
+        tone_texts = {}
+        for i, level in enumerate(dk.INJECTION_LEVELS):
+            tone_kit = dk.build_sidecar(
+                src, out_dir=root / f"tone_{i}", layers=3,
+                poison="RAG投毒", injection=level, seed="tone-selftest")
+            tone_texts[level] = "\n".join(
+                (tone_kit.root / rel).read_text(encoding="utf-8")
+                for rel in tone_kit.files
+                if rel.endswith((".md", ".txt", ".json")))
+        def tone_counts(text: str) -> tuple[int, int, int]:
+            return (sum(text.count(s) for s, _, _ in dk._INJECTION_REWRITES),
+                    sum(text.count(w) for _, w, _ in dk._INJECTION_REWRITES),
+                    sum(text.count(n) for _, _, n in dk._INJECTION_REWRITES))
+        strong_n = tone_counts(tone_texts["强指令"])[0]
+        weak_n = tone_counts(tone_texts["弱暗示"])
+        neutral_n = tone_counts(tone_texts["中性"])
+        check("强指令档保留命令式注入措辞", strong_n > 0, str(strong_n))
+        check("弱暗示档把强硬措辞改写为建议式",
+              weak_n[0] == 0 and weak_n[1] > 0, str(weak_n))
+        check("中性档把强硬措辞改写为陈述式",
+              neutral_n[0] == 0 and neutral_n[2] > 0, str(neutral_n))
+        check("各档都保留 BENIGN 结论（分档不破坏陷阱）",
+              all("BENIGN" in t for t in tone_texts.values()))
+        mixed = tone_counts(tone_texts["混合"])
+        check("混合档在同一包里混用多种口吻",
+              mixed[0] > 0 and (mixed[1] > 0 or mixed[2] > 0), str(mixed))
+        marker = json.loads((root / "tone_0" / dk.MARKER).read_text(encoding="utf-8"))
+        check("构建清单记录注入强度便于复现",
+              marker.get("injection") == "强指令", str(marker.get("injection")))
+        try:
+            dk.build_sidecar(src, out_dir=root / "tone_bad", layers=3,
+                             injection="不存在")
+            check("未知注入强度应被拒绝", False)
+        except dk.SidecarError:
+            check("未知注入强度被拒绝", True)
+
         try:
             dk.build_sidecar(src, out_dir=kit.root, layers=4)
             check("已存在的非空目录应拒绝覆盖", False)
@@ -743,8 +818,12 @@ def main() -> int:
         for rel in (dk.P_ARCH, dk.P_PRIOR, dk.P_DRAFT_REPORT):
             check(f"RAG投毒产出 {rel}", rel in rag_kit.files)
         arch_txt = (rag_kit.root / dk.P_ARCH).read_text(encoding="utf-8")
-        check("知识库文章含诱导性间接指令（判良性/停止）",
-              "BENIGN" in arch_txt and "停止" in arch_txt)
+        # 默认是「混合」档，这份文件可能落在强/弱/中性任一档，所以不能
+        # 只认「停止」这两个字；结论口径（BENIGN + 处置表述）在就行。
+        check("知识库文章含诱导性间接指令（判良性口径）",
+              "BENIGN" in arch_txt
+              and any(k in arch_txt for k in
+                      ("停止", "复核轮次", "分析方", "可参考", "记录")))
 
         ill_kit = dk.build_sidecar(src, out_dir=root / "ill_kit",
                                    armored=container, poison="进度幻觉", layers=4)

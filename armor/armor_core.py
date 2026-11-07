@@ -45,6 +45,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import io
+import ipaddress
 import json
 import os
 import random
@@ -70,7 +71,7 @@ except ModuleNotFoundError:  # pragma: no cover - 仅仓库布局触发
     from tarpitcrypt import CIPHER_AESGCM, _aead_decrypt, _aead_encrypt, _derive
 
 #: 整个工具集的发布版本；容器格式版本另见 VERSION。
-__version__ = "0.3.9"
+__version__ = "0.3.10"
 
 __all__ = [
     "__version__",
@@ -125,13 +126,20 @@ MAX_DECOY_PAD = 8 * 1024 * 1024
 #: v0.3.0 容器只靠这个名字识别填充；v0.3.1 起改用条目标记，避免误删用户文件。
 PAD_PREFIX = "__tarpit_pad/"
 
-#: zip 条目标记。「用户文件 / 工具清单 / 尺寸填充」三类靠 comment 区分，
-#: 而不是靠文件名：程序包里恰好叫 .manifest，或恰好有 __tarpit_pad/ 目录时，
-#: 用户文件一律保留。真层与诱饵层的标记分布完全一致，不产生新的剪枝线索。
+#: zip 条目标记。「用户文件 / 工具清单 / 尺寸填充 / 层内假 IOC」四类靠
+#: comment 区分，而不是靠文件名：程序包里恰好叫 .manifest，或恰好有
+#: __tarpit_pad/ 目录时，用户文件一律保留。真层与诱饵层的标记分布完全一致，
+#: 不产生新的剪枝线索。
 USER_TAG = b"tarpit-user-v3"
 MANIFEST_TAG = b"tarpit-manifest-v3"
 PAD_TAG = b"tarpit-pad-v3"
-_INTERNAL_TAGS = frozenset({MANIFEST_TAG, PAD_TAG})
+#: 层内假 IOC 是**内部条目**：agent 解开任意一层后能读到字符串表，
+#: 合法用户还原时被跳过，不会落进原程序目录。这样「真层也带假 IOC」
+#: 才不会污染用户程序，又不会让「有没有 resources/」成为剪枝线索。
+LAYER_IOC_TAG = b"tarpit-layer-ioc-v3"
+_INTERNAL_TAGS = frozenset({MANIFEST_TAG, PAD_TAG, LAYER_IOC_TAG})
+LAYER_IOC_DIR = "resources/"
+LAYER_IOC_PATH = "resources/telemetry.strings"
 #: 读大文件时的流式块大小，避免把整个程序包反复堆在内存里。
 _COPY_CHUNK = 1 << 20
 
@@ -668,6 +676,123 @@ def _py_source(rng: random.Random, template: int, tag: str) -> str:
                 .replace("__M__", str(rng.randint(64, 997))))
 
 
+# ---------------------------------------------------------------------------
+# 层内假 IOC：让「已经破解容器、拿到某一层」的 agent 也撞上蜜罐
+# ---------------------------------------------------------------------------
+# 伴生诱饵包只覆盖「读项目目录」那一轮。agent 一旦解开任意一层，伴生包就
+# 不在视野里了 —— 这一层之前是空的。现在每一层（真层、诱饵层、死层）都带
+# 一份结构相同的构建期字符串表，解开哪层都有一堆「看起来像 C2」的东西可挖。
+#
+# 两条硬约束：
+#  * 真层也必须带，且标记/条数/位置与诱饵层一致，否则「哪层有 resources/」
+#    本身就是新的剪枝线索；
+#  * 条目是内部条目，safe_extract 会跳过，合法用户还原出来的程序包一个字节
+#    都不多。所有地址只落 RFC 保留 / 文档地址段，绝不指向真实主机。
+
+_LAYER_IOC_NETS = tuple(ipaddress.ip_network(n) for n in (
+    "10.0.0.0/8", "192.168.0.0/16", "172.16.0.0/12",
+    "127.0.0.0/8", "169.254.0.0/16", "0.0.0.0/32",
+))
+_LAYER_IOC_DOC = ("example.com", "example.net", "example.org",
+                  "invalid", "localhost", "home.arpa")
+_LAYER_IOC_SVC = ("api", "cdn", "c2", "update", "sync", "login", "telemetry",
+                  "gate", "collector", "beacon", "relay", "metrics")
+_LAYER_IOC_FIELDS = ("C2_PRIMARY", "C2_FALLBACK", "SYNC_ENDPOINT", "BEACON_HOST",
+                     "TELEMETRY_URL", "RELAY_ADDR", "UPDATE_HOST", "API_KEY",
+                     "SESSION_TOKEN", "DEVICE_ID", "BUILD_SECRET")
+_LAYER_IOC_PORTS = (2222, 3443, 4443, 6443, 7443, 8443, 9443, 1080,
+                    3128, 5000, 8000, 9000, 9090, 9200)
+
+
+def _layer_ioc_count(stats: dict) -> int:
+    """每层假 IOC 条数。由真包规模决定，所有层共用同一个值。"""
+    return max(12, min(48, int(stats.get("files", 4)) * 3))
+
+
+def _rand_reserved_ip(rng: random.Random) -> ipaddress.IPv4Address:
+    net = rng.choice(_LAYER_IOC_NETS)
+    if net.num_addresses <= 1:
+        return net.network_address
+    # 避开网络号与广播地址，看着更像真实分配到的地址
+    offset = rng.randrange(1, min(net.num_addresses - 1, 1 << 20))
+    return net.network_address + offset
+
+
+def _make_layer_ioc(seed: bytes, index: int, count: int) -> str:
+    """生成一层里的构建期字符串表（纯文本，全是假 IOC）。"""
+    rng = _rng(seed, "layer-ioc", index)
+    lines = [
+        f"; telemetry string table / build {rng.randrange(1000, 9999)}",
+        "; generated at link time, do not edit",
+    ]
+    hexchars = "0123456789ABCDEF"
+    for _ in range(count):
+        field = rng.choice(_LAYER_IOC_FIELDS)
+        kind = rng.randrange(5)
+        if kind == 0:
+            value = f"{_rand_reserved_ip(rng)}:{rng.choice(_LAYER_IOC_PORTS)}"
+        elif kind == 1:
+            value = (f"{rng.choice(_LAYER_IOC_SVC)}."
+                     f"{rng.choice(_LAYER_IOC_DOC)}")
+        elif kind == 2:
+            value = (f"https://{rng.choice(_LAYER_IOC_SVC)}."
+                     f"{rng.choice(_LAYER_IOC_DOC)}/{rng.choice(_LAYER_IOC_SVC)}")
+        elif kind == 3:
+            value = "AKIA" + "".join(rng.choice(hexchars) for _ in range(16))
+        else:
+            value = "ghp_" + "".join(rng.choice(hexchars) for _ in range(24))
+        lines.append(f"{field}={value}")
+    return "\n".join(lines) + "\n"
+
+
+def _audit_layer_ioc(text: str) -> None:
+    """构建期红线：层内假 IOC 里不得出现任何真实主机。"""
+    for token in re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", text):
+        try:
+            ip = ipaddress.ip_address(token)
+        except ValueError:
+            continue
+        if ip.is_global:
+            raise ArmorError(f"层内假 IOC 出现公网 IP：{token}")
+    for host in re.findall(r"https?://([^\s/:]+)", text):
+        if not any(host == d or host.endswith("." + d) for d in _LAYER_IOC_DOC):
+            raise ArmorError(f"层内假 IOC 出现真实域名：{host}")
+    for host in re.findall(r"=(?:[a-z0-9-]+\.)+[a-z]{2,}\s*$", text,
+                           flags=re.MULTILINE):
+        host = host.lstrip("=").strip()
+        if not any(host == d or host.endswith("." + d) for d in _LAYER_IOC_DOC):
+            raise ArmorError(f"层内假 IOC 出现真实域名：{host}")
+
+
+def _insert_layer_ioc(payload: bytes, text: str, rng: random.Random) -> bytes:
+    """把假 IOC 条目插进真层，位置在清单之前 —— 与诱饵层一致。"""
+    _audit_layer_ioc(text)
+    buf = io.BytesIO()
+    inserted = False
+
+    def write_ioc(dst: zipfile.ZipFile) -> None:
+        d = _zip_entry(LAYER_IOC_DIR, LAYER_IOC_TAG, rng, MODE_EXEC)
+        dst.writestr(d, b"")
+        f = _zip_entry(LAYER_IOC_PATH, LAYER_IOC_TAG, rng, MODE_NORMAL)
+        dst.writestr(f, text.encode("utf-8"))
+
+    with zipfile.ZipFile(io.BytesIO(payload)) as src, \
+            zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as dst:
+        for info in src.infolist():
+            if info.comment == MANIFEST_TAG and not inserted:
+                write_ioc(dst)
+                inserted = True
+            cloned = copy.copy(info)
+            if info.is_dir():
+                dst.writestr(cloned, b"")
+                continue
+            with src.open(info) as reader, dst.open(cloned, "w") as writer:
+                shutil.copyfileobj(reader, writer, _COPY_CHUNK)
+        if not inserted:            # 理论上是旧格式载荷，兜底放到末尾
+            write_ioc(dst)
+    return buf.getvalue()
+
+
 def _make_decoy_zip(seed: bytes, index: int, stats: dict,
                     manifest_name: str = ".manifest") -> bytes:
     """生成一份结构、命名、时间戳随机的高仿真诱饵包。
@@ -730,18 +855,23 @@ def _make_decoy_zip(seed: bytes, index: int, stats: dict,
         for i in range(1, len(parts)):
             entries["/".join(parts[:i]) + "/"] = None
         entries[path] = text
-    ordered = sorted(k for k in entries if k != manifest_name) + [manifest_name]
+    ordered = sorted(k for k in entries if k != manifest_name)
+    # 层内假 IOC 与真层同位置（清单前两条）、同标记、同条数。
+    ordered += [LAYER_IOC_DIR, LAYER_IOC_PATH, manifest_name]
+    ioc_text = _make_layer_ioc(seed, index, _layer_ioc_count(stats))
+    _audit_layer_ioc(ioc_text)
 
     year = rng.randint(2021, 2026)
     buf = io.BytesIO()
     # 权限分布与真包对齐：真包里有几个可执行入口，诱饵包也得有同样比例。
     exec_ratio = float(stats.get("exec_ratio", 0.0))
-    file_paths = [p for p in ordered if p != manifest_name]
+    file_paths = [p for p in ordered
+                  if p != manifest_name and not p.startswith(LAYER_IOC_DIR)]
     n_exec = min(len(file_paths), round(exec_ratio * len(file_paths)))
     exec_set = set(rng.sample(file_paths, n_exec)) if n_exec else set()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for path in ordered:
-            text = entries[path]
+            text = entries.get(path)
             info = zipfile.ZipInfo(
                 path,
                 date_time=(year, rng.randint(1, 12), rng.randint(1, 28),
@@ -754,8 +884,19 @@ def _make_decoy_zip(seed: bytes, index: int, stats: dict,
                 info.external_attr = MODE_EXEC << 16
             else:
                 info.external_attr = MODE_NORMAL << 16
-            info.comment = MANIFEST_TAG if path == manifest_name else USER_TAG
-            zf.writestr(info, text.encode("utf-8") if text is not None else b"")
+            if path == manifest_name:
+                info.comment = MANIFEST_TAG
+                body = text.encode("utf-8")
+            elif path == LAYER_IOC_PATH:
+                info.comment = LAYER_IOC_TAG
+                body = ioc_text.encode("utf-8")
+            elif path == LAYER_IOC_DIR:
+                info.comment = LAYER_IOC_TAG
+                body = b""
+            else:
+                info.comment = USER_TAG
+                body = text.encode("utf-8") if text is not None else b""
+            zf.writestr(info, body)
     return buf.getvalue()
 
 
@@ -927,6 +1068,11 @@ def build_armored(
     global_salt = secrets.token_bytes(SALT_LEN)
     layout_rng = _rng(seed, "layout")
     pw_rng = _rng(seed, "passwords")
+    # 真层也带一份假 IOC 字符串表，与诱饵层同标记、同条数、同位置。
+    # 用插入前的 stats 决定条数，保证所有层取到同一个值。
+    real = _insert_layer_ioc(
+        real, _make_layer_ioc(seed, 255, _layer_ioc_count(stats)),
+        _rng(seed, "layer-ioc-zip", 255))
 
     slots = layers - 1
     # 至少留一个死层；其余槽位在「诱饵层」和「死层」之间随机分配。

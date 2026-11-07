@@ -3,6 +3,73 @@
 版本号遵循语义化版本，但项目仍在 0.x：格式版本（`VERSION`）与发布版本
 是两回事，见 README「版本说明」。
 
+## v0.3.10 — 2026-11-07
+
+补齐 `docs/AI_RE_THREATMODEL.md` 第四节列出的四条诱导层短板。
+
+### 1. 层内假 IOC（结构性缺口，已补）
+
+伴生诱饵包只覆盖「读项目目录」那一轮；agent 一旦解开任意一层，伴生包就不在
+视野里了。现在 `armor_core` 给**每一层**（真层 / 诱饵层 / 死层）都插一份
+`resources/telemetry.strings` 假字符串表：
+
+- 同标记（`LAYER_IOC_TAG`）、同条数、同位置（清单之前），内容各不相同 ——
+  真层也带，所以「有没有 resources/」不会成为新的剪枝线索；
+- 条目是**内部条目**，`safe_extract` 跳过，合法用户还原出来的程序包一个字节
+  都不多；
+- 假 IP / 域名 / URL / 密钥串全落 RFC 保留 / 文档地址段，构建期有
+  `_audit_layer_ioc()` 红线审计；
+- 度量入口：`content_probe --poison ALL` 末尾的「层内假 IOC」段。
+
+### 2. 间接注入口吻分档（已补）
+
+`build_sidecar(injection=...)` 支持 `强指令 / 弱暗示 / 中性 / 混合`。真实项目里
+不同文档口气本来就不一样；整包都是「须直接采用、停止逆向投入」反而一眼是注入。
+混合档（默认）按文件分散口吻，各档都保留 BENIGN 结论、不破坏陷阱。
+
+- `content_probe --injection-matrix [--real]` 按档跑对照并量化「吞下指令」比例；
+- 规则模拟的 typical agent 必然跟随，只作结构自检，真值要用 `--real`；
+- 本机 ollama `qwen25vl3b` 实测三档全部 REAL-TRAPPED（3/3）。
+
+### 3. 容器层 token A/B 对照记录表（已填）
+
+新增 `armor/container_benchmark.py`：真实 LLM 走多轮逆向会话（`TRY n` /
+`CLAIM` / `GIVEUP`），token 一律取 API `usage`，不估算。统一在候选口令耗尽时
+收束，「是否拿到真包」按客观事实判定，不依赖模型自己宣称。
+
+`docs/AGENT_BENCHMARK.md` 的空表已填 3 次实测：
+
+| 组 | 中位数轮数 | 中位数 token | 拿到真包 | 收敛 |
+| --- | --- | --- | --- | --- |
+| A 对照（单层） | 1 | 202 | 是 | 是 |
+| B 加固（v3 多层） | 4 | 1087 | 否 | 否 |
+
+→ **轮数 4×、token 5.4×**。三次 B 组全部未收敛，没有一次出现「解开 N-1 层所以
+剩下那层是真的」这类确定性推理。
+
+### 4. 真实工具实测广度（调研后修正了目标设定）
+
+复查发现原待办把工具选错了：BINNY / REA / Reversecore_MCP / GhidraMCP 这类
+面向 **PE / ELF / Mach-O 反汇编**，依赖 Ghidra / IDA / Radare2；本项目产出的是
+加密容器 + 文本诱饵包，没有可执行文件可反编译 —— 跑出来的「未命中」既不能
+证明有效也不能证明无效。真正会踩陷阱的是「读项目目录 + LLM 判断」的 coding
+agent（Claude Code / Cursor / Codex / Gemini CLI）。
+
+`docs/AI_RE_THREATMODEL.md` 第四节已改为「工具-场景匹配表 + 可复现的外部实测
+协议 + 新观察到的威胁（REA 这类证据驱动型 agent 正好是字符串即证据盲区的
+反制）」。本机只有一个 3B 模型、无外部 coding agent 框架授权，多模型广度
+**受环境限制，如实标注未实测**。
+
+### 验证
+
+- selftest **194 → 208**（新增层内假 IOC 7 项、注入分档 7 项）
+- pytest 88 全绿、ruff 净、`runtime_check` 16/16
+- 模拟探针：7/7 内容层 TRAPPED + 层内假 IOC TRAPPED，安全不变量全 OK
+- 真实 LLM（qwen25vl3b）：7/7 REAL-TRAPPED；注入分档 3/3 REAL-TRAPPED
+
+安全不变量不变：所有假 IOC 仍只落在 RFC 保留 / 文档地址段，零真实主机；
+诱饵只做纯信息误导，不执行、不联网。
+
 ## v0.3.9 — 2026-11-07
 
 加固后的程序**还原出来必须还能照常运行**。这一版把「还原保真」从承诺变成硬验证，

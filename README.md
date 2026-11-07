@@ -26,10 +26,10 @@ TarpitCrypt 是一个**反 AI 逆向的整活项目**。底层是一个本地文
 
 | 层面 | 当前值 | 说明 |
 | --- | --- | --- |
-| 发布版本 | **v0.3.9** | 还原保真度修复：权限位 / 符号链接 / 旧容器兼容，新增 `runtime_check` 可运行性矩阵；v0.3.8 起新增「工具污染」「代理记忆」侧重，见 [CHANGELOG.md](CHANGELOG.md) |
+| 发布版本 | **v0.3.10** | 补齐诱导层短板：层内假 IOC、注入口吻分档、容器层 token A/B 对照；诱导层威胁模型重新调研，见 [CHANGELOG.md](CHANGELOG.md) |
 | v1 文件格式 | `VERSION = 1`，`MAGIC = TARPITCR` | `.tarpit` 文件，格式冻结 |
 | armor 容器格式 | `VERSION = 3`，`MAGIC = TPARMOR3` | `.armored` 文件；v2 / v0.3.0 容器仍可读 |
-| Python 包元数据 | `0.3.9` | `pyproject.toml` |
+| Python 包元数据 | `0.3.10` | `pyproject.toml` |
 
 两层格式互不依赖：`armor/` 只复用 v1 的 Argon2id 与 AES-256-GCM 原语，
 **v1 文件格式一个字节没改**。
@@ -274,10 +274,12 @@ Argon2id 是内存硬函数，GPU/ASIC 的并行优势被内存带宽卡死，�
 pip install argon2-cffi cryptography pytest
 python -m pytest tests -o addopts=""   # 88 项：v1 单元 + 固定格式兼容 + keygen 保护 + 浏览器互解 + 控制台编码回归
 python -m pytest tests -k browser      # 单跑浏览器 ↔ Python 双向互解（无浏览器时跳过）
-python armor/selftest.py               # 194 项
+python armor/selftest.py               # 208 项
 python armor/probe_agent.py            # 模拟逆向轮数对照（加密容器层）
 python armor/agent_eval.py --runs 5    # 多轮取样 + 评估报告
 python armor/content_probe.py --poison ALL   # 内容层陷阱实测：模拟 AI 逆向 agent 打诱饵包，验证全 TRAPPED 且无真实主机泄露
+python -m armor.content_probe --injection-matrix --real  # 按注入口吻分档量化真实 LLM 的吞下比例
+python -m armor.container_benchmark --runs 3  # 容器层 A/B 对照：真实 LLM 轮数与 token（取 API usage）
 python -m armor.runtime_check           # 还原保真度与可运行性矩阵：加固→还原→实跑，逐字节 + 权限 + 结构比对
 ```
 
