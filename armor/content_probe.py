@@ -549,7 +549,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f">>> 判据：{r['verdict']}")
         return 0 if overall_ok else 1
 
-    poisons = [args.poison] if args.poison != "ALL" else ["IOC蜜罐", "RAG投毒", "均衡", "进度幻觉"]
+    poisons = [args.poison] if args.poison != "ALL" else ["IOC蜜罐", "RAG投毒", "均衡", "进度幻觉", "认知污染"]
     overall_ok = True
     for poison in poisons:
         with tempfile.TemporaryDirectory() as td:
