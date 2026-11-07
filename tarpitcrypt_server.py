@@ -702,6 +702,19 @@ class TarpitRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, {"ok": True, "job": _public_armor_job(job)})
             return
 
+        if path.startswith("/api/artifacts/"):
+            token = path.rsplit("/", 1)[-1]
+            with _ARTIFACT_LOCK:
+                artifact = _ARTIFACTS.get(token)
+            if artifact is None or not artifact.is_file():
+                self._fail(HTTPStatus.NOT_FOUND, "没有这个产出物")
+                return
+            content_type = (
+                mimetypes.guess_type(str(artifact))[0] or "application/octet-stream"
+            )
+            self._send_bytes(HTTPStatus.OK, artifact.read_bytes(), content_type, artifact.name)
+            return
+
         try:
             target = (DOCS_DIR / path.lstrip("/")).resolve()
             target.relative_to(DOCS_DIR)

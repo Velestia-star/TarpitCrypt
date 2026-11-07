@@ -655,3 +655,69 @@ body.drawer-open { overflow: hidden; }
   -webkit-user-select: none;
   -webkit-user-drag: element;
 }
+
+/* --------------------------------------------------------------------------
+   P3：本地版的 armor 面板（在线版整段隐藏）
+   -------------------------------------------------------------------------- */
+
+.armor-panel {
+  margin-top: 42px;
+  padding-top: 28px;
+  border-top: 1px solid var(--line);
+}
+
+.armor-head h2 {
+  font-size: 22px;
+  margin: 0 0 4px;
+  letter-spacing: 0.3px;
+}
+
+.armor-head h2 .hint { font-size: 13px; margin-left: 8px; }
+
+.armor-tabs {
+  display: flex;
+  gap: 8px;
+  margin: 16px 0 14px;
+}
+
+.armor-tab {
+  padding: 8px 18px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--panel);
+  color: var(--dim);
+  font: inherit;
+  cursor: pointer;
+}
+
+.armor-tab.active {
+  border-color: var(--accent);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.armor-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.armor-check input[type="checkbox"] { width: auto; }
+
+.bar {
+  height: 8px;
+  margin: 14px 0 4px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--panel);
+  overflow: hidden;
+}
+
+.bar-fill {
+  width: 0;
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.2s ease;
+}
+
+.armor-panel .status { min-height: 20px; }

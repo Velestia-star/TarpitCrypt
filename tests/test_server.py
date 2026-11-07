@@ -494,6 +494,8 @@ def test_web_index_serves_page(web_base: str) -> None:
     assert "drop" in html
     assert "window.TARPIT_LOCAL = true" in html
     assert "app.js" in html
+    assert 'id="armorPanel"' in html
+    assert "armor_ui.js" in html
     assert "/api/encrypt" not in html
 
 
@@ -502,6 +504,7 @@ def test_web_serves_docs_assets(web_base: str) -> None:
     for path, needle in (
         ("/app.js", "./core_adapter.js"),
         ("/core_adapter.js", "TARPIT_LOCAL"),
+        ("/armor_ui.js", "armorPanel"),
         ("/style.css", "--accent"),
     ):
         with urllib.request.urlopen(f"{web_base}{path}", timeout=10) as response:
@@ -514,6 +517,25 @@ def test_web_rejects_static_path_traversal(web_base: str) -> None:
     """docs/ 静态路由不能把仓库里的其他文件带出去。"""
     with pytest.raises(urllib.error.HTTPError) as exc:
         urllib.request.urlopen(f"{web_base}/%2e%2e/README.md", timeout=10)
+    assert exc.value.code == HTTPStatus.NOT_FOUND
+
+
+def test_web_artifact_download(web_base: str) -> None:
+    """登记过的产出物可以按令牌下载，且只认令牌。"""
+    content_type, body = build_multipart(
+        {"password": "pw", "mem": "8192", "time": "1", "para": "1", "rounds": "1"},
+        [("files", "a.txt", b"artifact-data")],
+    )
+    status, headers, blob = _post(f"{web_base}/api/encrypt", content_type, body)
+    assert status == HTTPStatus.OK
+    artifact = headers["X-Tarpit-Artifact"]
+    with urllib.request.urlopen(f"{web_base}/api/artifacts/{artifact}", timeout=10) as response:
+        assert response.status == HTTPStatus.OK
+        assert response.read() == blob
+        assert "attachment" in response.headers["Content-Disposition"]
+
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(f"{web_base}/api/artifacts/not-a-token", timeout=10)
     assert exc.value.code == HTTPStatus.NOT_FOUND
 
 
@@ -574,6 +596,10 @@ def test_armor_pack_inspect_restore_roundtrip(web_base: str) -> None:
     assert saved.exists()
     armored = saved.read_bytes()
     assert armored[:8] == b"TPARMOR3"
+    with urllib.request.urlopen(
+        f"{web_base}/api/artifacts/{job['result']['artifact']}", timeout=10
+    ) as response:
+        assert response.read() == armored
 
     content_type, body = build_multipart({}, [("files", saved.name, armored)])
     status, _, payload = _post(f"{web_base}/api/armor/inspect", content_type, body)

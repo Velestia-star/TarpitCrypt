@@ -88,6 +88,59 @@
       与 <code>tarpitcrypt.py</code> 生成的文件格式完全兼容，可以互换解密。
     </p>
   </footer>
+
+  <section class="armor-panel" id="armorPanel" hidden>
+    <div class="armor-head">
+      <h2>整活加固 <span class="hint">本地版</span></h2>
+      <p class="hint">把程序包拖进来，生成多层 <code>.armored</code> 容器。运算在本机 Python 进程里完成，不会上传外网。</p>
+    </div>
+    <div class="armor-tabs" role="tablist">
+      <button class="armor-tab active" data-armor-mode="pack" type="button">加固</button>
+      <button class="armor-tab" data-armor-mode="restore" type="button">还原</button>
+    </div>
+
+    <div id="armorPackPane">
+      <div class="drop" id="armorDrop">
+        <p><strong>把程序包（文件或整个文件夹）拖到这里</strong></p>
+        <p class="hint">
+          或 <label class="link">选择文件<input type="file" id="armorPickFiles" multiple hidden></label>
+          · <label class="link">选择文件夹<input type="file" id="armorPickDir" webkitdirectory multiple hidden></label>
+        </p>
+        <p class="hint">单文件会还原成文件；多文件 / 文件夹会还原成目录。</p>
+      </div>
+      <ul class="files" id="armorFiles"></ul>
+      <div class="grid">
+        <label>口令 <input type="password" id="armorPassword" autocomplete="new-password" placeholder="长一点，别用生日"></label>
+        <label>再输一次 <input type="password" id="armorPassword2" autocomplete="new-password"></label>
+        <label>层数 <input type="number" id="armorLayers" min="2" max="8" value="4"></label>
+        <label>加固强度 <select id="armorProfile"></select></label>
+        <label>投毒侧重 <select id="armorPoison"></select></label>
+        <label>拟态风格 <select id="armorStyle"></select></label>
+        <label>注入强度 <select id="armorInjection"></select></label>
+        <label class="armor-check">伴生诱饵 <input type="checkbox" id="armorSidecar" checked></label>
+      </div>
+      <p class="hint pw-warn" id="armorPwWarning" hidden></p>
+      <button class="go" id="armorGo" type="button">开始加固</button>
+      <div class="status" id="armorStatus"></div>
+      <div class="bar" id="armorBarWrap" hidden><div class="bar-fill" id="armorBar"></div></div>
+      <div class="result" id="armorResult"></div>
+    </div>
+
+    <div id="armorRestorePane" hidden>
+      <div class="drop" id="armorRestoreDrop">
+        <p><strong>把 .armored 容器拖到这里</strong></p>
+        <p class="hint">或 <label class="link">选择文件<input type="file" id="armorRestorePick" accept=".armored" hidden></label></p>
+        <p class="hint" id="armorRestoreName">还没有选择文件</p>
+      </div>
+      <div class="grid">
+        <label>口令 <input type="password" id="armorRestorePassword" autocomplete="current-password"></label>
+      </div>
+      <button class="go" id="armorRestoreGo" type="button">开始还原</button>
+      <div class="status" id="armorRestoreStatus"></div>
+      <div class="bar" id="armorRestoreBarWrap" hidden><div class="bar-fill" id="armorRestoreBar"></div></div>
+      <div class="result" id="armorRestoreResult"></div>
+    </div>
+  </section>
 </main>
 
 <div class="drawer-backdrop" id="drawerBackdrop" hidden></div>
@@ -159,5 +212,6 @@
 </div>
 
 <script type="module" src="app.js"></script>
+<script type="module" src="armor_ui.js"></script>
 </body>
 </html>
