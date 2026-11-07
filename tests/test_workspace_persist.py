@@ -86,9 +86,34 @@ AFTER_RELOAD_JS = """
 """
 
 
+DROP_ON_MAIN_JS = """
+(async () => {
+  const file = new File([new TextEncoder().encode("hello")], "拖入测试.txt", { type: "text/plain" });
+  const dt = new DataTransfer();
+  dt.items.add(file);
+  document.body.dispatchEvent(new DragEvent("dragover", { dataTransfer: dt, bubbles: true, cancelable: true }));
+  document.body.dispatchEvent(new DragEvent("drop", { dataTransfer: dt, bubbles: true, cancelable: true }));
+  await new Promise((r) => setTimeout(r, 500));
+  return { listItems: document.querySelectorAll("#fileList li").length };
+})()
+"""
+
+DROP_ON_DRAWER_JS = """
+(async () => {
+  const file = new File([new TextEncoder().encode("hello")], "抽屉测试.txt", { type: "text/plain" });
+  const dt = new DataTransfer();
+  dt.items.add(file);
+  const drawer = document.getElementById("drawer");
+  drawer.dispatchEvent(new DragEvent("dragover", { dataTransfer: dt, bubbles: true, cancelable: true }));
+  drawer.dispatchEvent(new DragEvent("drop", { dataTransfer: dt, bubbles: true, cancelable: true }));
+  await new Promise((r) => setTimeout(r, 800));
+  return { workspaceRows: document.querySelectorAll("#queueList .queue-row").length };
+})()
+"""
+
+
 class Cdp:
     """够用的极简 CDP 客户端。"""
-
     def __init__(self, url: str) -> None:
         self.ws = websocket.create_connection(url, timeout=180)
         self.counter = 0
@@ -179,6 +204,51 @@ def test_workspace_survives_reload() -> None:
         assert any("持久化测试" in name for name in after.get("names", [])), "文件名应被恢复"
         assert after.get("status") == "done", "加密结果也应被恢复"
         assert ".tarpit" in after.get("out", "")
+    finally:
+        for process in (edge, server):
+            process.terminate()
+        for process in (edge, server):
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+        shutil.rmtree(temp, ignore_errors=True)
+
+
+@pytest.mark.browser
+def test_file_drop_paths() -> None:
+    """系统文件拖到左侧要能载入，拖到抽屉要能进工作区——都不能静默无反应。"""
+    browser = find_browser()
+    if browser is None:
+        pytest.skip("本机没有 Edge/Chrome")
+
+    temp = pathlib.Path(tempfile.mkdtemp(prefix="tc-drop-"))
+    http_port = free_port()
+    debug_port = free_port()
+    base = f"http://127.0.0.1:{http_port}"
+
+    server = subprocess.Popen(
+        [sys.executable, "-m", "http.server", str(http_port), "--bind", "127.0.0.1",
+         "--directory", str(DOCS)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    edge = subprocess.Popen(
+        [browser, "--headless=new", "--disable-gpu", "--no-first-run",
+         f"--remote-debugging-port={debug_port}", f"--user-data-dir={temp / 'profile'}", "about:blank"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    try:
+        time.sleep(2)
+        cdp = Cdp(wait_for_page(debug_port))
+        cdp.call("Page.enable")
+        cdp.call("Page.navigate", {"url": f"{base}/index.html#workspace"})
+        time.sleep(2.5)
+
+        main = cdp.evaluate(DROP_ON_MAIN_JS)
+        assert main and main.get("listItems") == 1, f"拖到左侧应载入文件：{main}"
+
+        drawer = cdp.evaluate(DROP_ON_DRAWER_JS)
+        assert drawer and drawer.get("workspaceRows") == 1, f"拖到抽屉应进工作区：{drawer}"
     finally:
         for process in (edge, server):
             process.terminate()

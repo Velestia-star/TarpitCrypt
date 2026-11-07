@@ -89,6 +89,12 @@ async function collectFromDrop(dataTransfer) {
   }
   const out = [];
   for (const entry of roots) await walkEntry(entry, "", out);
+  if (!out.length) {
+    // 某些来源（或浏览器）拿不到 FileSystemEntry，退回扁平的文件列表
+    for (const file of Array.from(dataTransfer.files || [])) {
+      out.push({ file, path: file.webkitRelativePath || file.name });
+    }
+  }
   return out;
 }
 
@@ -768,6 +774,15 @@ async function collectWorkspaceEntries(dataTransfer) {
       items.push({ kind: "dir", name: entry.name, files });
     }
   }
+  if (!items.length) {
+    for (const file of Array.from(dataTransfer.files || [])) {
+      items.push({
+        kind: "file",
+        name: file.name,
+        files: [{ file, path: file.webkitRelativePath || file.name }],
+      });
+    }
+  }
   return items;
 }
 
@@ -951,34 +966,30 @@ function bindWorkspace() {
     dragDepth = Math.max(0, dragDepth - 1);
     if (dragDepth === 0) drawer.classList.remove("over");
   });
-  drawer.addEventListener("dragover", (event) => {
-    if (event.dataTransfer.types.includes("Files")) event.preventDefault();
-  });
-  drawer.addEventListener("drop", async (event) => {
-    dragDepth = 0;
-    drawer.classList.remove("over");
-    if (!event.dataTransfer.types.includes("Files")) return;
-    event.preventDefault();
-    try {
-      addWorkspaceEntries(await collectWorkspaceEntries(event.dataTransfer));
-    } catch (error) {
-      workspaceNote(`读取失败：${error.message}`);
-    }
-  });
 
-  // 拖到页面左半边任意位置松手，都开始加密（不必精确落进虚线框）
+  // 整页都是拖放目标，统一在这里分发：
+  //   工作区行 → 任意位置松手都开始加密
+  //   系统文件 → 落在抽屉里就进工作区，落在别处就作为待加密文件
   document.addEventListener("dragover", (event) => {
-    if (!event.dataTransfer.types.includes(ITEM_MIME)) return;
-    event.preventDefault();
-    event.dataTransfer.dropEffect = "copy";
-    $("drop").classList.add("over");
-    if (draggingItemName) {
-      $("dropTitle").textContent = `松手开始加密「${draggingItemName}」`;
+    const dt = event.dataTransfer;
+    if (!dt) return;
+    if (dt.types.includes(ITEM_MIME)) {
+      event.preventDefault();
+      dt.dropEffect = "copy";
+      $("drop").classList.add("over");
+      if (draggingItemName) {
+        $("dropTitle").textContent = `松手开始加密「${draggingItemName}」`;
+      }
+      return;
+    }
+    if (dt.types.includes("Files")) {
+      event.preventDefault();
+      dt.dropEffect = "copy";
+      if (!event.target.closest("#drawer")) $("drop").classList.add("over");
     }
   });
 
   document.addEventListener("dragleave", (event) => {
-    if (!event.dataTransfer.types.includes(ITEM_MIME)) return;
     if (event.relatedTarget === null) {
       $("drop").classList.remove("over");
       renderFiles();
@@ -986,19 +997,56 @@ function bindWorkspace() {
   });
 
   document.addEventListener("drop", async (event) => {
-    const itemId = event.dataTransfer.getData(ITEM_MIME);
-    if (!itemId) return;
-    event.preventDefault();
+    const dt = event.dataTransfer;
+    if (!dt) return;
     $("drop").classList.remove("over");
     renderFiles();
-    const item = workspaceItemById(itemId);
-    if (!item) return;
-    status(`正在加密「${item.name}」…`);
+
+    // ① 工作区里的行：丢到哪儿都当成「开始加密」
+    const itemId = dt.getData(ITEM_MIME);
+    if (itemId) {
+      event.preventDefault();
+      const item = workspaceItemById(itemId);
+      if (!item) return;
+      status(`正在加密「${item.name}」…`);
+      try {
+        await encryptWorkspaceItem(item);
+        status(`已加密「${item.name}」，结果在工作区右侧`, "ok");
+      } catch (error) {
+        status(`加密失败：${error.message}`, "bad");
+      }
+      return;
+    }
+
+    // ② 来自操作系统的文件
+    if (!dt.types.includes("Files")) return;
+    event.preventDefault();
+
+    if (event.target.closest("#drawer")) {
+      dragDepth = 0;
+      drawer.classList.remove("over");
+      try {
+        const entries = await collectWorkspaceEntries(dt);
+        if (!entries.length) {
+          workspaceNote("没有识别到文件，试试用上面的「加入文件」按钮");
+          return;
+        }
+        addWorkspaceEntries(entries);
+      } catch (error) {
+        workspaceNote(`读取失败：${error.message}`);
+      }
+      return;
+    }
+
     try {
-      await encryptWorkspaceItem(item);
-      status(`已加密「${item.name}」，结果在工作区右侧`, "ok");
+      const picked = await collectFromDrop(dt);
+      if (!picked.length) {
+        status("没有识别到文件，试试用「选择文件」按钮", "bad");
+        return;
+      }
+      setFiles(picked, picked.some((entry) => entry.path.includes("/")));
     } catch (error) {
-      status(`加密失败：${error.message}`, "bad");
+      status(`读取拖入的内容失败：${error.message}`, "bad");
     }
   });
 
@@ -1069,23 +1117,6 @@ function bind() {
   drop.addEventListener("click", (event) => {
     if (!event.target.closest("label")) $("pickFiles").click();
   });
-  drop.addEventListener("dragover", (event) => {
-    event.preventDefault();
-    drop.classList.add("over");
-  });
-  drop.addEventListener("dragleave", () => drop.classList.remove("over"));
-  drop.addEventListener("drop", async (event) => {
-    // 只接管来自操作系统的文件；工作区行由下面的 document 级监听处理
-    if (event.dataTransfer.types.includes(ITEM_MIME)) return;
-    event.preventDefault();
-    drop.classList.remove("over");
-    try {
-      setFiles(await collectFromDrop(event.dataTransfer), false);
-    } catch (error) {
-      status(`读取拖入的内容失败：${error.message}`, "bad");
-    }
-  });
-
   $("pickFiles").addEventListener("change", (event) => {
     setFiles([...event.target.files].map((file) => ({ file, path: file.name })), false);
   });
