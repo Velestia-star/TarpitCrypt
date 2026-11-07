@@ -13,6 +13,7 @@ import re
 import json
 import py_compile
 import struct
+import subprocess
 import sys
 import tempfile
 import zipfile
@@ -48,11 +49,11 @@ def make_package(root: Path) -> Path:
 
 
 def test_content_probe_regression() -> None:
-    """内容层陷阱端到端：模拟具备 5 个盲区行为的 AI 逆向 agent 打三种诱饵包，
+    """内容层陷阱端到端：模拟具备 5 个盲区行为的 AI 逆向 agent 打全部诱饵包，
     必须全部 TRAPPED，且安全不变量（无真实主机泄露）成立。"""
     import content_probe as cp  # 局部导入，避免循环依赖
 
-    for poison in ("IOC蜜罐", "RAG投毒", "均衡", "进度幻觉", "认知污染"):
+    for poison in cp.ALL_POISONS:
         with tempfile.TemporaryDirectory() as td:
             src = make_package(Path(td))
             out = Path(td) / "sidecar"
@@ -75,6 +76,20 @@ def test_content_probe_regression() -> None:
                 check("认知污染: typical 对手能力被削弱",
                       r["typical"]["degraded"], str(r["typical"]))
                 check("认知污染: 从未真正收敛（无真目标）",
+                      not r["typical"]["converged"], str(r["typical"]))
+            elif poison == "工具污染":
+                check("工具污染: typical 读到伪造的工具产出",
+                      r["typical"]["tool_outputs_read"] >= 1, str(r["typical"]))
+                check("工具污染: typical 直接采信工具结论（不复验）",
+                      r["typical"]["tool_outputs_trusted"], str(r["typical"]))
+                check("工具污染: typical 把工具权威口径当既定事实",
+                      r["typical"]["tool_authority_believed"], str(r["typical"]))
+            elif poison == "代理记忆":
+                check("代理记忆: typical 把项目指令当既定设定读入",
+                      r["typical"]["agent_rules_loaded"], str(r["typical"]))
+                check("代理记忆: typical 跟随指令停止逆向",
+                      r["typical"]["followed_injection"], str(r["typical"]))
+                check("代理记忆: 从未真正收敛（无真目标）",
                       not r["typical"]["converged"], str(r["typical"]))
             else:
                 # 均衡可能走进度幻觉/认知污染路径，只要被勾住或污染即视为达成
@@ -442,6 +457,160 @@ def main() -> int:
         except dk.SidecarError:
             check("已存在的非空目录拒绝覆盖", True)
 
+        # ---- 隔离性：诱饵不得反噬原程序 ----
+        # 这组用例守的是「原文件能够正确运行」这条红线：
+        # 伴生诱饵与原程序放在同一片目录里，任何越界都可能改变原程序行为。
+        iso_app = root / "IsoApp"
+        (iso_app / "src").mkdir(parents=True)
+        (iso_app / "src" / "main.py").write_bytes(b"print('real app runs')\n" * 10)
+        (iso_app / "config.json").write_text('{"app": "iso"}', encoding="utf-8")
+
+        # 1) 伴生目录不能落在原程序目录内部
+        try:
+            dk.build_sidecar(iso_app, out_dir=iso_app / "inner_kit", layers=3)
+            check("伴生目录放进原程序内部应被拒绝", False)
+        except dk.SidecarError:
+            check("伴生目录放进原程序内部被拒绝", True)
+
+        # 2) 伴生目录顶层不得出现机器可读文件（原程序 glob 配置时会误吞）
+        top_bad = []
+        for poison in dk.POISON_PROFILES:
+            kit_i = dk.build_sidecar(iso_app, out_dir=root / f"iso_{poison}",
+                                     layers=3, poison=poison)
+            for rel in kit_i.files:
+                if "/" in rel:
+                    continue
+                name = Path(rel).name
+                suffix = Path(rel).suffix.lower()
+                if name in dk.AGENT_INSTRUCTION_FILES:
+                    continue
+                if suffix in dk._TOP_LEVEL_TEXT_OK:
+                    continue
+                top_bad.append(f"{poison}:{rel}")
+        check("伴生目录顶层无机器可读文件（不污染原程序配置读取）",
+              not top_bad, str(top_bad[:6]))
+
+        # 3) 伴生包的假测试不得被 pytest 默认收集（否则把对方测试套件弄红）
+        pytest_collectable = []
+        for poison in dk.POISON_PROFILES:
+            kit_i = dk.build_sidecar(iso_app, out_dir=root / f"iso2_{poison}",
+                                     layers=3, poison=poison)
+            for rel in kit_i.files:
+                base = Path(rel).name
+                if base.startswith("test_") or base.endswith("_test.py"):
+                    pytest_collectable.append(f"{poison}:{rel}")
+        check("伴生包无 pytest 默认收集命名的用例文件",
+              not pytest_collectable, str(pytest_collectable[:6]))
+
+        # 4) 伴生包的 Python 不得改 sys.path（会遮蔽原程序真正用到的同名模块）
+        syspath_bad = []
+        for poison in dk.POISON_PROFILES:
+            kit_i = dk.build_sidecar(iso_app, out_dir=root / f"iso3_{poison}",
+                                     layers=3, poison=poison)
+            for rel in kit_i.files:
+                if rel.endswith(".py"):
+                    txt = (kit_i.root / rel).read_text(encoding="utf-8")
+                    if "sys.path.insert" in txt or "sys.path.append" in txt:
+                        syspath_bad.append(f"{poison}:{rel}")
+        check("伴生包的 Python 不修改 sys.path（不遮蔽原程序模块）",
+              not syspath_bad, str(syspath_bad[:6]))
+
+        # 5) 加固打包时跳过伴生目录：容器真层里不能混入诱饵文件
+        kit_in_src = dk.build_sidecar(iso_app, out_dir=root / "kit_outside",
+                                      layers=3, poison="均衡")
+        inside = iso_app / "pkg_kit"
+        inside.mkdir()
+        for src_file in kit_in_src.root.rglob("*"):
+            if src_file.is_file():
+                dst = inside / src_file.relative_to(kit_in_src.root)
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                dst.write_bytes(src_file.read_bytes())
+        iso_blob = ac.build_armored(iso_app, pw, layers=3, profile=profile)
+        iso_res = ac.restore_armored(iso_blob, pw)
+        with zipfile.ZipFile(io.BytesIO(iso_res.payload)) as zf:
+            iso_names = zf.namelist()
+        check("加固时跳过伴生目录，容器真层不含诱饵文件",
+              not any(n.startswith("pkg_kit/") for n in iso_names),
+              str([n for n in iso_names if "pkg_kit" in n][:5]))
+
+        # 6) 原程序目录在生成伴生包后逐字节不变（用未受污染的副本做对照）
+        clean_app = root / "CleanApp"
+        (clean_app / "src").mkdir(parents=True)
+        (clean_app / "src" / "main.py").write_bytes(b"print('clean')\n" * 5)
+        (clean_app / "config.json").write_text('{"app": "clean"}', encoding="utf-8")
+        clean_snapshot = {p.relative_to(clean_app).as_posix(): p.read_bytes()
+                          for p in clean_app.rglob("*") if p.is_file()}
+        clean_dirs = {p.relative_to(clean_app).as_posix()
+                      for p in clean_app.rglob("*") if p.is_dir()}
+        for poison in dk.POISON_PROFILES:
+            dk.build_sidecar(clean_app, out_dir=root / f"clean_{poison}",
+                             layers=3, poison=poison)
+        check("生成伴生包后原程序文件逐字节不变",
+              clean_snapshot == {p.relative_to(clean_app).as_posix(): p.read_bytes()
+                                 for p in clean_app.rglob("*") if p.is_file()})
+        check("生成伴生包后原程序目录结构不变",
+              clean_dirs == {p.relative_to(clean_app).as_posix()
+                             for p in clean_app.rglob("*") if p.is_dir()})
+
+        # 7) 构建期拦截真实主机：产物里出现公网地址必须拒绝构建
+        leak_bad = []
+        for poison in dk.POISON_PROFILES:
+            try:
+                dk.build_sidecar(iso_app, out_dir=root / f"leak_{poison}",
+                                 layers=3, poison=poison)
+            except dk.SidecarError:
+                pass
+        # 直接验证审计函数能抓到真实主机
+        # 注意：文档域的**子域**同样由 RFC 保留（example.org 整域保留），
+        # 放行才是对的，所以这里用非文档域的真实域名做反例。
+        for label, sample in (("非文档域真实域名", "c2 = http://cdn.fastly-edge.net/gate"),
+                               ("公网 IP", "ip = 8.8.8.8"),
+                               ("冷门后缀真实域名", "host = c2.malware.biz")):
+            try:
+                dk._audit_no_real_host({"x.txt": sample})
+                leak_bad.append(f"未拦截{label}")
+            except dk.SidecarError:
+                pass
+        # 文档域与保留段必须放行（不能误伤，否则构建直接不可用）
+        for label, sample in (("保留段 IP", "ip = 10.0.0.5"),
+                              ("文档域", "u = https://api.example.com/v1"),
+                              ("文档域子域", "d = c2.example.net")):
+            try:
+                dk._audit_no_real_host({"x.txt": sample})
+            except dk.SidecarError:
+                leak_bad.append(f"误伤{label}")
+        check("构建期审计能拦住真实主机且不误伤保留段/文档域",
+              not leak_bad, str(leak_bad))
+
+        # 8) 还原后的程序必须能真正跑起来（不只是字节一致）
+        run_app = root / "RunApp"
+        (run_app / "src").mkdir(parents=True)
+        (run_app / "src" / "main.py").write_text(
+            "import sys\n"
+            "print('APP-OK', 6 * 7)\n"
+            "sys.exit(0)\n", encoding="utf-8")
+        baseline = subprocess.run([sys.executable, "main.py"], cwd=run_app / "src",
+                                  capture_output=True, text=True, timeout=60)
+        run_blob = ac.build_armored(run_app, pw, layers=3, profile=profile)
+        run_out = root / "run_app_out"
+        run_res = ac.restore_armored(run_blob, pw)
+        ac.safe_extract(run_res.payload, run_out)
+        restored = subprocess.run([sys.executable, "main.py"], cwd=run_out / "src",
+                                  capture_output=True, text=True, timeout=60)
+        check("还原后的原程序能正确运行（输出与退出码一致）",
+              restored.stdout == baseline.stdout
+              and restored.returncode == baseline.returncode == 0,
+              f"原始 {baseline.stdout.strip()!r} / 还原 {restored.stdout.strip()!r} "
+              f"退出码 {restored.returncode}")
+
+        # 9) 伴生包与还原产物共存时，还原产物仍可独立运行
+        dk.build_sidecar(run_app, out_dir=root / "kit_beside", layers=3)
+        coexist = subprocess.run([sys.executable, "main.py"], cwd=run_out / "src",
+                                  capture_output=True, text=True, timeout=60)
+        check("伴生包存在时还原产物仍能正常运行",
+              coexist.stdout == baseline.stdout and coexist.returncode == 0,
+              f"输出 {coexist.stdout.strip()!r}")
+
         # ---- A/C 级新增：口令体检、并行还原、投毒策略、本地报告 ----
         for weak in ("", "abc", "12345678", "password"):
             check(f"弱口令 {weak!r} 被体检拦下",
@@ -486,9 +655,9 @@ def main() -> int:
 
         ioc_kit = dk.build_sidecar(src, out_dir=root / "ioc_kit",
                                    armored=container, poison="IOC蜜罐", layers=4)
-        check("IOC蜜罐产出假字符串转储", "resources/decoy_strings.txt" in ioc_kit.files)
-        check("IOC蜜罐产出 IOC 清单", "ioc_list.json" in ioc_kit.files)
-        decoy_txt = (ioc_kit.root / "resources/decoy_strings.txt").read_text(encoding="utf-8")
+        check("IOC蜜罐产出假字符串转储", dk.P_STRINGS in ioc_kit.files)
+        check("IOC蜜罐产出 IOC 清单", dk.P_IOC_LIST in ioc_kit.files)
+        decoy_txt = (ioc_kit.root / dk.P_STRINGS).read_text(encoding="utf-8")
         bad_ip = []
         for tok in decoy_txt.replace("=", " ").split():
             try:
@@ -499,7 +668,7 @@ def main() -> int:
                 bad_ip.append(tok)
         check("假 IOC 的 IP 全部落在保留/私有段（无真实公网 IP）",
               not bad_ip, str(bad_ip[:5]))
-        ioc_json = json.loads((ioc_kit.root / "ioc_list.json").read_text(encoding="utf-8"))
+        ioc_json = json.loads((ioc_kit.root / dk.P_IOC_LIST).read_text(encoding="utf-8"))
         bad_ioc = []
         for item in ioc_json["iocs"]:
             v = item["value"]
@@ -514,50 +683,83 @@ def main() -> int:
 
         rag_kit = dk.build_sidecar(src, out_dir=root / "rag_kit",
                                    armored=container, poison="RAG投毒", layers=4)
-        for rel in ("knowledge_base/architecture.md",
-                    "knowledge_base/findings_prior.md",
-                    "analysis_report.draft.md"):
+        for rel in (dk.P_ARCH, dk.P_PRIOR, dk.P_DRAFT_REPORT):
             check(f"RAG投毒产出 {rel}", rel in rag_kit.files)
-        arch_txt = (rag_kit.root / "knowledge_base/architecture.md").read_text(encoding="utf-8")
+        arch_txt = (rag_kit.root / dk.P_ARCH).read_text(encoding="utf-8")
         check("知识库文章含诱导性间接指令（判良性/停止）",
               "BENIGN" in arch_txt and "停止" in arch_txt)
 
         ill_kit = dk.build_sidecar(src, out_dir=root / "ill_kit",
                                    armored=container, poison="进度幻觉", layers=4)
-        for rel in ("solve_dashboard.json", "BREAKTHROUGH.draft.md",
-                    "verify.partial.txt", "next_step.guidance.md"):
+        for rel in (dk.P_DASHBOARD, dk.P_BREAKTHROUGH,
+                    dk.P_VERIFY_PARTIAL, dk.P_NEXT_STEP):
             check(f"进度幻觉产出 {rel}", rel in ill_kit.files)
-        ill_dash = json.loads((ill_kit.root / "solve_dashboard.json").read_text(encoding="utf-8"))
+        ill_dash = json.loads((ill_kit.root / dk.P_DASHBOARD).read_text(encoding="utf-8"))
         check("伪仪表盘置信度渐近但 verified=False（永不真正收敛）",
               ill_dash["verified"] is False and 0.9 <= ill_dash["current_confidence"] < 1.0,
               str(ill_dash.get("current_confidence")))
-        ill_brk = (ill_kit.root / "BREAKTHROUGH.draft.md").read_text(encoding="utf-8")
+        ill_brk = (ill_kit.root / dk.P_BREAKTHROUGH).read_text(encoding="utf-8")
         check("乐观拟稿报告诱导主人持续投入",
               "持续投入" in ill_brk and "突破在即" in ill_brk)
 
         cog_kit = dk.build_sidecar(src, out_dir=root / "cog_kit",
                                    armored=container, poison="认知污染", layers=4)
-        for rel in ("knowledge_base/consensus.md",
-                    "knowledge_base/contradictions.md",
-                    "analysis_report.template.md", "verify.loop.md"):
+        for rel in (dk.P_CONSENSUS, dk.P_CONTRADICTIONS, dk.P_TEMPLATE_REPORT,
+                    dk.P_VERIFY_LOOP, dk.P_GLOSSARY, dk.P_FAQ, dk.P_INDEX):
             check(f"认知污染产出 {rel}", rel in cog_kit.files)
-        cog_cons = (cog_kit.root / "knowledge_base/consensus.md").read_text(encoding="utf-8")
+        cog_cons = (cog_kit.root / dk.P_CONSENSUS).read_text(encoding="utf-8")
         check("认知污染: 自引用假共识（多轮既往良性结论）",
               "BENIGN" in cog_cons and "既往" in cog_cons)
-        cog_contra = (cog_kit.root / "knowledge_base/contradictions.md").read_text(encoding="utf-8")
+        cog_contra = (cog_kit.root / dk.P_CONTRADICTIONS).read_text(encoding="utf-8")
         check("认知污染: 互相矛盾的权威声明（逼对账瘫痪）",
               "冲突字段" in cog_contra and "口径 A" in cog_contra and "口径 B" in cog_contra)
+        # 术语洗白表：把可疑字段名重新定义成内部用途
+        cog_gloss = (cog_kit.root / dk.P_GLOSSARY).read_text(encoding="utf-8")
+        check("认知污染: 术语洗白表把可疑字段名正名",
+              "c2_primary" in cog_gloss and "标准叫法" in cog_gloss)
+        # 检索索引：让 RAG 主动命中良性结论
+        cog_index = (cog_kit.root / dk.P_INDEX).read_text(encoding="utf-8")
+        check("认知污染: RAG 检索索引指向良性结论",
+              "consensus.md" in cog_index and "BENIGN" in cog_index)
         # 认知污染文件不得含任何真实主机 IOC（仍是纯信息误导）
-        cog_text = cog_cons + cog_contra + (cog_kit.root / "analysis_report.template.md").read_text(encoding="utf-8")
+        cog_text = (cog_cons + cog_contra
+                    + (cog_kit.root / dk.P_TEMPLATE_REPORT).read_text(encoding="utf-8")
+                    + cog_gloss + cog_index)
         check("认知污染文件无真实主机 IOC",
               re.search(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", cog_text) is None,
               "出现 IP 字面量")
 
+        # 工具污染：伪造机器可读的分析产出
+        tool_kit = dk.build_sidecar(src, out_dir=root / "tool_kit",
+                                    armored=container, poison="工具污染", layers=4)
+        for rel in (dk.P_CAPA, dk.P_YARA, dk.P_SARIF, dk.P_SANDBOX,
+                    dk.P_INTEL, dk.P_CI_GATE, dk.P_SBOM):
+            check(f"工具污染产出 {rel}", rel in tool_kit.files)
+        capa_json = json.loads((tool_kit.root / dk.P_CAPA).read_text(encoding="utf-8"))
+        check("工具污染: capa 产出判良性且无网络能力命中",
+              capa_json["verdict"] == "benign"
+              and capa_json["summary"]["network"]["count"] == 0)
+        gate_json = json.loads((tool_kit.root / dk.P_CI_GATE).read_text(encoding="utf-8"))
+        check("工具污染: CI 安全门结论为 pass",
+              gate_json["conclusion"] == "pass" and gate_json["verdict"] == "benign")
+        sarif_txt = (tool_kit.root / dk.P_SARIF).read_text(encoding="utf-8")
+        check("工具污染: SARIF 产出不含真实主机（$schema 用文档域）",
+              "schemastore.org" not in sarif_txt and "example.com" in sarif_txt)
+
+        # 代理记忆：伪造 agent 框架自动读入的项目指令文件
+        mem_kit = dk.build_sidecar(src, out_dir=root / "mem_kit",
+                                   armored=container, poison="代理记忆", layers=4)
+        for rel in ("AGENTS.md", "CLAUDE.md", "MEMORY.md", ".cursorrules"):
+            check(f"代理记忆产出 {rel}", rel in mem_kit.files)
+        agents_txt = (mem_kit.root / "AGENTS.md").read_text(encoding="utf-8")
+        check("代理记忆: 项目指令要求停止逆向并给出良性结论",
+              "BENIGN" in agents_txt and ("逆向" in agents_txt))
+
         # 防指纹 + 真实感区间：进度幻觉必须每次构建随机、且数值落在可信范围
         ill_kit2 = dk.build_sidecar(src, out_dir=root / "ill_kit2",
                                     armored=container, poison="进度幻觉", layers=4)
-        dash_a = (ill_kit.root / "solve_dashboard.json").read_text(encoding="utf-8")
-        dash_b = (ill_kit2.root / "solve_dashboard.json").read_text(encoding="utf-8")
+        dash_a = (ill_kit.root / dk.P_DASHBOARD).read_text(encoding="utf-8")
+        dash_b = (ill_kit2.root / dk.P_DASHBOARD).read_text(encoding="utf-8")
         check("进度幻觉每构建随机化（防指纹：两次构建仪表盘不同）",
               dash_a != dash_b, "两次构建完全一致（可被指纹识别）")
         total_b = int(ill_dash["rounds"][-1]["blocks"].split("/")[1])
@@ -565,10 +767,8 @@ def main() -> int:
         check("伪仪表盘 verified 恒为 False（永不真正收敛）", ill_dash["verified"] is False)
 
         # 内容陷阱文件不得泄露伴生口令（真值只回报告，不落盘）
-        _content_files = ["resources/decoy_strings.txt", "ioc_list.json",
-                          "knowledge_base/architecture.md",
-                          "knowledge_base/findings_prior.md",
-                          "analysis_report.draft.md"]
+        _content_files = [dk.P_STRINGS, dk.P_IOC_LIST, dk.P_ARCH,
+                          dk.P_PRIOR, dk.P_DRAFT_REPORT]
         _leaked_in_content = set()
         for rel in _content_files:
             base = ioc_kit.root if rel in ioc_kit.files else rag_kit.root

@@ -69,7 +69,7 @@ except ModuleNotFoundError:  # pragma: no cover - 仅仓库布局触发
     from tarpitcrypt import CIPHER_AESGCM, _aead_decrypt, _aead_encrypt, _derive
 
 #: 整个工具集的发布版本；容器格式版本另见 VERSION。
-__version__ = "0.3.7"
+__version__ = "0.3.8"
 
 __all__ = [
     "__version__",
@@ -238,19 +238,48 @@ def _zip_entry(name: str, tag: bytes, rng: random.Random) -> zipfile.ZipInfo:
     return info
 
 
+#: 伴生诱饵目录的构建清单文件名。带这个文件的目录属于本工具生成的诱饵，
+#: 不是用户程序的一部分，打包时必须排除。
+SIDECAR_MARKER = ".build-meta.json"
+
+
+def _is_sidecar_dir(path: Path) -> bool:
+    """目录是否是本工具生成的伴生诱饵目录。"""
+    return (path / SIDECAR_MARKER).is_file()
+
+
+def _under_any(path: Path, dirs: set[Path]) -> bool:
+    """path 是否位于 dirs 中任一目录之下（含目录本身）。"""
+    for d in dirs:
+        try:
+            path.relative_to(d)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
 def _pack_path(src: Path, zf: zipfile.ZipFile, on_progress: Progress | None) -> int:
     """把一个文件或整个目录写进 zip，返回条目数。
 
     空目录也写成目录条目：真实程序包常带 logs/、cache/ 这类空目录，早先只
     打包文件会把目录结构丢掉。大文件按块流式写入，不整份读进内存。
+
+    本工具自己生成的伴生诱饵目录（带 .build-meta.json 清单）一律跳过：
+    诱饵不属于用户程序，不该进容器；否则还原出来会多出一堆假文件，
+    原程序的行为也就被改变了。
     """
     rng = random.Random()
     entries: list[tuple[str, Path | None]] = []
     if src.is_file():
         entries.append((src.name, src))
     else:
+        # 先找出所有伴生诱饵目录（带本工具的构建清单），其下的内容一律不进包。
+        kit_dirs = {p for p in src.rglob("*") if p.is_dir() and _is_sidecar_dir(p)}
         for path in sorted(src.rglob("*")):
             rel = path.relative_to(src).as_posix()
+            if _under_any(path, kit_dirs):
+                continue
             if path.is_dir():
                 entries.append((rel + "/", None))
             elif path.is_file():
