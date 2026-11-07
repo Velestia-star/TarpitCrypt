@@ -438,14 +438,19 @@ async function restoreWorkspace() {
     return;
   }
   if (!records.length) return;
-  const items = records
-    .sort((a, b) => a.id - b.id)
-    .map(deserializeItem);
+  const all = records.sort((a, b) => a.id - b.id).map(deserializeItem);
+  const items = all.filter((item) => item.files.length > 0);
+  const dropped = all.length - items.length;
   workspace.items = items;
   workspace.seq = items.reduce((max, item) => Math.max(max, item.id), 0);
   renderWorkspace();
+  if (dropped > 0) void persistWorkspace();
   const cached = items.filter((item) => item.cached).length;
-  workspaceNote(`已恢复上次的 ${items.length} 项（${cached} 项可直接继续加密）`);
+  workspaceNote(
+    dropped > 0
+      ? `已恢复 ${items.length} 项，清掉 ${dropped} 条没有内容的旧记录`
+      : `已恢复上次的 ${items.length} 项（${cached} 项可直接继续加密）`,
+  );
 }
 
 function addHistoryEntry(payload) {
@@ -517,10 +522,24 @@ function setView(view) {
   if (drawerOpen()) history.replaceState(null, "", `#${view}`);
 }
 
-/** 往工作区加项。 */
+/** 往工作区加项：空文件夹没有可加密的内容，直接跳过并说明。 */
 function addWorkspaceEntries(entries) {
   if (!entries.length) return;
+  const usable = [];
+  const empty = [];
   for (const entry of entries) {
+    if (!entry.files || entry.files.length === 0) empty.push(entry.name);
+    else usable.push(entry);
+  }
+  if (!usable.length) {
+    workspaceNote(
+      empty.length
+        ? `「${empty.join("」「")}」是空文件夹，里面没有文件可加密`
+        : "没有可加入的文件",
+    );
+    return;
+  }
+  for (const entry of usable) {
     workspace.items.push({
       id: ++workspace.seq,
       kind: entry.kind,
@@ -535,6 +554,9 @@ function addWorkspaceEntries(entries) {
   }
   renderWorkspace();
   void persistWorkspace();
+  if (empty.length) {
+    workspaceNote(`已加入 ${usable.length} 项，跳过 ${empty.length} 个空文件夹`);
+  }
 }
 
 function selectedItems() {
@@ -609,7 +631,7 @@ function buildWorkspaceRow(item) {
   } else if (item.cached === false) {
     const note = document.createElement("span");
     note.className = "q-meta";
-    note.textContent = "未缓存文件，请重新加入";
+    note.textContent = "内容不可用，请重新加入";
     source.append(note);
   } else if (item.status === "error") {
     const error = document.createElement("span");
@@ -801,7 +823,7 @@ async function workspaceItemPayload(item) {
 /** 加密工作区里的一项，结果留在右侧，并记进历史。 */
 async function encryptWorkspaceItem(item) {
   if (!item.files.length) {
-    throw new Error("这一项没有缓存文件内容（上次存储空间不够），请重新加入");
+    throw new Error("这一项没有可加密的内容（空文件夹或上次没缓存成功），请重新加入");
   }
   const passwordText = $("password").value;
   if (!passwordText) throw new Error("先在上面表单里填口令");
