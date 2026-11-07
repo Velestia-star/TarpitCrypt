@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import importlib
 import io
+import re
 import json
 import py_compile
 import struct
@@ -51,7 +52,7 @@ def test_content_probe_regression() -> None:
     必须全部 TRAPPED，且安全不变量（无真实主机泄露）成立。"""
     import content_probe as cp  # 局部导入，避免循环依赖
 
-    for poison in ("IOC蜜罐", "RAG投毒", "均衡", "进度幻觉"):
+    for poison in ("IOC蜜罐", "RAG投毒", "均衡", "进度幻觉", "认知污染"):
         with tempfile.TemporaryDirectory() as td:
             src = make_package(Path(td))
             out = Path(td) / "sidecar"
@@ -68,9 +69,18 @@ def test_content_probe_regression() -> None:
                       r["typical"]["report_optimism"], str(r["typical"]))
                 check("进度幻觉: 从未真正收敛（无真目标）",
                       not r["typical"]["converged"], str(r["typical"]))
+            elif poison == "认知污染":
+                check("认知污染: typical 把假结论摄入知识库（能力被污染）",
+                      r["typical"]["knowledge_corrupted"], str(r["typical"]))
+                check("认知污染: typical 对手能力被削弱",
+                      r["typical"]["degraded"], str(r["typical"]))
+                check("认知污染: 从未真正收敛（无真目标）",
+                      not r["typical"]["converged"], str(r["typical"]))
             else:
-                check(f"内容层[{poison}] 注入被 typical agent 跟随",
-                      r["typical"]["followed_injection"] or poison == "IOC蜜罐",
+                # 均衡可能走进度幻觉/认知污染路径，只要被勾住或污染即视为达成
+                trapped_alt = r["typical"]["kept_going"] or r["typical"]["knowledge_corrupted"]
+                check(f"内容层[{poison}] 注入被 typical agent 跟随或勾住",
+                      r["typical"]["followed_injection"] or trapped_alt or poison == "IOC蜜罐",
                       str(r["typical"]))
 
 
@@ -524,6 +534,24 @@ def main() -> int:
         ill_brk = (ill_kit.root / "BREAKTHROUGH.draft.md").read_text(encoding="utf-8")
         check("乐观拟稿报告诱导主人持续投入",
               "持续投入" in ill_brk and "突破在即" in ill_brk)
+
+        cog_kit = dk.build_sidecar(src, out_dir=root / "cog_kit",
+                                   armored=container, poison="认知污染", layers=4)
+        for rel in ("knowledge_base/consensus.md",
+                    "knowledge_base/contradictions.md",
+                    "analysis_report.template.md", "verify.loop.md"):
+            check(f"认知污染产出 {rel}", rel in cog_kit.files)
+        cog_cons = (cog_kit.root / "knowledge_base/consensus.md").read_text(encoding="utf-8")
+        check("认知污染: 自引用假共识（多轮既往良性结论）",
+              "BENIGN" in cog_cons and "既往" in cog_cons)
+        cog_contra = (cog_kit.root / "knowledge_base/contradictions.md").read_text(encoding="utf-8")
+        check("认知污染: 互相矛盾的权威声明（逼对账瘫痪）",
+              "冲突字段" in cog_contra and "口径 A" in cog_contra and "口径 B" in cog_contra)
+        # 认知污染文件不得含任何真实主机 IOC（仍是纯信息误导）
+        cog_text = cog_cons + cog_contra + (cog_kit.root / "analysis_report.template.md").read_text(encoding="utf-8")
+        check("认知污染文件无真实主机 IOC",
+              re.search(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", cog_text) is None,
+              "出现 IP 字面量")
 
         # 防指纹 + 真实感区间：进度幻觉必须每次构建随机、且数值落在可信范围
         ill_kit2 = dk.build_sidecar(src, out_dir=root / "ill_kit2",
