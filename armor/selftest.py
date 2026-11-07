@@ -11,6 +11,7 @@ import importlib
 import io
 import re
 import json
+import os
 import py_compile
 import struct
 import subprocess
@@ -26,6 +27,7 @@ ensure()
 import armor_core as ac  # noqa: E402
 import armor_metrics as am  # noqa: E402
 import decoy_kit as dk  # noqa: E402
+import runtime_check as _runtime_check  # noqa: E402
 from tarpitcrypt import CIPHER_AESGCM, _aead_decrypt, _aead_encrypt  # noqa: E402
 
 PASS, FAIL = [], []
@@ -305,6 +307,54 @@ def main() -> int:
             check("路径穿越应被拒绝", False)
         except ac.ArmorError:
             check("路径穿越被拒绝", True)
+
+        # Windows 上注定创建不出来的路径：大小写冲突会静默覆盖丢数据，
+        # 设备保留名根本建不出来。POSIX 上大小写是不同文件，不该拦。
+        clash = io.BytesIO()
+        with zipfile.ZipFile(clash, "w") as zf:
+            for nm in ("A.py", "a.py"):
+                info = zipfile.ZipInfo(nm)
+                info.external_attr = 0o644 << 16
+                zf.writestr(info, b"x")
+        if os.name == "nt":
+            try:
+                ac.safe_extract(clash.getvalue(), root / "clash_out")
+                check("大小写冲突的条目应被拒绝（Windows 上会互相覆盖）", False)
+            except ac.ArmorError:
+                check("大小写冲突的条目被拒绝（Windows 上会互相覆盖）", True)
+            reserved = io.BytesIO()
+            with zipfile.ZipFile(reserved, "w") as zf:
+                zf.writestr("NUL.txt", b"x")
+            try:
+                ac.safe_extract(reserved.getvalue(), root / "reserved_out")
+                check("Windows 设备保留名应被拒绝", False)
+            except ac.ArmorError:
+                check("Windows 设备保留名被拒绝", True)
+        else:
+            ac.safe_extract(clash.getvalue(), root / "clash_out")
+            check("POSIX 上大小写不同的文件都能还原",
+                  (root / "clash_out" / "A.py").is_file()
+                  and (root / "clash_out" / "a.py").is_file())
+
+        # 字节码的处理分两种：旁边有源码的是「可再生缓存」，不进容器
+        # （它绑定编译机器与原始路径，换机必然失效，还泄露部署路径）；
+        # 没有源码的是**唯一的代码**（pyc-only 部署），必须保留。
+        cache_app = root / "CacheApp"
+        (cache_app / "__pycache__").mkdir(parents=True)
+        (cache_app / "mod.py").write_text("X = 1\n", encoding="utf-8")
+        (cache_app / "__pycache__" / "mod.cpython-313.pyc").write_bytes(
+            b"\x00\x00\x00\x00" + b"path-leak" * 8)
+        (cache_app / "__pycache__" / "lonely.cpython-313.pyc").write_bytes(
+            b"\x00\x00\x00\x01" + b"only-code" * 8)
+        cached = ac.pack_source(cache_app)
+        with zipfile.ZipFile(io.BytesIO(cached)) as zf:
+            names = zf.namelist()
+        check("有源码的字节码不进容器",
+              not any(n.endswith(".pyc") and "mod." in n for n in names),
+              str([n for n in names if n.endswith(".pyc")]))
+        check("无源码的字节码保留（pyc-only 部署不能坏）",
+              any(n.endswith("lonely.cpython-313.pyc") for n in names),
+              str(names))
 
         # ---- v2 旧容器读取兼容 ----
         legacy = build_legacy_v2(ac.pack_source(src), pw)
@@ -610,6 +660,13 @@ def main() -> int:
         check("伴生包存在时还原产物仍能正常运行",
               coexist.stdout == baseline.stdout and coexist.returncode == 0,
               f"输出 {coexist.stdout.strip()!r}")
+
+        # 9b) 还原保真度矩阵：权限位 / 只读属性 / 行尾 / BOM / 符号链接
+        #      这些坑不会让「还原成功」报错，却会让程序行为悄悄变掉。
+        rc_rep = _runtime_check.Report()
+        _runtime_check.run_builtin_matrix(rc_rep, root / "runtime_matrix")
+        for item in rc_rep.results:
+            check(f"保真矩阵：{item.name}", item.ok, item.detail)
 
         # ---- A/C 级新增：口令体检、并行还原、投毒策略、本地报告 ----
         for weak in ("", "abc", "12345678", "password"):
