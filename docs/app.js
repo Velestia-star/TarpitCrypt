@@ -280,6 +280,8 @@ const HISTORY_LIMIT = 200;
 const ITEM_MIME = "application/x-tarpit-item";
 
 const workspace = { items: [], seq: 0, view: "workspace" };
+/** 正在拖动的条目标题，用于主区域提示文案。 */
+let draggingItemName = null;
 let historyEntries = loadHistory();
 /** 只在本次会话有效的文件句柄（File 与 blob URL 都没法持久化）。 */
 const liveHandles = new Map();
@@ -964,7 +966,43 @@ function bindWorkspace() {
     }
   });
 
-  // 行内拖拽排序；拖到左侧主区域会触发加密（见 bind() 里的 drop 处理）
+  // 拖到页面左半边任意位置松手，都开始加密（不必精确落进虚线框）
+  document.addEventListener("dragover", (event) => {
+    if (!event.dataTransfer.types.includes(ITEM_MIME)) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "copy";
+    $("drop").classList.add("over");
+    if (draggingItemName) {
+      $("dropTitle").textContent = `松手开始加密「${draggingItemName}」`;
+    }
+  });
+
+  document.addEventListener("dragleave", (event) => {
+    if (!event.dataTransfer.types.includes(ITEM_MIME)) return;
+    if (event.relatedTarget === null) {
+      $("drop").classList.remove("over");
+      renderFiles();
+    }
+  });
+
+  document.addEventListener("drop", async (event) => {
+    const itemId = event.dataTransfer.getData(ITEM_MIME);
+    if (!itemId) return;
+    event.preventDefault();
+    $("drop").classList.remove("over");
+    renderFiles();
+    const item = workspaceItemById(itemId);
+    if (!item) return;
+    status(`正在加密「${item.name}」…`);
+    try {
+      await encryptWorkspaceItem(item);
+      status(`已加密「${item.name}」，结果在工作区右侧`, "ok");
+    } catch (error) {
+      status(`加密失败：${error.message}`, "bad");
+    }
+  });
+
+  // 行内拖拽排序；拖到左侧主区域会触发加密（见上面的 document 级监听）
   let dragId = null;
   const list = $("queueList");
   list.addEventListener("dragstart", (event) => {
@@ -973,8 +1011,11 @@ function bindWorkspace() {
     dragId = Number(row.dataset.id);
     row.classList.add("dragging");
     event.dataTransfer.effectAllowed = "copyMove";
+    // 只写自定义类型：一旦写入 text/plain，Edge/Chrome 会把这次拖拽当成
+    // 「拖文本」，弹出「松开鼠标以搜索文本」的浮层并吞掉 drop 事件。
     event.dataTransfer.setData(ITEM_MIME, String(dragId));
-    event.dataTransfer.setData("text/plain", String(dragId));
+    const dragged = workspaceItemById(dragId);
+    draggingItemName = dragged ? dragged.name : null;
   });
   list.addEventListener("dragend", () => {
     dragId = null;
@@ -1034,23 +1075,10 @@ function bind() {
   });
   drop.addEventListener("dragleave", () => drop.classList.remove("over"));
   drop.addEventListener("drop", async (event) => {
+    // 只接管来自操作系统的文件；工作区行由下面的 document 级监听处理
+    if (event.dataTransfer.types.includes(ITEM_MIME)) return;
     event.preventDefault();
     drop.classList.remove("over");
-    // 从工作区里拖出来的一行 → 放到左侧大框里就开始加密
-    const itemId = event.dataTransfer.getData(ITEM_MIME);
-    if (itemId) {
-      const item = workspaceItemById(itemId);
-      if (item) {
-        status(`正在加密「${item.name}」…`);
-        try {
-          await encryptWorkspaceItem(item);
-          status(`已加密「${item.name}」，结果在工作区右侧`, "ok");
-        } catch (error) {
-          status(`加密失败：${error.message}`, "bad");
-        }
-      }
-      return;
-    }
     try {
       setFiles(await collectFromDrop(event.dataTransfer), false);
     } catch (error) {

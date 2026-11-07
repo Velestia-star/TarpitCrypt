@@ -642,3 +642,11 @@ body.drawer-open { overflow: hidden; }
 .deleted-dot { background: #6b6259; }
 
 .history-row.deleted-record { opacity: 0.85; }
+
+/* 行内不选中文本：否则鼠标一拖就被当成「拖文本」触发浏览器搜索浮层 */
+.queue-row,
+.history-row {
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-user-drag: element;
+}

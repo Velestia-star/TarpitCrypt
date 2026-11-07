@@ -46,7 +46,8 @@ DRAG_TO_ENCRYPT_JS = """
   if (!row) return { error: "没有行" };
   const dt = new DataTransfer();
   dt.setData("application/x-tarpit-item", row.dataset.id);
-  document.getElementById("drop").dispatchEvent(new DragEvent("drop", {
+  // 故意丢在 body 上：等价于「拖到左侧任意位置松手」，不必精确落进虚线框
+  document.body.dispatchEvent(new DragEvent("drop", {
     dataTransfer: dt, bubbles: true, cancelable: true,
   }));
   // renderWorkspace 会重建行，必须每次重新查询，不能抓着旧引用
