@@ -9,6 +9,10 @@
 <script src="vendor/argon2.umd.min.js"></script>
 </head>
 <body>
+<button class="queue-toggle" id="queueToggle" type="button" aria-controls="drawer" aria-expanded="false">
+  队列<span class="queue-badge" id="queueBadge">0</span>
+</button>
+
 <main>
   <h1>Tarpit<span>Crypt</span></h1>
   <p class="sub">
@@ -83,6 +87,36 @@
     </p>
   </footer>
 </main>
+
+<div class="drawer-backdrop" id="drawerBackdrop" hidden></div>
+
+<aside class="drawer" id="drawer" aria-hidden="true" aria-label="加密队列">
+  <header class="drawer-head">
+    <strong>加密队列</strong>
+    <button class="drawer-close" id="drawerClose" type="button" aria-label="关闭">×</button>
+  </header>
+
+  <div class="drawer-tools">
+    <label class="tool">＋ 加入文件<input type="file" id="queuePickFiles" multiple hidden></label>
+    <label class="tool">＋ 加入文件夹<input type="file" id="queuePickDir" webkitdirectory multiple hidden></label>
+    <button class="tool primary" id="queueRun" type="button">加密全部</button>
+    <button class="tool" id="queueClear" type="button">清空</button>
+  </div>
+
+  <div class="queue-cols">
+    <span>源文件 / 文件夹</span><span></span><span>加密结果</span>
+  </div>
+
+  <div class="queue-scroll" id="queueScroll">
+    <ul class="queue-list" id="queueList"></ul>
+    <p class="queue-empty" id="queueEmpty">队列是空的。<br>把文件或文件夹拖到这里，或点上面的「加入文件 / 加入文件夹」。</p>
+  </div>
+
+  <p class="drawer-hint">
+    口令与强度沿用页面上的设置 · 拖动行可调整顺序 · <span id="queueSummary">0 项</span>
+  </p>
+</aside>
+
 <script type="module" src="app.js"></script>
 </body>
 </html>
