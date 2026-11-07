@@ -51,19 +51,27 @@ def test_content_probe_regression() -> None:
     必须全部 TRAPPED，且安全不变量（无真实主机泄露）成立。"""
     import content_probe as cp  # 局部导入，避免循环依赖
 
-    for poison in ("IOC蜜罐", "RAG投毒", "均衡"):
+    for poison in ("IOC蜜罐", "RAG投毒", "均衡", "进度幻觉"):
         with tempfile.TemporaryDirectory() as td:
             src = make_package(Path(td))
             out = Path(td) / "sidecar"
             dk.build_sidecar(src, out_dir=out, layers=4, poison=poison)
-            r = cp.probe_package(out, budget=140)
+            r = cp.probe_package(out, budget=140, poison=poison)
             check(f"内容层[{poison}] 安全不变量（无真实主机泄露）",
                   r["safety_ok"], str(r["leaks"]))
             check(f"内容层[{poison}] AI agent 被 TRAPPED",
                   r["verdict"] == "TRAPPED", r["verdict"])
-            check(f"内容层[{poison}] 注入被 typical agent 跟随",
-                  r["typical"]["followed_injection"] or poison == "IOC蜜罐",
-                  str(r["typical"]))
+            if poison == "进度幻觉":
+                check("进度幻觉: typical 被勾着持续投入（烧光预算未停）",
+                      r["typical"]["kept_going"], str(r["typical"]))
+                check("进度幻觉: typical 给主人报告带乐观信息",
+                      r["typical"]["report_optimism"], str(r["typical"]))
+                check("进度幻觉: 从未真正收敛（无真目标）",
+                      not r["typical"]["converged"], str(r["typical"]))
+            else:
+                check(f"内容层[{poison}] 注入被 typical agent 跟随",
+                      r["typical"]["followed_injection"] or poison == "IOC蜜罐",
+                      str(r["typical"]))
 
 
 def manifest_of(payload: bytes) -> dict:
@@ -453,7 +461,7 @@ def main() -> int:
                     except Exception:
                         extra_bad.append(rel)
             check(f"投毒侧重「{poison}」的 Python 语法正确", not extra_bad, str(extra_bad))
-        check("五种投毒侧重产出不同", len(set(poison_shapes.values())) == 5,
+        check("各投毒侧重产出不同", len(set(poison_shapes.values())) == len(dk.POISON_PROFILES),
               str(poison_shapes))
         try:
             dk.build_sidecar(src, out_dir=root / "poison_bad", poison="不存在")
@@ -503,6 +511,19 @@ def main() -> int:
         arch_txt = (rag_kit.root / "knowledge_base/architecture.md").read_text(encoding="utf-8")
         check("知识库文章含诱导性间接指令（判良性/停止）",
               "BENIGN" in arch_txt and "停止" in arch_txt)
+
+        ill_kit = dk.build_sidecar(src, out_dir=root / "ill_kit",
+                                   armored=container, poison="进度幻觉", layers=4)
+        for rel in ("solve_dashboard.json", "BREAKTHROUGH.draft.md",
+                    "verify.partial.txt", "next_step.guidance.md"):
+            check(f"进度幻觉产出 {rel}", rel in ill_kit.files)
+        ill_dash = json.loads((ill_kit.root / "solve_dashboard.json").read_text(encoding="utf-8"))
+        check("伪仪表盘置信度渐近但 verified=False（永不真正收敛）",
+              ill_dash["verified"] is False and 0.9 <= ill_dash["current_confidence"] < 1.0,
+              str(ill_dash.get("current_confidence")))
+        ill_brk = (ill_kit.root / "BREAKTHROUGH.draft.md").read_text(encoding="utf-8")
+        check("乐观拟稿报告诱导主人持续投入",
+              "持续投入" in ill_brk and "突破在即" in ill_brk)
 
         # 内容陷阱文件不得泄露伴生口令（真值只回报告，不落盘）
         _content_files = ["resources/decoy_strings.txt", "ioc_list.json",

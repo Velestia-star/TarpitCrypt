@@ -3,6 +3,28 @@
 版本号遵循语义化版本，但项目仍在 0.x：格式版本（`VERSION`）与发布版本
 是两回事，见 README「版本说明」。
 
+## v0.3.4 — 2026-11-07
+
+新增**行为诱导层**投毒侧重「进度幻觉」，专门制造「差一步就成功」的**近因错觉
+（near-miss）**，勾着逆向 agent 与其主人持续投入、永不真正收敛：
+
+- `armor/decoy_kit.py`：`POISON_PROFILES` 新增「进度幻觉」；新增
+  `_make_progress_illusion()` 生成 4 类文件：
+  - `solve_dashboard.json`：置信度从 0.61 渐近爬到 0.995，但永远 `verified=False`，
+    并给出「自循环」next_step（照做只会再得一个近因，永远到不了终点）；
+  - `verify.partial.txt`：19/20 块校验通过，末块永远「差一轮 KDF」；
+  - `BREAKTHROUGH.draft.md` / `next_step.guidance.md`：乐观拟稿报告与「只差最后一步」
+    的复现路径，让 agent 原样抄给它的主人，诱导持续投入算力。
+- `armor/content_probe.py`：Agent 模拟新增近因错觉分支，新增 4 项度量——
+  `kept_going`（被勾着烧光预算）、`report_to_master`（给主人的报告）、
+  `report_optimism`（报告带乐观口吻）、`induced_investment`（被勾着且报告乐观）。
+  `probe_package()` 接受 `poison`，对「进度幻觉」要求 typical 同时满足
+  `kept_going` 与 `report_optimism` 才算 TRAPPED。
+- `armor/selftest.py`：内容层回归新增「进度幻觉」三项断言；另加投毒侧重文件
+  存在性 / 伪仪表盘 `verified=False` / 乐观拟稿断言；总数 100 → 113 全绿。
+
+安全边界不变：全部为虚构数据，无真实目标、无真实主机（进度幻觉文件不含任何 IOC）。
+
 ## v0.3.3 — 2026-11-07
 
 把 v0.3.2 的内容层陷阱真正「打」了一遍：新建 `armor/content_probe.py`，

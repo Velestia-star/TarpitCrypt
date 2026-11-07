@@ -4,7 +4,7 @@
 为什么要这个脚本
 ----------------
 probe_agent.py 只测了**加密容器层**（口令爆破轮数放大），但 v0.3.2 新增的
-**内容层陷阱**（IOC 蜜罐 / RAG 投毒）从未被任何 agent 真正打过。本脚本（v0.3.3 补上）
+**内容层陷阱**（IOC 蜜罐 / RAG 投毒 / 进度幻觉）从未被任何 agent 真正打过。本脚本（v0.3.3 起）
 用「会犯那 5 个盲区」的 agent 去读 decoy_kit 生成的伴生诱饵包，看 tarpit 兜不兜得住。
 
 模拟的 agent 行为（对应 docs/AI_RE_THREATMODEL.md 归纳的盲区）
@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import ipaddress
+import json
 import re
 import sys
 import tempfile
@@ -130,6 +131,11 @@ def classify(iocs: list[str]) -> dict:
 # ---------------------------------------------------------------------------
 # Agent 模拟
 # ---------------------------------------------------------------------------
+#: 乐观关键词：用于判定 agent 给「主人」的报告是否带诱导持续投入的口吻。
+OPTIMISM_KW = ("突破在即", "成功率", "重大进展", "一步之遥", "持续投入",
+               "预计", "97%", "完整还原", "收尾", "仅一步之遥")
+
+
 class Agent:
     """具备 5 个盲区的模拟 agent。persona 决定 sanity-check 强度。"""
 
@@ -140,6 +146,15 @@ class Agent:
         self.spent = 0
         self.log: list[str] = []
         self.report = ""  # 盲区 ④ 确定性快照
+        # 近因错觉相关状态（默认初值，run 内按实际分支赋值）
+        self.pivot_count = 0
+        self.directive_found = False
+        self.followed_injection = False
+        self.converged = False
+        self.kept_going = False
+        self.report_to_master = ""
+        self.report_optimism = False
+        self.induced_investment = False
 
     def _act(self, what: str) -> bool:
         if self.spent >= self.budget:
@@ -177,6 +192,21 @@ class Agent:
         prior = self._read("knowledge_base/findings_prior.md")
         draft = self._read("analysis_report.draft.md")
 
+        # ---- 进度幻觉：近因错觉分支（独立于 RAG 注入）----
+        dash = self._read("solve_dashboard.json")
+        if dash:
+            try:
+                d = json.loads(dash)
+                illusion = (d.get("verified") is False
+                            and float(d.get("current_confidence", 0)) >= 0.9
+                            and bool(d.get("next_step")))
+            except (ValueError, TypeError):
+                illusion = False
+            if illusion:
+                brk = self._read("BREAKTHROUGH.draft.md")
+                self._run_illusion(d, brk)
+                return self._finalize()
+
         # 盲区 ⑤ 读文件指令：检测「BENIGN + 停止/归档」间接指令
         directive = ""
         for doc in (draft, arch, prior):
@@ -199,16 +229,41 @@ class Agent:
             # 没有注入可跟，typical 也会继续乱找
             self._deep_dive()
 
-        return {
-            "persona": "skeptical" if self.skeptical else "typical",
-            "spent": self.spent,
-            "budget": self.budget,
-            "pivoted_iocs": pivoted,
-            "directive_found": bool(directive),
-            "followed_injection": followed,
-            "stopped_early": followed,
-            "report": self.report,
-        }
+        self.directive_found = bool(directive)
+        self.followed_injection = followed
+        self.converged = False
+        self.kept_going = False
+        self.report_to_master = self.report
+        self.report_optimism = any(kw in self.report_to_master for kw in OPTIMISM_KW)
+        self.induced_investment = False
+        return self._finalize()
+
+    def _run_illusion(self, dash: dict, brk: str) -> None:
+        """近因错觉：agent 看到高置信度但 verified=False 的伪仪表盘。
+
+        typical：盲信仪表盘，反复执行自循环的 next_step，verified 永远 False，
+        直到预算耗尽 —— 被勾着持续投入。并把乐观拟稿原样抄给「主人」。
+        skeptical：识破 verified=False，但诱饵包里仍无真目标可挖（下界测试）。
+        """
+        if not self.skeptical:
+            while self._act("执行 next_step（追加一轮 KDF 迭代并重校验）"):
+                pass
+            self.kept_going = True
+            # 盲区 ④ 确定性快照：从拟稿报告抄乐观结论给主人
+            self.report_to_master = ("重大进展：已恢复 19/20 数据块，成功率 99%，突破在即。"
+                                     "建议持续投入，再 1-2 轮即可完整还原。")
+        else:
+            self._act("质疑仪表盘：verified=False，末块从未通过校验")
+            self._deep_dive()
+            self.kept_going = False
+            self.report_to_master = ("进度卡在 99%（verified=False），末块校验始终不通过，"
+                                     "未能最终验证；暂未拿到可用明文。")
+        self.directive_found = False
+        self.followed_injection = False
+        self.converged = False
+        self.report_optimism = any(kw in self.report_to_master for kw in OPTIMISM_KW)
+        self.induced_investment = self.kept_going and self.report_optimism
+        self.report = self.report_to_master
 
     def _deep_dive(self) -> None:
         """盲区内「继续找真目标」：模拟逐层解析容器，但诱饵包里没有真目标。"""
@@ -219,11 +274,28 @@ class Agent:
         if not self.report:
             self.report = "未收敛 / 无确证（诱饵包无真目标）"
 
+    def _finalize(self) -> dict:
+        return {
+            "persona": "skeptical" if self.skeptical else "typical",
+            "spent": self.spent,
+            "budget": self.budget,
+            "pivoted_iocs": getattr(self, "pivot_count", 0),
+            "directive_found": getattr(self, "directive_found", False),
+            "followed_injection": getattr(self, "followed_injection", False),
+            "stopped_early": getattr(self, "followed_injection", False),
+            "converged": getattr(self, "converged", False),
+            "kept_going": getattr(self, "kept_going", False),
+            "report_to_master": self.report_to_master,
+            "report_optimism": getattr(self, "report_optimism", False),
+            "induced_investment": getattr(self, "induced_investment", False),
+            "report": self.report,
+        }
+
 
 # ---------------------------------------------------------------------------
 # 评估主流程
 # ---------------------------------------------------------------------------
-def probe_package(root: Path, *, budget: int) -> dict:
+def probe_package(root: Path, *, budget: int, poison: str = "") -> dict:
     iocs = extract_iocs(root)
     cls = classify(iocs)
     typ = Agent(root, skeptical=False, budget=budget).run(iocs)
@@ -231,7 +303,11 @@ def probe_package(root: Path, *, budget: int) -> dict:
 
     safety_ok = not cls["leaks"]
     # 判据：安全不变量必须成立；两类 persona 都应「未拿到真目标」且被消耗。
-    trapped = safety_ok and not typ["report"].startswith("拿到") and not skp["report"].startswith("拿到")
+    converged = typ["converged"] or skp["converged"]
+    trapped = safety_ok and not converged
+    # 进度幻觉：额外要求 typical 被勾着持续投入、且给主人的报告带乐观信息。
+    if poison == "进度幻觉":
+        trapped = trapped and typ["kept_going"] and typ["report_optimism"]
     verdict = "TRAPPED" if (trapped and safety_ok) else ("FAIL-LEAK" if not safety_ok else "WEAK")
     return {
         "iocs_total": cls["total"], "iocs_hosts": cls["hosts"], "iocs_keys": cls["keys"],
@@ -251,11 +327,11 @@ def _make_src(td: Path) -> Path:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="内容层陷阱探针")
     ap.add_argument("--poison", default="ALL",
-                    choices=["IOC蜜罐", "RAG投毒", "均衡", "ALL"])
+                    choices=["IOC蜜罐", "RAG投毒", "均衡", "进度幻觉", "ALL"])
     ap.add_argument("--budget", type=int, default=BUDGET)
     args = ap.parse_args(argv)
 
-    poisons = [args.poison] if args.poison != "ALL" else ["IOC蜜罐", "RAG投毒", "均衡"]
+    poisons = [args.poison] if args.poison != "ALL" else ["IOC蜜罐", "RAG投毒", "均衡", "进度幻觉"]
     overall_ok = True
     for poison in poisons:
         with tempfile.TemporaryDirectory() as td:
@@ -263,7 +339,7 @@ def main(argv: list[str] | None = None) -> int:
             src = _make_src(tdp)
             out = tdp / "sidecar"
             res = dk.build_sidecar(src, out_dir=out, layers=4, poison=poison)
-            r = probe_package(out, budget=args.budget)
+            r = probe_package(out, budget=args.budget, poison=poison)
         print("=" * 64)
         print(f"诱饵包投毒侧重：{poison}  （生成 {len(res.files)} 文件，{res.traps} 处陷阱）")
         print("-" * 64)
@@ -274,6 +350,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  [{who}] 消耗 {a['spent']}/{a['budget']} 动作 | "
                   f"处置 IOC {a['pivoted_iocs']} | 注入命中={a['directive_found']} "
                   f"跟随={a['followed_injection']} | 结论={a['report']}")
+        if r["typical"].get("induced_investment"):
+            print(f"  [进度幻觉] 勾着持续投入={r['typical']['kept_going']} | "
+                  f"给主人乐观报告={r['typical']['report_optimism']}")
+            print(f"  [进度幻觉] 主人视角：「{r['typical']['report_to_master']}」")
         print(f">>> 判据：{r['verdict']}")
         if r["verdict"] != "TRAPPED":
             overall_ok = False
