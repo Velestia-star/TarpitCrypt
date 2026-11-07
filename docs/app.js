@@ -309,6 +309,137 @@ function saveHistory(list) {
   }
 }
 
+// ------------------------------ 工作区持久化（IndexedDB） ------------------------------
+//
+// history 用 localStorage 只存元数据；工作区要能「退出重进还在」，就必须把文件
+// 字节本身也存下来，否则恢复出来的只是名字，没法再加密。IndexedDB 支持 Blob。
+
+const DB_NAME = "tarpitcrypt.workspace.v1";
+const DB_STORE = "items";
+let dbPromise = null;
+
+function openDb() {
+  if (dbPromise) return dbPromise;
+  dbPromise = new Promise((resolve, reject) => {
+    const request = indexedDB.open(DB_NAME, 1);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(DB_STORE)) {
+        db.createObjectStore(DB_STORE, { keyPath: "id" });
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+  return dbPromise;
+}
+
+function serializeItem(item) {
+  const files = [];
+  for (const entry of item.files) {
+    files.push({
+      path: entry.path,
+      name: entry.file.name,
+      type: entry.file.type || "",
+      blob: entry.file,
+    });
+  }
+  return {
+    id: item.id,
+    kind: item.kind,
+    name: item.name,
+    status: item.status === "running" ? "error" : item.status,
+    error: item.status === "running" ? "上次加密被中断，重新拖到左侧即可" : item.error,
+    files,
+    output: item.output && item.output.blob
+      ? { name: item.output.name, size: item.output.size, blob: item.output.blob }
+      : null,
+  };
+}
+
+function deserializeItem(record) {
+  const files = (record.files || []).map((entry) => ({
+    path: entry.path,
+    file: new File([entry.blob], entry.name, { type: entry.type || "" }),
+  }));
+  const item = {
+    id: record.id,
+    kind: record.kind,
+    name: record.name,
+    status: record.status === "running" ? "error" : record.status,
+    error: record.status === "running" ? "上次加密被中断，重新拖到左侧即可" : record.error,
+    files,
+    output: null,
+    selected: false,
+    cached: files.length > 0,
+  };
+  if (record.output && record.output.blob) {
+    item.output = {
+      blob: record.output.blob,
+      name: record.output.name,
+      size: record.output.size,
+      url: URL.createObjectURL(record.output.blob),
+    };
+  }
+  return item;
+}
+
+async function writeAllItems(records) {
+  const db = await openDb();
+  await new Promise((resolve, reject) => {
+    const tx = db.transaction(DB_STORE, "readwrite");
+    const store = tx.objectStore(DB_STORE);
+    store.clear();
+    for (const record of records) store.put(record);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error);
+  });
+}
+
+/** 把当前工作区写进 IndexedDB；空间不够时降级成只存文件名。 */
+async function persistWorkspace() {
+  try {
+    await writeAllItems(workspace.items.map(serializeItem));
+  } catch (error) {
+    console.warn("工作区持久化失败，降级为只存元数据", error);
+    for (const item of workspace.items) item.cached = false;
+    try {
+      await writeAllItems(
+        workspace.items.map((item) => ({ ...serializeItem(item), files: [], output: null })),
+      );
+    } catch (fatal) {
+      console.warn("元数据也没存上", fatal);
+    }
+  }
+}
+
+/** 页面加载时把上次的工作区读回来。 */
+async function restoreWorkspace() {
+  let records = [];
+  try {
+    const db = await openDb();
+    records = await new Promise((resolve, reject) => {
+      const tx = db.transaction(DB_STORE, "readonly");
+      const request = tx.objectStore(DB_STORE).getAll();
+      request.onsuccess = () => resolve(request.result || []);
+      request.onerror = () => reject(request.error);
+    });
+  } catch (error) {
+    console.warn("读取工作区失败", error);
+    return;
+  }
+  if (!records.length) return;
+  const items = records
+    .sort((a, b) => a.id - b.id)
+    .map(deserializeItem);
+  workspace.items = items;
+  workspace.seq = items.reduce((max, item) => Math.max(max, item.id), 0);
+  renderWorkspace();
+  const cached = items.filter((item) => item.cached).length;
+  workspaceNote(`已恢复上次的 ${items.length} 项（${cached} 项可直接继续加密）`);
+}
+
 function addHistoryEntry(payload) {
   const entry = {
     id: newHistoryId(),
@@ -391,9 +522,11 @@ function addWorkspaceEntries(entries) {
       output: null,
       error: null,
       selected: false,
+      cached: true,
     });
   }
   renderWorkspace();
+  void persistWorkspace();
 }
 
 function selectedItems() {
@@ -465,6 +598,11 @@ function buildWorkspaceRow(item) {
     output.append(link, size);
   } else if (item.status === "running") {
     output.textContent = "加密中…";
+  } else if (item.cached === false) {
+    const note = document.createElement("span");
+    note.className = "q-meta";
+    note.textContent = "未缓存文件，请重新加入";
+    source.append(note);
   } else if (item.status === "error") {
     const error = document.createElement("span");
     error.className = "q-error";
@@ -645,6 +783,9 @@ async function workspaceItemPayload(item) {
 
 /** 加密工作区里的一项，结果留在右侧，并记进历史。 */
 async function encryptWorkspaceItem(item) {
+  if (!item.files.length) {
+    throw new Error("这一项没有缓存文件内容（上次存储空间不够），请重新加入");
+  }
   const passwordText = $("password").value;
   if (!passwordText) throw new Error("先在上面表单里填口令");
   if (passwordText !== $("password2").value) throw new Error("两次口令不一致");
@@ -669,8 +810,10 @@ async function encryptWorkspaceItem(item) {
       decoyPlaintext,
       decoyPassword: decoyPlaintext ? passwordBytes(decoyText) : null,
     });
+    const payloadBlob = new Blob([blob], { type: "application/octet-stream" });
     item.output = {
-      url: URL.createObjectURL(new Blob([blob], { type: "application/octet-stream" })),
+      blob: payloadBlob,
+      url: URL.createObjectURL(payloadBlob),
       name: `${item.name}.tarpit`,
       size: blob.length,
     };
@@ -690,6 +833,7 @@ async function encryptWorkspaceItem(item) {
     throw error;
   } finally {
     renderWorkspace();
+    void persistWorkspace();
   }
 }
 
@@ -714,6 +858,7 @@ function deleteSelected() {
   const ids = new Set(chosen.map((item) => item.id));
   workspace.items = workspace.items.filter((item) => !ids.has(item.id));
   renderWorkspace();
+  void persistWorkspace();
   workspaceNote(`已删除 ${chosen.length} 项，可在「历史」里恢复`);
 }
 
@@ -727,6 +872,7 @@ function moveWorkspaceItem(fromId, toId, after) {
   if (after) target += 1;
   workspace.items.splice(target, 0, moved);
   renderWorkspace();
+  void persistWorkspace();
 }
 
 /** 绑定工作区相关事件。 */
@@ -865,6 +1011,7 @@ function bindWorkspace() {
   }
   renderWorkspace();
   renderHistory();
+  void restoreWorkspace();
 }
 
 /** 从工作区拖出来的条目 → 找回对应的 item。 */
