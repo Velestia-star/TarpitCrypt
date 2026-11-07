@@ -694,3 +694,88 @@ def test_armor_report_and_clear(web_base: str) -> None:
     with urllib.request.urlopen(f"{web_base}/api/armor/report", timeout=10) as response:
         cleared = json.load(response)
     assert cleared["attempts"] == []
+
+
+def test_armor_desktop_path_mode(
+    web_base: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """桌面壳专用路径模式：源、输出、容器都可直接走本机路径。"""
+    source = tmp_path / "hello.txt"
+    source.write_bytes(b"path mode payload")
+    out_dir = tmp_path / "out"
+    token = "test-path-token"
+    monkeypatch.setattr(ts, "_ALLOW_PATHS", True)
+    monkeypatch.setattr(ts, "_PATH_TOKEN", token)
+    headers = {"X-Tarpit-Path-Token": token}
+
+    content_type, body = build_multipart(
+        {
+            "password": "ArmorPass1!",
+            "layers": "2",
+            "sidecar": "0",
+            "source_path": str(source),
+            "out_dir": str(out_dir),
+        },
+        [],
+    )
+    status, _, payload = _post(
+        f"{web_base}/api/armor/pack", content_type, body, extra=headers
+    )
+    assert status == HTTPStatus.ACCEPTED
+    job = _wait_armor_job(web_base, json.loads(payload)["job"])
+    assert job["status"] == "done", job
+    saved = Path(job["result"]["savedPath"])
+    assert saved.parent == out_dir.resolve()
+    assert source.read_bytes() == b"path mode payload"
+
+    content_type, body = build_multipart({"path": str(saved)}, [])
+    status, _, payload = _post(
+        f"{web_base}/api/armor/inspect", content_type, body, extra=headers
+    )
+    assert status == HTTPStatus.OK
+    assert json.loads(payload)["layers"] == 2
+
+    content_type, body = build_multipart(
+        {"password": "ArmorPass1!", "container_path": str(saved)},
+        [],
+    )
+    status, _, payload = _post(
+        f"{web_base}/api/armor/restore", content_type, body, extra=headers
+    )
+    assert status == HTTPStatus.ACCEPTED
+    job = _wait_armor_job(web_base, json.loads(payload)["job"])
+    assert job["status"] == "done", job
+    restored = Path(job["result"]["savedPath"])
+    with zipfile.ZipFile(io.BytesIO(restored.read_bytes())) as archive:
+        assert archive.read("hello.txt") == b"path mode payload"
+
+    # 没有令牌时，路径模式必须拒绝。
+    content_type, body = build_multipart(
+        {"password": "ArmorPass1!", "source_path": str(source)}, []
+    )
+    status, _, payload = _post(f"{web_base}/api/armor/pack", content_type, body)
+    assert status == HTTPStatus.BAD_REQUEST
+    assert "令牌" in json.loads(payload)["error"]
+
+
+def test_desktop_server_starts_with_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """桌面壳启动的服务要带路径令牌，普通浏览器入口仍然可读。"""
+    import desktop_web
+
+    old = (ts._OUT_DIR, ts._ALLOW_PATHS, ts._PATH_TOKEN)
+    try:
+        server, url, token = desktop_web.start_local_server(tmp_path / "out")
+        try:
+            assert token
+            with urllib.request.urlopen(url, timeout=10) as response:
+                html = response.read().decode("utf-8")
+            assert "TARPIT_LOCAL = true" in html
+            assert "TARPIT_PATH_TOKEN" in html
+            assert token in html
+        finally:
+            server.shutdown()
+            server.server_close()
+    finally:
+        ts._OUT_DIR, ts._ALLOW_PATHS, ts._PATH_TOKEN = old

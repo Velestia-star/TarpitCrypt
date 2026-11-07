@@ -16,6 +16,10 @@ let armorRestoreFile = null;
 let armorKitPicked = [];
 let armorKitArmored = null;
 let armorReportData = null;
+let armorSourcePath = "";
+let armorKitSourcePath = "";
+let armorRestorePath = "";
+let armorOutDir = "";
 
 function formatSize(bytes) {
   if (bytes > 1048576) return `${(bytes / 1048576).toFixed(1)} MB`;
@@ -35,6 +39,11 @@ function setBar(wrap, bar, value) {
 
 function errorText(data, status) {
   return (data && data.error) || `HTTP ${status}`;
+}
+
+function pathHeaders() {
+  const token = globalThis.TARPIT_PATH_TOKEN;
+  return token ? { "X-Tarpit-Path-Token": token } : {};
 }
 
 function logArmor(message, prefix = "") {
@@ -110,7 +119,7 @@ function renderPicked(entries, target) {
 
 function bindDrop(drop, pick, pickDir, setter, list) {
   drop.addEventListener("click", (event) => {
-    if (!event.target.closest("label")) pick.click();
+    if (!event.target.closest("label") && !event.target.closest("button")) pick.click();
   });
   pick.addEventListener("change", (event) => {
     setter([...event.target.files].map((file) => ({ file, path: file.name })));
@@ -180,7 +189,7 @@ function bindPickDrop() {
   const restoreDrop = $("armorRestoreDrop");
   const restorePick = $("armorRestorePick");
   restoreDrop.addEventListener("click", (event) => {
-    if (!event.target.closest("label")) restorePick.click();
+    if (!event.target.closest("label") && !event.target.closest("button")) restorePick.click();
   });
   restorePick.addEventListener("change", (event) => {
     armorRestoreFile = event.target.files[0] || null;
@@ -220,6 +229,76 @@ function bindPickDrop() {
     renderPicked(armorKitPicked, $("armorKitFiles"));
     setStatus($("armorKitStatus"), `已复用加固页的 ${armorPicked.length} 个文件`, "ok");
   });
+
+  const clearPackPath = () => {
+    armorSourcePath = "";
+    $("armorSourcePathLabel").hidden = true;
+  };
+  $("armorPickFiles").addEventListener("change", clearPackPath);
+  $("armorPickDir").addEventListener("change", clearPackPath);
+  $("armorDrop").addEventListener("drop", clearPackPath);
+
+  const clearKitPath = () => {
+    armorKitSourcePath = "";
+    $("armorKitSourcePathLabel").hidden = true;
+  };
+  $("armorKitPickFiles").addEventListener("change", clearKitPath);
+  $("armorKitPickDir").addEventListener("change", clearKitPath);
+  $("armorKitDrop").addEventListener("drop", clearKitPath);
+
+  const clearRestorePath = () => {
+    armorRestorePath = "";
+    $("armorRestorePathLabel").hidden = true;
+  };
+  $("armorRestorePick").addEventListener("change", clearRestorePath);
+  $("armorRestoreDrop").addEventListener("drop", clearRestorePath);
+}
+
+function setNativePath(labelId, path) {
+  const label = $(labelId);
+  if (!label) return;
+  label.hidden = false;
+  label.textContent = path;
+}
+
+async function pickNativePath(method, setter, labelId) {
+  const api = globalThis.pywebview?.api;
+  if (!api || typeof api[method] !== "function") return;
+  try {
+    const path = await api[method]();
+    if (!path) return;
+    setter(path);
+    setNativePath(labelId, path);
+    logArmor(`已选择本机路径：${path}`, "[桌面]");
+  } catch (error) {
+    logArmor(`原生选择失败：${error.message}`, "[桌面]");
+  }
+}
+
+function setupDesktop() {
+  const api = globalThis.pywebview?.api;
+  if (!api) return;
+  document.querySelectorAll(".desktop-only").forEach((element) => {
+    element.hidden = false;
+  });
+  if (setupDesktop.done) return;
+  setupDesktop.done = true;
+
+  $("armorPickFilePath").addEventListener("click", () =>
+    pickNativePath("pick_file", (path) => { armorSourcePath = path; }, "armorSourcePathLabel"));
+  $("armorPickFolderPath").addEventListener("click", () =>
+    pickNativePath("pick_folder", (path) => { armorSourcePath = path; }, "armorSourcePathLabel"));
+  $("armorKitPickFilePath").addEventListener("click", () =>
+    pickNativePath("pick_file", (path) => { armorKitSourcePath = path; }, "armorKitSourcePathLabel"));
+  $("armorKitPickFolderPath").addEventListener("click", () =>
+    pickNativePath("pick_folder", (path) => { armorKitSourcePath = path; }, "armorKitSourcePathLabel"));
+  $("armorPickContainerPath").addEventListener("click", () =>
+    pickNativePath("pick_armored", (path) => {
+      armorRestorePath = path;
+      $("armorRestoreName").textContent = path;
+    }, "armorRestorePathLabel"));
+  $("armorPickOutDir").addEventListener("click", () =>
+    pickNativePath("pick_output_dir", (path) => { armorOutDir = path; }, "armorOutDirLabel"));
 }
 
 function fillSelect(element, values, selected) {
@@ -272,8 +351,16 @@ function outSubdir(form) {
   if (value) form.append("out_subdir", value);
 }
 
-async function submitJob(url, form, prefix) {
-  const response = await fetch(url, { method: "POST", body: form });
+function appendOutput(form) {
+  if (armorOutDir) {
+    form.append("out_dir", armorOutDir);
+  } else {
+    outSubdir(form);
+  }
+}
+
+async function submitJob(url, form, prefix, headers = undefined) {
+  const response = await fetch(url, { method: "POST", body: form, headers });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(errorText(data, response.status));
   logArmor(`任务已提交：${data.job}`, prefix);
@@ -350,7 +437,9 @@ async function runPack() {
   const password = $("armorPassword").value;
   const again = $("armorPassword2").value;
 
-  if (!armorPicked.length) return setStatus(status, "先拖入或选择程序包", "bad");
+  if (!armorPicked.length && !armorSourcePath) {
+    return setStatus(status, "先拖入或选择程序包", "bad");
+  }
   if (!password) return setStatus(status, "口令不能为空", "bad");
   if (password !== again) return setStatus(status, "两次口令不一致", "bad");
   const strength = checkPasswordStrength(password);
@@ -366,7 +455,10 @@ async function runPack() {
   setStatus(status, "正在提交加固任务…");
   $("armorBarWrap").hidden = false;
   $("armorBar").style.width = "0%";
-  logArmor(`提交加固：${armorPicked.length} 个文件 / ${layers} 层`, "[加固]");
+  logArmor(
+    `提交加固：${armorSourcePath || `${armorPicked.length} 个文件`} / ${layers} 层`,
+    "[加固]",
+  );
 
   try {
     const form = new FormData();
@@ -377,10 +469,17 @@ async function runPack() {
     form.append("style", $("armorStyle").value);
     form.append("injection", $("armorInjection").value);
     form.append("sidecar", $("armorSidecar").checked ? "1" : "0");
-    outSubdir(form);
-    for (const { file, path } of armorPicked) form.append("files", file, path);
+    appendOutput(form);
+    if (armorSourcePath) {
+      form.append("source_path", armorSourcePath);
+    } else {
+      for (const { file, path } of armorPicked) form.append("files", file, path);
+    }
+    const usePath = Boolean(armorSourcePath || armorOutDir);
 
-    const jobId = await submitJob("/api/armor/pack", form, "[加固]");
+    const jobId = await submitJob(
+      "/api/armor/pack", form, "[加固]", usePath ? pathHeaders() : undefined,
+    );
     const job = await pollJob(
       jobId, status, $("armorBarWrap"), $("armorBar"), "[加固]",
     );
@@ -418,7 +517,9 @@ async function runRestore() {
   const button = $("armorRestoreGo");
   const password = $("armorRestorePassword").value;
 
-  if (!armorRestoreFile) return setStatus(status, "先选择 .armored 文件", "bad");
+  if (!armorRestoreFile && !armorRestorePath) {
+    return setStatus(status, "先选择 .armored 文件", "bad");
+  }
   if (!password) return setStatus(status, "口令不能为空", "bad");
 
   button.disabled = true;
@@ -428,7 +529,7 @@ async function runRestore() {
   $("armorRestoreBarWrap").hidden = false;
   $("armorRestoreBar").style.width = "0%";
   logArmor(
-    `提交还原：${armorRestoreFile.name}${$("armorParallel").checked ? " / 并行" : ""}`,
+    `提交还原：${armorRestorePath || armorRestoreFile.name}${$("armorParallel").checked ? " / 并行" : ""}`,
     "[还原]",
   );
 
@@ -436,9 +537,16 @@ async function runRestore() {
     const form = new FormData();
     form.append("password", password);
     form.append("parallel", $("armorParallel").checked ? "1" : "0");
-    outSubdir(form);
-    form.append("files", armorRestoreFile, armorRestoreFile.name);
-    const jobId = await submitJob("/api/armor/restore", form, "[还原]");
+    appendOutput(form);
+    if (armorRestorePath) {
+      form.append("container_path", armorRestorePath);
+    } else {
+      form.append("files", armorRestoreFile, armorRestoreFile.name);
+    }
+    const usePath = Boolean(armorRestorePath || armorOutDir);
+    const jobId = await submitJob(
+      "/api/armor/restore", form, "[还原]", usePath ? pathHeaders() : undefined,
+    );
     const job = await pollJob(
       jobId, status, $("armorRestoreBarWrap"), $("armorRestoreBar"), "[还原]",
     );
@@ -464,11 +572,21 @@ async function runRestore() {
 async function runInspect() {
   const status = $("armorRestoreStatus");
   const infoBox = $("armorInspectInfo");
-  if (!armorRestoreFile) return setStatus(status, "先选择 .armored 文件", "bad");
+  if (!armorRestoreFile && !armorRestorePath) {
+    return setStatus(status, "先选择 .armored 文件", "bad");
+  }
   try {
     const form = new FormData();
-    form.append("files", armorRestoreFile, armorRestoreFile.name);
-    const response = await fetch("/api/armor/inspect", { method: "POST", body: form });
+    if (armorRestorePath) {
+      form.append("path", armorRestorePath);
+    } else {
+      form.append("files", armorRestoreFile, armorRestoreFile.name);
+    }
+    const response = await fetch("/api/armor/inspect", {
+      method: "POST",
+      body: form,
+      headers: armorRestorePath ? pathHeaders() : undefined,
+    });
     const data = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(errorText(data, response.status));
     infoBox.hidden = false;
@@ -493,7 +611,9 @@ async function runKit() {
   const status = $("armorKitStatus");
   const result = $("armorKitResult");
   const button = $("armorKitGo");
-  if (!armorKitPicked.length) return setStatus(status, "先拖入或选择源程序包", "bad");
+  if (!armorKitPicked.length && !armorKitSourcePath) {
+    return setStatus(status, "先拖入或选择源程序包", "bad");
+  }
   const layers = Number($("armorKitLayers").value);
   if (!Number.isInteger(layers) || layers < 2 || layers > 8) {
     return setStatus(status, "层数必须是 2~8 的整数", "bad");
@@ -505,7 +625,10 @@ async function runKit() {
   setStatus(status, "正在提交伴生任务…");
   $("armorKitBarWrap").hidden = false;
   $("armorKitBar").style.width = "0%";
-  logArmor(`提交伴生：${armorKitPicked.length} 个文件 / ${layers} 层`, "[伴生]");
+  logArmor(
+    `提交伴生：${armorKitSourcePath || `${armorKitPicked.length} 个文件`} / ${layers} 层`,
+    "[伴生]",
+  );
 
   try {
     const form = new FormData();
@@ -513,11 +636,18 @@ async function runKit() {
     form.append("style", $("armorKitStyle").value);
     form.append("poison", $("armorKitPoison").value);
     form.append("injection", $("armorKitInjection").value);
-    outSubdir(form);
-    for (const { file, path } of armorKitPicked) form.append("files", file, path);
+    appendOutput(form);
+    if (armorKitSourcePath) {
+      form.append("source_path", armorKitSourcePath);
+    } else {
+      for (const { file, path } of armorKitPicked) form.append("files", file, path);
+    }
     if (armorKitArmored) form.append("armored", armorKitArmored, armorKitArmored.name);
+    const usePath = Boolean(armorKitSourcePath || armorOutDir);
 
-    const jobId = await submitJob("/api/armor/sidecar", form, "[伴生]");
+    const jobId = await submitJob(
+      "/api/armor/sidecar", form, "[伴生]", usePath ? pathHeaders() : undefined,
+    );
     const job = await pollJob(
       jobId, status, $("armorKitBarWrap"), $("armorKitBar"), "[伴生]",
     );
@@ -740,4 +870,6 @@ async function init() {
 
 if (LOCAL && typeof document !== "undefined") {
   init();
+  window.addEventListener("pywebviewready", setupDesktop);
+  if (globalThis.pywebview?.api) setupDesktop();
 }

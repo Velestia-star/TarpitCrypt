@@ -236,6 +236,30 @@ python tarpitcrypt_server.py
 | `POST` | `/api/armor/report/clear` | 清空本次会话报告 |
 | `GET` | `/api/artifacts/<token>` | 按令牌下载登记过的产出物 |
 
+## 桌面 WebView 壳（P5，可选）
+
+不想开浏览器、又想要 Web 的界面，可以装一个可选的桌面壳：
+
+```bash
+python -m pip install -r requirements-desktop.txt
+python desktop_web.py
+# 或者双击 启动桌面版.cmd
+```
+
+它用 pywebview/WebView2 打开同一个 `docs/` 页面，但套在原生窗口里：
+
+- 不显示浏览器地址栏；本地服务只监听 `127.0.0.1` 的随机端口。
+- 页面里多出「本机文件 / 本机文件夹 / 本机输出目录」按钮，直接调系统
+  文件对话框，不再经过浏览器上传。
+- 桌面壳使用随机令牌开启「本机路径模式」；普通 `tarpitcrypt_server.py`
+  永远不开启，仍然只允许往 `存放文件/` 写。
+- 原生对话框选中的路径可以用于加固、伴生、还原和摘要；输出目录也可以
+  直接选任意本地目录。
+- 没有装 pywebview 时会明确提示；原来的 `python armor/armor_gui.py`
+  仍然保留，作为不依赖浏览器的 fallback。
+
+目前 P5 还是桌面壳形态，尚未做单文件 exe 打包。
+
 ---
 
 ## 单次猜测到底有多贵（本机实测）

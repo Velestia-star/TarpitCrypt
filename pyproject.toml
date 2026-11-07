@@ -16,6 +16,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "ruff>=0.6"]
+desktop = ["pywebview>=6.0"]
 
 [project.urls]
 Homepage = "https://Velestia-star.github.io/TarpitCrypt/"
@@ -26,9 +27,10 @@ Issues = "https://github.com/Velestia-star/TarpitCrypt/issues"
 [project.scripts]
 tarpitcrypt = "tarpitcrypt:main"
 tarpitcrypt-web = "tarpitcrypt_server:main"
+tarpitcrypt-desktop = "desktop_web:main"
 
 [tool.setuptools]
-py-modules = ["tarpitcrypt", "tarpitcrypt_server"]
+py-modules = ["tarpitcrypt", "tarpitcrypt_server", "desktop_web"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

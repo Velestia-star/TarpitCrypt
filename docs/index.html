@@ -104,6 +104,10 @@
     <div class="grid armor-common">
       <label>输出子目录 <input id="armorOutSubdir" placeholder="可选，例如 2026-11-08"></label>
     </div>
+    <div class="armor-actions">
+      <button class="armor-link desktop-only" id="armorPickOutDir" type="button" hidden>选择本机输出目录</button>
+      <span class="hint armor-path" id="armorOutDirLabel" hidden></span>
+    </div>
     <pre class="armor-log" id="armorLog" aria-live="polite"></pre>
 
     <div id="armorPackPane">
@@ -112,8 +116,10 @@
         <p class="hint">
           或 <label class="link">选择文件<input type="file" id="armorPickFiles" multiple hidden></label>
           · <label class="link">选择文件夹<input type="file" id="armorPickDir" webkitdirectory multiple hidden></label>
+          <span class="desktop-only" hidden>· <button class="armor-link" id="armorPickFilePath" type="button">本机文件</button> · <button class="armor-link" id="armorPickFolderPath" type="button">本机文件夹</button></span>
         </p>
         <p class="hint">单文件会还原成文件；多文件 / 文件夹会还原成目录。</p>
+        <p class="hint armor-path desktop-only" id="armorSourcePathLabel" hidden></p>
       </div>
       <ul class="files" id="armorFiles"></ul>
       <div class="grid">
@@ -136,8 +142,11 @@
     <div id="armorRestorePane" hidden>
       <div class="drop" id="armorRestoreDrop">
         <p><strong>把 .armored 容器拖到这里</strong></p>
-        <p class="hint">或 <label class="link">选择文件<input type="file" id="armorRestorePick" accept=".armored" hidden></label></p>
+        <p class="hint">或 <label class="link">选择文件<input type="file" id="armorRestorePick" accept=".armored" hidden></label>
+          <span class="desktop-only" hidden>· <button class="armor-link" id="armorPickContainerPath" type="button">本机 .armored</button></span>
+        </p>
         <p class="hint" id="armorRestoreName">还没有选择文件</p>
+        <p class="hint armor-path desktop-only" id="armorRestorePathLabel" hidden></p>
       </div>
       <div class="grid">
         <label>口令 <input type="password" id="armorRestorePassword" autocomplete="current-password"></label>
@@ -159,8 +168,10 @@
         <p class="hint">
           或 <label class="link">选择文件<input type="file" id="armorKitPickFiles" multiple hidden></label>
           · <label class="link">选择文件夹<input type="file" id="armorKitPickDir" webkitdirectory multiple hidden></label>
+          <span class="desktop-only" hidden>· <button class="armor-link" id="armorKitPickFilePath" type="button">本机文件</button> · <button class="armor-link" id="armorKitPickFolderPath" type="button">本机文件夹</button></span>
         </p>
         <p class="hint">伴生目录会生成在输出目录下，原程序一个字节都不改。</p>
+        <p class="hint armor-path desktop-only" id="armorKitSourcePathLabel" hidden></p>
       </div>
       <ul class="files" id="armorKitFiles"></ul>
       <div class="grid">

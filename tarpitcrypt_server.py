@@ -68,6 +68,10 @@ _CRYPTO_LOCK: Final[threading.Lock] = threading.Lock()
 #: 加密/解密的结果会顺手存一份到磁盘，默认放在项目目录下的 `存放文件/`。
 #: 用 __file__ 定位，换到哪个工作目录启动都指向项目里。
 _OUT_DIR: Path = Path(__file__).resolve().parent / "存放文件"
+#: P5 桌面壳专用：允许 Web 端直接传本机路径 / 输出目录。普通本地 Web
+#: 永远保持 False；只有 desktop_web.py 启动时打开，并配合随机令牌。
+_ALLOW_PATHS: bool = False
+_PATH_TOKEN: str | None = None
 
 #: 只有服务端自己登记过的产出物才允许被打开。令牌随机，客户端猜不到。
 _ARTIFACTS: dict[str, Path] = {}
@@ -302,6 +306,43 @@ def _resolve_out_subdir(raw: str | None) -> Path:
     return target
 
 
+def _require_path_mode() -> None:
+    if not _ALLOW_PATHS:
+        raise ValueError("本机路径模式未启用")
+
+
+def _local_source_path(raw: str) -> Path:
+    _require_path_mode()
+    text = (raw or "").strip()
+    if not text:
+        raise ValueError("没有选择本机源路径")
+    path = Path(text).expanduser().resolve()
+    if not path.is_file() and not path.is_dir():
+        raise ValueError(f"源路径不存在：{path}")
+    return path
+
+
+def _local_file_path(raw: str) -> Path:
+    _require_path_mode()
+    text = (raw or "").strip()
+    if not text:
+        raise ValueError("没有选择本机文件")
+    path = Path(text).expanduser().resolve()
+    if not path.is_file():
+        raise ValueError(f"文件不存在：{path}")
+    return path
+
+
+def _local_out_dir(raw: str) -> Path:
+    _require_path_mode()
+    text = (raw or "").strip()
+    if not text:
+        raise ValueError("没有选择输出目录")
+    path = Path(text).expanduser().resolve()
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def _zip_directory(directory: Path) -> bytes:
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
@@ -380,9 +421,14 @@ def _run_armor_pack(job: dict[str, Any]) -> dict[str, Any]:
     payload = job["_payload"]
     out_dir = payload.get("out_dir") or _OUT_DIR
     started = time.perf_counter()
-    work = Path(tempfile.mkdtemp(prefix="src-", dir=_armor_tmp_root()))
-    try:
+    work: Path | None = None
+    if payload.get("source_path"):
+        src = Path(payload["source_path"])
+        display = src.name
+    else:
+        work = Path(tempfile.mkdtemp(prefix="src-", dir=_armor_tmp_root()))
         src, display = _materialize_source(work, payload["files"])
+    try:
         try:
             armored = armor_core.build_armored(
                 src,
@@ -444,7 +490,8 @@ def _run_armor_pack(job: dict[str, Any]) -> dict[str, Any]:
                 result["sidecarError"] = str(exc)
         return result
     finally:
-        shutil.rmtree(work, ignore_errors=True)
+        if work is not None:
+            shutil.rmtree(work, ignore_errors=True)
 
 
 def _run_armor_restore(job: dict[str, Any]) -> dict[str, Any]:
@@ -522,11 +569,20 @@ def _run_armor_sidecar(job: dict[str, Any]) -> dict[str, Any]:
     payload = job["_payload"]
     out_dir = payload.get("out_dir") or _OUT_DIR
     started = time.perf_counter()
-    work = Path(tempfile.mkdtemp(prefix="kit-", dir=_armor_tmp_root()))
-    try:
+    work: Path | None = None
+    if payload.get("source_path"):
+        src = Path(payload["source_path"])
+        display = src.name
+    else:
+        work = Path(tempfile.mkdtemp(prefix="kit-", dir=_armor_tmp_root()))
         src, display = _materialize_source(work, payload["files"])
+    try:
         container = None
-        if payload.get("container"):
+        if payload.get("container_path"):
+            container = Path(payload["container_path"])
+        elif payload.get("container"):
+            if work is None:
+                work = Path(tempfile.mkdtemp(prefix="kit-", dir=_armor_tmp_root()))
             container = work / "container.armored"
             container.write_bytes(payload["container"])
 
@@ -574,7 +630,8 @@ def _run_armor_sidecar(job: dict[str, Any]) -> dict[str, Any]:
             "traps": kit.traps,
         }
     finally:
-        shutil.rmtree(work, ignore_errors=True)
+        if work is not None:
+            shutil.rmtree(work, ignore_errors=True)
 
 
 def open_in_file_manager(path: Path) -> None:
@@ -847,9 +904,13 @@ class TarpitRequestHandler(BaseHTTPRequestHandler):
             except OSError:
                 self._fail(HTTPStatus.INTERNAL_SERVER_ERROR, "找不到 docs/index.html")
                 return
+            injection = "<script>window.TARPIT_LOCAL = true;"
+            if _PATH_TOKEN:
+                injection += f' window.TARPIT_PATH_TOKEN = "{_PATH_TOKEN}";'
+            injection += "</script>"
             html = html.replace(
                 "</head>",
-                "<script>window.TARPIT_LOCAL = true;</script>\n</head>",
+                injection + "\n</head>",
                 1,
             )
             self._send_bytes(HTTPStatus.OK, html.encode("utf-8"), "text/html; charset=utf-8")
@@ -1109,15 +1170,22 @@ class TarpitRequestHandler(BaseHTTPRequestHandler):
         password_raw = fields.get("password", "")
         if not password_raw:
             raise ValueError("口令不能为空")
-        data_files = [
-            (name, filename, data)
-            for name, filename, data in files
-            if name == "files"
-        ]
-        if not data_files:
-            raise ValueError("没有收到任何文件")
+        source_raw = (fields.get("source_path") or "").strip()
+        if source_raw:
+            self._require_path_token()
+            source_path: Path | None = _local_source_path(source_raw)
+            data_files: list[tuple[str, str, bytes]] = []
+        else:
+            source_path = None
+            data_files = [
+                (name, filename, data)
+                for name, filename, data in files
+                if name == "files"
+            ]
+            if not data_files:
+                raise ValueError("没有收到任何文件")
 
-        out_dir = _resolve_out_subdir(fields.get("out_subdir"))
+        out_dir = self._armor_out_dir(fields)
         strong, hint = armor_core.check_password_strength(password_raw)
         if not strong:
             raise ValueError(f"口令偏弱：{hint}")
@@ -1146,6 +1214,7 @@ class TarpitRequestHandler(BaseHTTPRequestHandler):
         job = _new_armor_job(
             "pack",
             files=data_files,
+            source_path=source_path,
             password=normalize_password(password_raw),
             layers=layers,
             profile=profile,
@@ -1164,18 +1233,25 @@ class TarpitRequestHandler(BaseHTTPRequestHandler):
         password_raw = fields.get("password", "")
         if not password_raw:
             raise ValueError("口令不能为空")
-        armored = self._pick_file(files, "files") or self._pick_file(files, "armored")
-        if armored is None:
-            raise ValueError("没有收到 .armored 文件")
-        name = next(
-            (
-                filename
-                for field, filename, _data in files
-                if field in ("files", "armored")
-            ),
-            "restore.armored",
-        )
-        out_dir = _resolve_out_subdir(fields.get("out_subdir"))
+        container_raw = (fields.get("container_path") or "").strip()
+        if container_raw:
+            self._require_path_token()
+            container_path = _local_file_path(container_raw)
+            armored = container_path.read_bytes()
+            name = container_path.name
+        else:
+            armored = self._pick_file(files, "files") or self._pick_file(files, "armored")
+            if armored is None:
+                raise ValueError("没有收到 .armored 文件")
+            name = next(
+                (
+                    filename
+                    for field, filename, _data in files
+                    if field in ("files", "armored")
+                ),
+                "restore.armored",
+            )
+        out_dir = self._armor_out_dir(fields)
         parallel = fields.get("parallel", "0").lower() in ("1", "true", "yes", "on")
         job = _new_armor_job(
             "restore",
@@ -1192,13 +1268,20 @@ class TarpitRequestHandler(BaseHTTPRequestHandler):
     ) -> None:
         """独立生成伴生诱饵包；不需要口令，也不需要先加固。"""
         _armor_core, decoy_kit = _armor_modules()
-        data_files = [
-            (name, filename, data)
-            for name, filename, data in files
-            if name == "files"
-        ]
-        if not data_files:
-            raise ValueError("没有收到源程序包")
+        source_raw = (fields.get("source_path") or "").strip()
+        if source_raw:
+            self._require_path_token()
+            source_path: Path | None = _local_source_path(source_raw)
+            data_files: list[tuple[str, str, bytes]] = []
+        else:
+            source_path = None
+            data_files = [
+                (name, filename, data)
+                for name, filename, data in files
+                if name == "files"
+            ]
+            if not data_files:
+                raise ValueError("没有收到源程序包")
         try:
             layers = int(fields.get("layers", "4"))
         except ValueError:
@@ -1215,11 +1298,18 @@ class TarpitRequestHandler(BaseHTTPRequestHandler):
         if injection not in decoy_kit.INJECTION_LEVELS:
             raise ValueError(f"未知注入强度：{injection}")
         container = self._pick_file(files, "armored") or self._pick_file(files, "container")
-        out_dir = _resolve_out_subdir(fields.get("out_subdir"))
+        container_path = None
+        container_raw = (fields.get("container_path") or "").strip()
+        if container_raw:
+            self._require_path_token()
+            container_path = _local_file_path(container_raw)
+        out_dir = self._armor_out_dir(fields)
         job = _new_armor_job(
             "sidecar",
             files=data_files,
+            source_path=source_path,
             container=container,
+            container_path=container_path,
             layers=layers,
             style=style,
             poison=poison,
@@ -1233,7 +1323,12 @@ class TarpitRequestHandler(BaseHTTPRequestHandler):
     ) -> None:
         """只读容器摘要，不需要口令。"""
         armor_core, _decoy_kit = _armor_modules()
-        blob = self._pick_file(files, "files") or self._pick_file(files, "armored")
+        path_raw = (fields.get("path") or "").strip()
+        if path_raw:
+            self._require_path_token()
+            blob = _local_file_path(path_raw).read_bytes()
+        else:
+            blob = self._pick_file(files, "files") or self._pick_file(files, "armored")
         if blob is None:
             raise ValueError("没有收到 .armored 文件")
         info = armor_core.inspect_armored(blob)
@@ -1271,6 +1366,19 @@ class TarpitRequestHandler(BaseHTTPRequestHandler):
             self._fail(HTTPStatus.INTERNAL_SERVER_ERROR, f"打不开文件管理器：{exc}")
             return
         self._send_json(HTTPStatus.OK, {"ok": True, "path": str(path)})
+
+    def _require_path_token(self) -> None:
+        if _PATH_TOKEN is None:
+            return
+        if self.headers.get("X-Tarpit-Path-Token") != _PATH_TOKEN:
+            raise ValueError("本机路径模式令牌无效")
+
+    def _armor_out_dir(self, fields: dict[str, str]) -> Path:
+        raw = (fields.get("out_dir") or "").strip()
+        if raw:
+            self._require_path_token()
+            return _local_out_dir(raw)
+        return _resolve_out_subdir(fields.get("out_subdir"))
 
     @staticmethod
     def _pick_file(files: list[tuple[str, str, bytes]], field: str) -> bytes | None:

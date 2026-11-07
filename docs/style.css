@@ -801,3 +801,5 @@ body.drawer-open { overflow: hidden; }
 .armor-report-list tr:last-child td { border-bottom: 0; }
 .armor-report-list .ok { color: var(--ok, #57b87b); }
 .armor-report-list .bad { color: var(--bad, #e06c75); }
+
+.armor-path { word-break: break-all; }
