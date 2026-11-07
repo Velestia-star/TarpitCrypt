@@ -66,7 +66,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-from armor_core import armor_passwords, noise_password, read_note
+from armor_core import revealed_debug_passwords, noise_password, read_note
 
 __all__ = [
     "STYLES", "POISON_PROFILES", "DEFAULT_POISON", "SidecarError",
@@ -1844,7 +1844,7 @@ def build_sidecar(
             note = read_note(blob).decode("utf-8", "replace")
             # v3 起口令只属于这一个容器：伴生包与容器共用同一份线索，
             # 源码里没有任何可跨容器复用的口令常量。
-            leaked, noise = armor_passwords(blob), noise_password(blob)
+            leaked, noise = revealed_debug_passwords(blob), noise_password(blob)
         except Exception:
             note = None  # 容器尚未生成或格式不符时，照样能出伴生包
 

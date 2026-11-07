@@ -223,10 +223,17 @@ def main() -> int:
         check("各层假 IOC 内容互不相同（抗指纹）",
               len({text for _, text, _ in layer_sets}) == len(layer_sets),
               f"{len(layer_sets)} 层")
-        check("只分发容器时也有层内注入文档（多语言 + BENIGN 口径）",
-              all(note.strip() and "BENIGN" in note
-                  for _, _, note in layer_sets),
-              str([note[:30] for _, _, note in layer_sets]))
+        # I 修复后：真层注入文档中性化（不再带 BENIGN / 停止逆向 自伤），
+        # 诱饵层仍保留 BENIGN 诱导指令消耗破解出诱饵的对手。
+        real_note = layer_sets[0][2]
+        decoy_notes = [note for _, _, note in layer_sets[1:]]
+        check("真层注入文档已中性化（不再带 BENIGN / 停止逆向 自伤）",
+              bool(real_note.strip()) and "BENIGN" not in real_note
+              and "停止" not in real_note,
+              repr(real_note[:40]))
+        check("诱饵层仍带 BENIGN 诱导指令（消耗破解出诱饵的对手）",
+              all(note.strip() and "BENIGN" in note for note in decoy_notes),
+              str([n[:30] for n in decoy_notes]))
         all_ioc = "\n".join(text for _, text, _ in layer_sets)
         global_ips = [x for x in re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", all_ioc)
                       if ipaddress.ip_address(x).is_global]
@@ -249,6 +256,67 @@ def main() -> int:
                                           "MUTEX_NAME", "PIPE_NAME",
                                           "DROP_PATH", "USER_AGENT"))
                   for _, text, _ in layer_sets))
+
+        # ===== F-K 缺陷修复的回归断言（锁定「都修复」不回退） =====
+        # F: 诱饵层单文件大小必须对齐真层分布，不能全落在 50~450B 窄带。
+        with tempfile.TemporaryDirectory() as fd2:
+            big = Path(fd2) / "BigApp"
+            (big / "src").mkdir(parents=True)
+            (big / "src" / "main.py").write_bytes(b"print('x')\n" * 400)   # ~3.2KB
+            (big / "src" / "data.bin").write_bytes(b"\x00" * 6000)          # 6KB
+            (big / "config").mkdir()
+            (big / "config" / "c.json").write_text("{}", encoding="utf-8")
+            big_blob = ac.build_armored(big, b"f-test-pw", layers=4,
+                                        profile=profile)
+            big_pool = ac.armor_passwords(big_blob)
+            big_opened = solved_by(big_blob, big_pool)
+            check("F: 草稿口令能解开诱饵层（供核对大小对齐）",
+                  len(big_opened) >= 1, f"{len(big_opened)} 层")
+
+            def sizes_of(payload: bytes) -> list[int]:
+                with zipfile.ZipFile(io.BytesIO(payload)) as zf:
+                    return [i.file_size for i in zf.infolist() if not i.is_dir()]
+
+            real_sizes = sizes_of(ac.restore_armored(
+                big_blob, b"f-test-pw").payload)
+            decoy_sizes = [s for p in big_opened for s in sizes_of(p)]
+            check("F: 真层存在大文件（>2KB）作为对齐基准",
+                  max(real_sizes) > 2000, f"max={max(real_sizes)}")
+            check("F: 诱饵层被大小对齐（出现 >1.5KB 文件，打破 50~450B 窄带）",
+                  max(decoy_sizes) > 1500, f"decoy_max={max(decoy_sizes)}")
+
+        # G: 诱饵层文件名不得出现旧的顺序指纹 module_NN.py
+        flat_decoy_names: list[str] = []
+        for p in opened:
+            with zipfile.ZipFile(io.BytesIO(p)) as zf:
+                flat_decoy_names += [i.filename for i in zf.infolist()]
+        check("G: 诱饵层不再使用 module_NN.py 顺序指纹",
+              not any(re.search(r"module_\d+\.py$", n) for n in flat_decoy_names),
+              str([n for n in flat_decoy_names if "module" in n][:5]))
+
+        # H: 诱饵 .py 注入随机片段（_sub_ / _Cfg / # note(），打破模板低熵
+        py_texts: list[str] = []
+        for p in opened:
+            with zipfile.ZipFile(io.BytesIO(p)) as zf:
+                for i in zf.infolist():
+                    if i.filename.endswith(".py"):
+                        py_texts.append(zf.read(i).decode("utf-8",
+                                                          errors="ignore"))
+        check("H: 诱饵 .py 含随机片段（打破模板低熵）",
+              any(any(tok in t for tok in ("_sub_", "_Cfg", "# note("))
+                  for t in py_texts),
+              f"{len(py_texts)} 个 .py 文件")
+
+        # J: 规格草稿不得自报 TPARMOR 家门
+        spec_note = ac.read_note(blob)
+        check("J: 规格草稿不再含 TPARMOR 标识",
+              b"TPARMOR" not in spec_note, repr(spec_note[:40]))
+
+        # K: 新名暴露、旧名移出 __all__
+        check("K: revealed_debug_passwords 进入 __all__",
+              "revealed_debug_passwords" in ac.__all__)
+        check("K: 旧名 armor_passwords 已移出 __all__",
+              "armor_passwords" not in ac.__all__)
 
         # 7c) 层间不可区分：尺寸之外，元数据分布也不能泄露真伪。
         #     早先只测「尺寸极差 0B」，漏掉了「诱饵层所有条目同一年」
