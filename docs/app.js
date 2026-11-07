@@ -996,6 +996,11 @@ function bindWorkspace() {
     const dt = event.dataTransfer;
     if (!dt) return;
     if (dt.types.includes(ITEM_MIME)) {
+      // 工作区内部拖动 = 排序，不点亮左侧加密区
+      if (event.target.closest("#drawer")) {
+        dt.dropEffect = "move";
+        return;
+      }
       event.preventDefault();
       dt.dropEffect = "copy";
       $("drop").classList.add("over");
@@ -1024,9 +1029,10 @@ function bindWorkspace() {
     $("drop").classList.remove("over");
     renderFiles();
 
-    // ① 工作区里的行：丢到哪儿都当成「开始加密」
+    // ① 工作区里的行：只有丢到工作区**外面**才开始加密
     const itemId = dt.getData(ITEM_MIME);
     if (itemId) {
+      if (event.target.closest("#drawer")) return; // 抽屉内 = 排序，不加密
       event.preventDefault();
       const item = workspaceItemById(itemId);
       if (!item) return;
@@ -1094,9 +1100,16 @@ function bindWorkspace() {
     }
   });
   list.addEventListener("dragover", (event) => {
-    const row = event.target.closest(".queue-row");
-    if (!row || dragId === null) return;
+    if (dragId === null) return;
+    // 整个列表都接受放下，行与行之间的空隙也算
     event.preventDefault();
+    const row = event.target.closest(".queue-row");
+    if (!row) {
+      for (const other of list.querySelectorAll(".queue-row")) {
+        other.classList.remove("drop-before", "drop-after");
+      }
+      return;
+    }
     const rect = row.getBoundingClientRect();
     const after = event.clientY > rect.top + rect.height / 2;
     for (const other of list.querySelectorAll(".queue-row")) {
@@ -1105,9 +1118,16 @@ function bindWorkspace() {
     }
   });
   list.addEventListener("drop", (event) => {
-    const row = event.target.closest(".queue-row");
-    if (!row || dragId === null) return;
+    if (dragId === null) return;
     event.preventDefault();
+    event.stopPropagation(); // 别再冒泡到 document 触发加密
+    const row = event.target.closest(".queue-row");
+    if (!row) {
+      const last = workspace.items[workspace.items.length - 1];
+      if (last) moveWorkspaceItem(dragId, last.id, true);
+      dragId = null;
+      return;
+    }
     const rect = row.getBoundingClientRect();
     const after = event.clientY > rect.top + rect.height / 2;
     moveWorkspaceItem(dragId, Number(row.dataset.id), after);

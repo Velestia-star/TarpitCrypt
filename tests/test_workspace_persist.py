@@ -112,6 +112,45 @@ DROP_ON_DRAWER_JS = """
 """
 
 
+
+ADD_TWO_FILES_JS = """
+(async () => {
+  const make = (name, body) => new File([new TextEncoder().encode(body)], name, { type: "text/plain" });
+  const dt = new DataTransfer();
+  dt.items.add(make("A文件.txt", "aaa"));
+  dt.items.add(make("B文件.txt", "bbb"));
+  const input = document.getElementById("queuePickFiles");
+  input.files = dt.files;
+  input.dispatchEvent(new Event("change", { bubbles: true }));
+  await new Promise((r) => setTimeout(r, 800));
+  return document.querySelectorAll("#queueList .queue-row").length;
+})()
+"""
+
+
+REORDER_JS = """
+(async () => {
+  const rows = [...document.querySelectorAll("#queueList .queue-row")];
+  if (rows.length < 2) return { error: "需要两行" };
+  const before = rows.map((r) => r.querySelector(".q-name").textContent);
+  const dt = new DataTransfer();
+  dt.setData("application/x-tarpit-item", rows[0].dataset.id);
+  rows[0].dispatchEvent(new DragEvent("dragstart", { dataTransfer: dt, bubbles: true }));
+  const rect = rows[1].getBoundingClientRect();
+  const evt = { dataTransfer: dt, bubbles: true, cancelable: true,
+                clientY: rect.top + rect.height * 0.8 };
+  rows[1].dispatchEvent(new DragEvent("dragover", evt));
+  rows[1].dispatchEvent(new DragEvent("drop", evt));
+  await new Promise((r) => setTimeout(r, 400));
+  const after = [...document.querySelectorAll("#queueList .queue-row")]
+    .map((r) => r.querySelector(".q-name").textContent);
+  const anyDone = [...document.querySelectorAll("#queueList .queue-row")]
+    .some((r) => r.classList.contains("done") || r.classList.contains("running"));
+  return { before, after, anyDone, status: document.getElementById("status").textContent };
+})()
+"""
+
+
 class Cdp:
     """够用的极简 CDP 客户端。"""
     def __init__(self, url: str) -> None:
@@ -216,6 +255,53 @@ def test_workspace_survives_reload() -> None:
 
 
 @pytest.mark.browser
+@pytest.mark.browser
+def test_reorder_inside_drawer_does_not_encrypt() -> None:
+    """抽屉内上下拖动 = 排序，绝不能顺带触发加密。"""
+    browser = find_browser()
+    if browser is None:
+        pytest.skip("本机没有 Edge/Chrome")
+
+    temp = pathlib.Path(tempfile.mkdtemp(prefix="tc-reorder-"))
+    http_port = free_port()
+    debug_port = free_port()
+    base = f"http://127.0.0.1:{http_port}"
+
+    server = subprocess.Popen(
+        [sys.executable, "-m", "http.server", str(http_port), "--bind", "127.0.0.1",
+         "--directory", str(DOCS)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    edge = subprocess.Popen(
+        [browser, "--headless=new", "--disable-gpu", "--no-first-run",
+         f"--remote-debugging-port={debug_port}", f"--user-data-dir={temp / 'profile'}", "about:blank"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    try:
+        time.sleep(2)
+        cdp = Cdp(wait_for_page(debug_port))
+        cdp.call("Page.enable")
+        cdp.call("Page.navigate", {"url": f"{base}/index.html#workspace"})
+        time.sleep(2.5)
+
+        assert cdp.evaluate(ADD_TWO_FILES_JS) == 2, "应加入两行"
+        result = cdp.evaluate(REORDER_JS)
+
+        assert "error" not in result, result
+        assert result["after"] != result["before"], f"顺序应当变化：{result}"
+        assert result["after"][-1] == result["before"][0], f"第一行应移到末尾：{result}"
+        assert not result["anyDone"], f"抽屉内排序不应触发加密：{result}"
+    finally:
+        for process in (edge, server):
+            process.terminate()
+        for process in (edge, server):
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+        shutil.rmtree(temp, ignore_errors=True)
+
+
 def test_file_drop_paths() -> None:
     """系统文件拖到左侧要能载入，拖到抽屉要能进工作区——都不能静默无反应。"""
     browser = find_browser()
