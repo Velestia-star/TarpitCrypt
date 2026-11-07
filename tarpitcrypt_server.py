@@ -699,9 +699,6 @@ INDEX_HTML = """<!doctype html>
     <label id="confirmWrap">再输一次
       <input type="password" id="password2" autocomplete="new-password">
     </label>
-    <label>keyfile（可选）
-      <input type="file" id="keyfile">
-    </label>
     <label>强度预设
       <select id="preset">
         <option value="fast">快速 · 256 MiB × 2 轮（约 1 秒）</option>
@@ -710,10 +707,14 @@ INDEX_HTML = """<!doctype html>
       </select>
     </label>
   </div>
+  <p class="hint" id="onePwHint">默认只需要一个口令；keyfile、PoW、诱饵层都在「高级」里，通常不用动。</p>
 
   <details id="advanced">
-    <summary>高级：PoW / 算法 / 诱饵层</summary>
+    <summary>高级：keyfile / PoW / 算法 / 诱饵层（可全部不设）</summary>
     <div class="grid">
+      <label>keyfile（可选，兼容旧文件）
+        <input type="file" id="keyfile">
+      </label>
       <label>PoW 难度
         <select id="pow">
           <option value="0" selected>关闭</option>
@@ -732,7 +733,7 @@ INDEX_HTML = """<!doctype html>
         <input type="file" id="decoy">
       </label>
       <label class="decoy-only">诱饵口令
-        <input type="password" id="decoyPassword" placeholder="用别的口令才能解出诱饵">
+        <input type="password" id="decoyPassword" placeholder="选了诱饵文件才需要填">
       </label>
     </div>
   </details>

@@ -19,7 +19,9 @@ TarpitCrypt 是一个**反 AI 逆向的整活项目**。底层是一个本地文
 
 > 护城河怎么来的、针对哪些真实 AI 逆向工具、利用了它们的哪些盲区，见
 > [`armor/` 威胁模型](docs/AI_RE_THREATMODEL.md)；效果量化与待办（含真实
-> agent 实测）见 [`docs/AGENT_BENCHMARK.md`](docs/AGENT_BENCHMARK.md)。
+> agent 实测）见 [`docs/AGENT_BENCHMARK.md`](docs/AGENT_BENCHMARK.md)；
+> 整活路线与「为什么不是把 Argon2 调到无限」见
+> [`docs/ROADMAP.md`](docs/ROADMAP.md)。
 
 ---
 
@@ -45,7 +47,7 @@ TarpitCrypt 是一个**反 AI 逆向的整活项目**。底层是一个本地文
 ```bash
 pip install argon2-cffi cryptography
 
-# 加密
+# 加密（默认只需要一个口令）
 python tarpitcrypt.py encrypt notes.pdf notes.pdf.tarpit
 # 解密
 python tarpitcrypt.py decrypt notes.pdf.tarpit notes.pdf
@@ -56,7 +58,11 @@ python tarpitcrypt.py info notes.pdf.tarpit
 口令通过交互式 `getpass` 输入，或从 stdin 读（`--password-stdin`），
 **永远不作为命令行参数**——那样会被 `ps` / 命令行历史记下来。
 
-### 加一个 keyfile
+默认流程只问一个口令。`--keyfile` 和 `--decoy` 都是**可选**的高级 / 兼容项；
+不写它们，程序不会要求任何额外秘密。想让 AI 逆向更难受，用 `armor/`
+的多层容器——同样只需要一个主口令。
+
+### 可选：加一个 keyfile
 
 ```bash
 python tarpitcrypt.py keygen my.key           # 生成 64 字节 keyfile
@@ -77,7 +83,7 @@ keyfile 丢了 = 数据没了。请离线备份（U 盘 / 纸）。别把它和�
   0 字节 keyfile 静默当成「没启用 keyfile」，现在直接报错。
 - 解密仍接受空口令，历史上用空口令加密的文件还能打开。
 
-### 加一个诱饵层
+### 可选：加一个诱饵层（v1 兼容层）
 
 ```bash
 python tarpitcrypt.py encrypt real.txt out.tarpit --decoy fake.txt
@@ -89,6 +95,11 @@ python tarpitcrypt.py encrypt real.txt out.tarpit --decoy fake.txt
 代价：本工具的 `decrypt()` 命中诱饵层前会做两次派生，所以**合法用户会变慢**；
 但这不等于攻击者成本翻倍——他只攻主层就能判定一个候选口令失败，不必碰诱饵段。
 详见下文「什么情况下不安全」。
+
+v1 的诱饵层是**可见的**（文件头有 `FLAGS.bit2`，命中还会返回 `is_decoy`），
+它给的是「一个备用口令」，可否认性为零，不是反 AI 主力。想让 AI 判断不了
+自己是否拿到了真数据，用 [`armor/` 的多层容器](armor/README.md)——同样只需要
+一个主口令，层号与真伪都不会回给还原方。
 
 ### 用 AI 生成的参数
 
@@ -163,7 +174,7 @@ python tarpitcrypt_server.py --open
 浏览器直接落一个 `.tarpit` 文件。切到「解密」标签，拖回 `.tarpit` 就能解出来。
 
 - 文件夹会被打包成一个 `.tarpit`；解开后是一个 `.zip`（保留目录结构）。
-- 支持 keyfile、强度预设、PoW、AEAD 算法、诱饵层。
+- 主表单只需要口令；keyfile / PoW / 诱饵层都在「高级」里，默认不用动。
 - 拖入文件夹后，界面上每条文件都带相对路径，能看出结构对不对。
 - **结果会在服务端另存一份**到项目目录下的 `存放文件/`（首次启动自动创建，
   `--out-dir` 可改），完成页给出完整路径和「打开所在目录」按钮——点了会弹出

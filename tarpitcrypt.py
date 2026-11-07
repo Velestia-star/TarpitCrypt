@@ -1023,7 +1023,10 @@ def _build_parser() -> argparse.ArgumentParser:
     """构建命令行解析器。"""
     parser = _Parser(
         prog="tarpitcrypt",
-        description="TarpitCrypt：让每一次口令猜测都付出完整代价的本地文件加密工具。",
+        description=(
+            "TarpitCrypt：让每一次口令猜测都付出完整代价的本地文件加密工具。"
+            "默认只需要一个口令；keyfile / 诱饵层是可选的高级兼容项。"
+        ),
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="输出详细日志")
     sub = parser.add_subparsers(dest="command", required=True, parser_class=_Parser)
@@ -1032,8 +1035,8 @@ def _build_parser() -> argparse.ArgumentParser:
     enc.add_argument("input", help="明文文件路径")
     enc.add_argument("output", help="输出 .tarpit 文件路径")
     enc.add_argument("--force", action="store_true", help="覆盖已存在的输出文件")
-    enc.add_argument("--keyfile", help="keyfile 路径")
-    enc.add_argument("--decoy", help="诱饵层明文的路径")
+    enc.add_argument("--keyfile", help="keyfile 路径（可选，兼容旧文件）")
+    enc.add_argument("--decoy", help="诱饵层明文的路径（可选，兼容旧文件）")
     enc.add_argument("--password-stdin", action="store_true", help="从 stdin 读取主口令")
     enc.add_argument("--decoy-password-stdin", action="store_true", help="从 stdin 读取诱饵口令")
     enc.add_argument("--mem", type=int, help="Argon2id memory_cost (KiB)")
@@ -1048,7 +1051,7 @@ def _build_parser() -> argparse.ArgumentParser:
     dec.add_argument("input", help=".tarpit 文件路径")
     dec.add_argument("output", help="明文输出路径")
     dec.add_argument("--force", action="store_true", help="覆盖已存在的输出文件")
-    dec.add_argument("--keyfile", help="keyfile 路径")
+    dec.add_argument("--keyfile", help="keyfile 路径（可选，兼容旧文件）")
     dec.add_argument("--password-stdin", action="store_true", help="从 stdin 读取口令")
 
     info = sub.add_parser("info", help="查看文件头，无需口令")
