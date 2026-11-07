@@ -103,7 +103,6 @@
     <div class="drawer-tools">
       <label class="tool">＋ 加入文件<input type="file" id="queuePickFiles" multiple hidden></label>
       <label class="tool">＋ 加入文件夹<input type="file" id="queuePickDir" webkitdirectory multiple hidden></label>
-      <button class="tool primary" id="queueRun" type="button">加密全部</button>
       <button class="tool" id="queueDelete" type="button">删除选中</button>
       <button class="tool" id="openPath" type="button">存放位置</button>
     </div>
@@ -126,7 +125,7 @@
       <button class="tool" id="historyClear" type="button">清空历史</button>
     </div>
     <div class="queue-cols history-cols">
-      <span></span><span>过去加密的文件</span><span></span><span>结果</span>
+      <span></span><span>过去加密的文件</span><span></span><span>结果</span><span></span>
     </div>
     <div class="queue-scroll">
       <ul class="history-list" id="historyList"></ul>
@@ -137,7 +136,7 @@
   </section>
 
   <p class="drawer-hint">
-    口令与强度沿用页面上的设置 · 拖动行可排序，拖到左侧可重新加密 · <span id="queueSummary">0 项</span>
+    口令与强度沿用页面上的设置 · 把行拖到左侧大框里就会加密 · <span id="queueSummary">0 项</span>
   </p>
 </aside>
 

@@ -607,3 +607,38 @@ body.drawer-open { overflow: hidden; }
 
 /* hidden 属性必须真的隐藏：作者样式里的 display 会盖掉浏览器的 [hidden] */
 [hidden] { display: none !important; }
+
+/* ---- 历史行：5 列（状态点 / 源 / 箭头 / 结果 / 操作） ---- */
+
+.history-cols { grid-template-columns: 10px 1fr 24px 1fr auto; }
+.history-row { grid-template-columns: 10px 1fr 24px 1fr auto; }
+
+.history-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.history-restore {
+  padding: 5px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: #0e0c0a;
+  color: var(--accent);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.history-restore:hover { border-color: var(--accent); }
+
+/* 文件已被删除：整段划掉 */
+.history-row .missing {
+  text-decoration: line-through;
+  color: #6b6259;
+}
+
+.deleted-dot { background: #6b6259; }
+
+.history-row.deleted-record { opacity: 0.85; }

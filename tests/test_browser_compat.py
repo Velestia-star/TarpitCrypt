@@ -310,10 +310,11 @@ def test_queue_drawer_opens_from_hash(served_site: str, tmp_path: Path) -> None:
         time.sleep(0.8)
 
     assert 'data-app="ready"' in dom, f"页面模块没有执行完：\n{dom[:600]}"
-    for element_id in ("queueToggle", "drawer", "queueList", "queueRun", "queuePickDir",
+    for element_id in ("queueToggle", "drawer", "queueList", "queuePickDir",
                        "queueSelectAll", "queueDelete", "openPath", "pathModal",
-                       "historyList", "historyClear", "queueSelectAll"):
+                       "historyList", "historyClear", "historyEmpty"):
         assert f'id="{element_id}"' in dom, f"缺少工作区节点 #{element_id}"
+    assert 'id="queueRun"' not in dom, "「加密全部」按钮已移除，改由拖到左侧触发加密"
     assert 'class="drawer open"' in dom, "`#queue` 应当直接展开抽屉"
     assert 'aria-expanded="true"' in dom
 

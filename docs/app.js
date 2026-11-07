@@ -272,7 +272,7 @@ async function onSubmit() {
 }
 
 // ---------------------------------------------------------------------------
-// 右侧工作区（存放与管理）
+// 右侧工作区（存放与管理）＋ 历史
 // ---------------------------------------------------------------------------
 
 const HISTORY_KEY = "tarpitcrypt.history.v1";
@@ -281,6 +281,14 @@ const ITEM_MIME = "application/x-tarpit-item";
 
 const workspace = { items: [], seq: 0, view: "workspace" };
 let historyEntries = loadHistory();
+/** 只在本次会话有效的文件句柄（File 与 blob URL 都没法持久化）。 */
+const liveHandles = new Map();
+let historySeq = 0;
+
+function newHistoryId() {
+  historySeq += 1;
+  return `h${Date.now().toString(36)}${historySeq}`;
+}
 
 /** 读历史记录（只存名字/时间/大小，绝不存文件内容）。 */
 function loadHistory() {
@@ -301,6 +309,20 @@ function saveHistory(list) {
   }
 }
 
+function addHistoryEntry(payload) {
+  const entry = {
+    id: newHistoryId(),
+    at: Date.now(),
+    sourceMissing: false,
+    outputMissing: false,
+    ...payload,
+  };
+  historyEntries.unshift(entry);
+  historyEntries = historyEntries.slice(0, HISTORY_LIMIT);
+  saveHistory(historyEntries);
+  return entry;
+}
+
 /** 打开右侧抽屉。 */
 function openDrawer() {
   $("drawer").classList.add("open");
@@ -309,7 +331,7 @@ function openDrawer() {
   $("drawerBackdrop").hidden = false;
   requestAnimationFrame(() => $("drawerBackdrop").classList.add("show"));
   document.body.classList.add("drawer-open");
-  const target = "#" + workspace.view;
+  const target = `#${workspace.view}`;
   if (location.hash !== target) history.replaceState(null, "", target);
 }
 
@@ -353,7 +375,7 @@ function setView(view) {
   $("viewWorkspace").hidden = view !== "workspace";
   $("viewHistory").hidden = view !== "history";
   if (view === "history") renderHistory();
-  if (drawerOpen()) history.replaceState(null, "", "#" + view);
+  if (drawerOpen()) history.replaceState(null, "", `#${view}`);
 }
 
 /** 往工作区加项。 */
@@ -417,7 +439,7 @@ function buildWorkspaceRow(item) {
   const name = document.createElement("span");
   name.className = "q-name";
   name.textContent = item.name;
-  name.title = `${item.name}（拖到左侧可重新加密）`;
+  name.title = `${item.name}（拖到左侧大框即可加密）`;
   const meta = document.createElement("span");
   meta.className = "q-meta";
   meta.textContent = item.kind === "dir"
@@ -455,25 +477,25 @@ function buildWorkspaceRow(item) {
   return li;
 }
 
-/** 渲染历史记录。 */
+/** 渲染历史记录：可恢复、可删除、双击校验文件是否还在。 */
 function renderHistory() {
   const list = $("historyList");
   $("historyEmpty").hidden = historyEntries.length > 0;
   list.innerHTML = "";
   for (const entry of historyEntries) {
     const li = document.createElement("li");
-    li.className = "history-row";
+    li.className = `history-row${entry.status === "deleted" ? " deleted-record" : ""}`;
+    li.title = "双击检查这两个文件是否还在";
 
     const dot = document.createElement("span");
-    dot.className = "history-empty-dot";
-    dot.title = "已加密";
+    dot.className = `history-empty-dot${entry.status === "deleted" ? " deleted-dot" : ""}`;
+    dot.title = entry.status === "deleted" ? "已从工作区删除" : "已加密";
 
     const source = document.createElement("div");
-    source.className = "q-src";
+    source.className = `q-src${entry.sourceMissing ? " missing" : ""}`;
     const name = document.createElement("span");
     name.className = "q-name";
     name.textContent = entry.name;
-    name.title = entry.name;
     const meta = document.createElement("span");
     meta.className = "q-meta";
     meta.textContent = `${formatTime(entry.at)} · ${formatSize(entry.sizeIn)}`;
@@ -484,33 +506,108 @@ function renderHistory() {
     arrow.textContent = "→";
 
     const output = document.createElement("div");
-    output.className = "q-out";
+    output.className = `q-out${entry.outputMissing ? " missing" : ""}`;
     const outName = document.createElement("span");
     outName.className = "q-name";
-    outName.textContent = entry.outName;
-    outName.title = entry.outName;
+    outName.textContent = entry.outName || "（未加密）";
     const outMeta = document.createElement("span");
     outMeta.className = "q-meta";
-    outMeta.textContent = formatSize(entry.sizeOut);
+    outMeta.textContent = entry.sizeOut ? formatSize(entry.sizeOut) : "";
+    output.append(outName, outMeta);
+
+    const actions = document.createElement("div");
+    actions.className = "history-actions";
+    const restore = document.createElement("button");
+    restore.className = "history-restore";
+    restore.type = "button";
+    restore.textContent = "恢复";
+    restore.title = "把这一项放回工作区";
+    restore.addEventListener("click", (event) => {
+      event.stopPropagation();
+      restoreHistoryEntry(entry);
+    });
     const del = document.createElement("button");
     del.className = "history-del";
     del.type = "button";
     del.textContent = "×";
     del.title = "从历史里删掉这条记录（不影响已下载的文件）";
-    del.addEventListener("click", () => {
-      historyEntries = historyEntries.filter((item) => item.at !== entry.at);
+    del.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const handle = liveHandles.get(entry.id);
+      if (handle && handle.outputUrl && !workspace.items.some((item) => item.output && item.output.url === handle.outputUrl)) {
+        URL.revokeObjectURL(handle.outputUrl);
+      }
+      liveHandles.delete(entry.id);
+      historyEntries = historyEntries.filter((item) => item.id !== entry.id);
       saveHistory(historyEntries);
       renderHistory();
     });
-    output.append(outName, outMeta);
+    actions.append(restore, del);
 
-    const tail = document.createElement("div");
-    tail.append(del);
-
-    li.append(dot, source, arrow, output);
-    li.append(tail);
+    li.addEventListener("dblclick", () => { void inspectHistoryEntry(entry); });
+    li.append(dot, source, arrow, output, actions);
     list.append(li);
   }
+}
+
+/** 把历史里的一项放回工作区。 */
+function restoreHistoryEntry(entry) {
+  const handle = liveHandles.get(entry.id);
+  if (!handle) {
+    workspaceNote("这条记录恢复不了：页面刷新后文件句柄已经没了，重新加入一次吧");
+    return;
+  }
+  addWorkspaceEntries([{ kind: entry.kind, name: entry.name, files: handle.files }]);
+  const restored = workspace.items[workspace.items.length - 1];
+  if (handle.outputUrl && entry.outName) {
+    restored.output = { url: handle.outputUrl, name: entry.outName, size: entry.sizeOut };
+    restored.status = "done";
+  }
+  renderWorkspace();
+  setView("workspace");
+  workspaceNote(`已恢复「${entry.name}」`);
+}
+
+/** 双击历史行：检查文件还在不在，缺的划掉，并弹存放位置说明。 */
+async function inspectHistoryEntry(entry) {
+  const handle = liveHandles.get(entry.id);
+  if (!handle) {
+    workspaceNote("页面刷新过，无法校验这条记录——浏览器没有权限查看本地文件");
+    $("pathModal").hidden = false;
+    return;
+  }
+
+  // 源文件：能读出一个字节就认为还在（被删/被移动会抛错）
+  let sourceMissing = false;
+  try {
+    const file = handle.files[0] && handle.files[0].file;
+    if (!file) sourceMissing = true;
+    else await file.slice(0, 1).arrayBuffer();
+  } catch {
+    sourceMissing = true;
+  }
+
+  // 加密结果：只能校验本次会话里那个 blob，磁盘上那份浏览器看不见
+  let outputMissing = false;
+  if (handle.outputUrl) {
+    try {
+      const response = await fetch(handle.outputUrl);
+      if (!response.ok) outputMissing = true;
+    } catch {
+      outputMissing = true;
+    }
+  }
+
+  entry.sourceMissing = sourceMissing;
+  entry.outputMissing = outputMissing;
+  saveHistory(historyEntries);
+  renderHistory();
+
+  const notes = [];
+  notes.push(sourceMissing ? "原文件：不在了（已划掉）" : "原文件：还在");
+  notes.push(outputMissing ? "加密结果：不在了（已划掉）" : "加密结果：还在");
+  workspaceNote(notes.join(" · "));
+  $("pathModal").hidden = false;
 }
 
 /** 把拖进抽屉的文件/文件夹收成工作区条目。 */
@@ -546,18 +643,11 @@ async function workspaceItemPayload(item) {
   return readBytes(item.files[0].file);
 }
 
-/** 逐项加密，结果留在右侧，同时写入历史。 */
-async function runWorkspace() {
-  const pending = workspace.items.filter((item) => item.status === "pending");
-  if (!pending.length) {
-    workspaceNote(workspace.items.length ? "没有待加密的项" : "工作区是空的");
-    return;
-  }
+/** 加密工作区里的一项，结果留在右侧，并记进历史。 */
+async function encryptWorkspaceItem(item) {
   const passwordText = $("password").value;
-  if (!passwordText) {
-    workspaceNote("先在上面表单里填口令");
-    return;
-  }
+  if (!passwordText) throw new Error("先在上面表单里填口令");
+  if (passwordText !== $("password2").value) throw new Error("两次口令不一致");
 
   const params = collectParams();
   const keyfileFile = $("keyfile").files[0];
@@ -565,62 +655,66 @@ async function runWorkspace() {
   const decoyFile = $("decoy").files[0];
   const decoyPlaintext = decoyFile ? await readBytes(decoyFile) : null;
   const decoyText = $("decoyPassword").value;
-  if (decoyPlaintext && !decoyText) {
-    workspaceNote("选了诱饵文件就要填诱饵口令");
-    return;
-  }
+  if (decoyPlaintext && !decoyText) throw new Error("选了诱饵文件就要填诱饵口令");
 
-  $("queueRun").disabled = true;
-  let index = 0;
-  for (const item of pending) {
-    index += 1;
-    item.status = "running";
-    item.error = null;
-    renderWorkspace();
-    workspaceNote(`正在加密 ${index}/${pending.length}：${item.name}`);
-    await nextPaint();
-    try {
-      const payload = await workspaceItemPayload(item);
-      const blob = await core.encrypt(payload, passwordBytes(passwordText), {
-        params,
-        keyfile,
-        decoyPlaintext,
-        decoyPassword: decoyPlaintext ? passwordBytes(decoyText) : null,
-      });
-      item.output = {
-        url: URL.createObjectURL(new Blob([blob], { type: "application/octet-stream" })),
-        name: `${item.name}.tarpit`,
-        size: blob.length,
-      };
-      item.status = "done";
-      historyEntries.unshift({
-        name: item.name,
-        kind: item.kind,
-        sizeIn: itemSize(item),
-        outName: item.output.name,
-        sizeOut: item.output.size,
-        at: Date.now(),
-      });
-      historyEntries = historyEntries.slice(0, HISTORY_LIMIT);
-      saveHistory(historyEntries);
-    } catch (error) {
-      item.status = "error";
-      item.error = error.message;
-    }
+  item.status = "running";
+  item.error = null;
+  renderWorkspace();
+  await nextPaint();
+  try {
+    const payload = await workspaceItemPayload(item);
+    const blob = await core.encrypt(payload, passwordBytes(passwordText), {
+      params,
+      keyfile,
+      decoyPlaintext,
+      decoyPassword: decoyPlaintext ? passwordBytes(decoyText) : null,
+    });
+    item.output = {
+      url: URL.createObjectURL(new Blob([blob], { type: "application/octet-stream" })),
+      name: `${item.name}.tarpit`,
+      size: blob.length,
+    };
+    item.status = "done";
+    const entry = addHistoryEntry({
+      status: "encrypted",
+      kind: item.kind,
+      name: item.name,
+      sizeIn: itemSize(item),
+      outName: item.output.name,
+      sizeOut: item.output.size,
+    });
+    liveHandles.set(entry.id, { files: item.files, outputUrl: item.output.url });
+  } catch (error) {
+    item.status = "error";
+    item.error = error.message;
+    throw error;
+  } finally {
     renderWorkspace();
   }
-  $("queueRun").disabled = false;
 }
 
-/** 删除选中的行（只删记录，不动已下载的文件）。 */
+/** 删除选中的行：只删记录，同时把这一项记进历史，方便恢复。 */
 function deleteSelected() {
-  const selected = new Set(selectedItems().map((item) => item.id));
-  if (!selected.size) return;
-  for (const item of workspace.items) {
-    if (selected.has(item.id) && item.output) URL.revokeObjectURL(item.output.url);
+  const chosen = selectedItems();
+  if (!chosen.length) return;
+  for (const item of chosen) {
+    const entry = addHistoryEntry({
+      status: "deleted",
+      kind: item.kind,
+      name: item.name,
+      sizeIn: itemSize(item),
+      outName: item.output ? item.output.name : null,
+      sizeOut: item.output ? item.output.size : 0,
+    });
+    liveHandles.set(entry.id, {
+      files: item.files,
+      outputUrl: item.output ? item.output.url : null,
+    });
   }
-  workspace.items = workspace.items.filter((item) => !selected.has(item.id));
+  const ids = new Set(chosen.map((item) => item.id));
+  workspace.items = workspace.items.filter((item) => !ids.has(item.id));
   renderWorkspace();
+  workspaceNote(`已删除 ${chosen.length} 项，可在「历史」里恢复`);
 }
 
 /** 把 fromId 移到 toId 之前或之后。 */
@@ -651,7 +745,6 @@ function bindWorkspace() {
     tab.addEventListener("click", () => setView(tab.dataset.view));
   }
 
-  $("queueRun").addEventListener("click", () => { void runWorkspace(); });
   $("queueDelete").addEventListener("click", deleteSelected);
   $("queueSelectAll").addEventListener("change", (event) => {
     for (const item of workspace.items) item.selected = event.target.checked;
@@ -659,6 +752,10 @@ function bindWorkspace() {
   });
 
   $("historyClear").addEventListener("click", () => {
+    for (const handle of liveHandles.values()) {
+      if (handle.outputUrl) URL.revokeObjectURL(handle.outputUrl);
+    }
+    liveHandles.clear();
     historyEntries = [];
     saveHistory(historyEntries);
     renderHistory();
@@ -721,7 +818,7 @@ function bindWorkspace() {
     }
   });
 
-  // 行内拖拽排序；拖到左侧主区域则交给上面绑定的事件重新加密
+  // 行内拖拽排序；拖到左侧主区域会触发加密（见 bind() 里的 drop 处理）
   let dragId = null;
   const list = $("queueList");
   list.addEventListener("dragstart", (event) => {
@@ -792,13 +889,18 @@ function bind() {
   drop.addEventListener("drop", async (event) => {
     event.preventDefault();
     drop.classList.remove("over");
-    // 从工作区里拖出来的一行 → 直接放到左侧，走「加密并下载」原来的流程
+    // 从工作区里拖出来的一行 → 放到左侧大框里就开始加密
     const itemId = event.dataTransfer.getData(ITEM_MIME);
     if (itemId) {
       const item = workspaceItemById(itemId);
       if (item) {
-        setFiles(item.files, item.kind === "dir");
-        status(`已从工作区取出「${item.name}」，可以直接加密`, "ok");
+        status(`正在加密「${item.name}」…`);
+        try {
+          await encryptWorkspaceItem(item);
+          status(`已加密「${item.name}」，结果在工作区右侧`, "ok");
+        } catch (error) {
+          status(`加密失败：${error.message}`, "bad");
+        }
       }
       return;
     }
