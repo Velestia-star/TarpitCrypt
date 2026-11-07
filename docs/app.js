@@ -1012,7 +1012,17 @@ function bindWorkspace() {
     if (dt.types.includes("Files")) {
       event.preventDefault();
       dt.dropEffect = "copy";
-      if (!event.target.closest("#drawer")) $("drop").classList.add("over");
+      if (event.target.closest("#drawer")) {
+        $("drop").classList.remove("over");
+        return;
+      }
+      // 右半边：松手会进工作区（中途不展开，否则 DOM 变化会打断拖拽）
+      if (event.clientX > window.innerWidth * 0.65) {
+        $("drop").classList.add("over");
+        $("dropTitle").textContent = "松手加入右侧工作区";
+        return;
+      }
+      $("drop").classList.add("over");
     }
   });
 
@@ -1050,9 +1060,11 @@ function bindWorkspace() {
     if (!dt.types.includes("Files")) return;
     event.preventDefault();
 
-    if (event.target.closest("#drawer")) {
+    const onRightSide = event.clientX > window.innerWidth * 0.65;
+    if (event.target.closest("#drawer") || onRightSide) {
       dragDepth = 0;
       drawer.classList.remove("over");
+      if (!drawerOpen()) openDrawer();
       try {
         const entries = await collectWorkspaceEntries(dt);
         if (!entries.length) {
@@ -1060,6 +1072,9 @@ function bindWorkspace() {
           return;
         }
         addWorkspaceEntries(entries);
+        if (entries.length) {
+          workspaceNote(`已加入 ${entries.length} 项（拖动左边的行到左侧即可加密）`);
+        }
       } catch (error) {
         workspaceNote(`读取失败：${error.message}`);
       }

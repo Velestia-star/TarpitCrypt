@@ -302,6 +302,75 @@ def test_reorder_inside_drawer_does_not_encrypt() -> None:
         shutil.rmtree(temp, ignore_errors=True)
 
 
+@pytest.mark.browser
+def test_real_file_drag_to_right_side() -> None:
+    """用 CDP 派发**真实文件**拖放：抽屉关着、丢到窗口右侧，应进工作区并展开。
+
+    合成 DragEvent 不带真实文件，webkitGetAsEntry 全是 null，
+    证明不了「从资源管理器拖进来」这条路径，所以这里必须用 Input.dispatchDragEvent。
+    """
+    browser = find_browser()
+    if browser is None:
+        pytest.skip("本机没有 Edge/Chrome")
+
+    temp = pathlib.Path(tempfile.mkdtemp(prefix="tc-realdrag-"))
+    sample = temp / "右侧拖入.txt"
+    sample.write_text("payload", encoding="utf-8")
+
+    http_port = free_port()
+    debug_port = free_port()
+    base = f"http://127.0.0.1:{http_port}"
+
+    server = subprocess.Popen(
+        [sys.executable, "-m", "http.server", str(http_port), "--bind", "127.0.0.1",
+         "--directory", str(DOCS)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    edge = subprocess.Popen(
+        [browser, "--headless=new", "--disable-gpu", "--no-first-run", "--window-size=1440,900",
+         f"--remote-debugging-port={debug_port}", f"--user-data-dir={temp / 'profile'}", "about:blank"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    try:
+        time.sleep(2)
+        cdp = Cdp(wait_for_page(debug_port))
+        cdp.call("Page.enable")
+        cdp.call("Page.navigate", {"url": f"{base}/index.html"})
+        time.sleep(3)
+
+        assert cdp.evaluate("document.getElementById('drawer').classList.contains('open')") is False
+
+        drag_data = {"items": [], "files": [str(sample)], "dragOperationsMask": 1}
+        for kind in ("dragEnter", "dragOver", "drop"):
+            cdp.call(
+                "Input.dispatchDragEvent",
+                {"type": kind, "x": 1250, "y": 400, "data": drag_data},
+            )
+            time.sleep(0.4)
+        time.sleep(1.0)
+
+        state = cdp.evaluate("""(() => ({
+          open: document.getElementById('drawer').classList.contains('open'),
+          rows: document.querySelectorAll('#queueList .queue-row').length,
+          names: [...document.querySelectorAll('#queueList .q-name')].map((e) => e.textContent),
+          fileList: document.querySelectorAll('#fileList li').length,
+        }))()""")
+
+        assert state.get("rows") == 1, f"右侧拖入应进工作区：{state}"
+        assert state.get("open") is True, f"落盘后应自动展开工作区：{state}"
+        assert state.get("fileList") == 0, f"不应同时进入左侧待加密列表：{state}"
+        assert any("右侧拖入" in name for name in state.get("names", []))
+    finally:
+        for process in (edge, server):
+            process.terminate()
+        for process in (edge, server):
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+        shutil.rmtree(temp, ignore_errors=True)
+
+
 def test_file_drop_paths() -> None:
     """系统文件拖到左侧要能载入，拖到抽屉要能进工作区——都不能静默无反应。"""
     browser = find_browser()
