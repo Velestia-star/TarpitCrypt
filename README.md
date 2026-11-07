@@ -2,6 +2,7 @@
 
 **🌐 在线版（打开即用）→ [Velestia-star.github.io/TarpitCrypt](https://Velestia-star.github.io/TarpitCrypt/)**
 —— 拖文件进去就能加解密，运算全在你自己浏览器里，文件不上传。
+（懒得多打一次字的话，直接双击仓库根目录的 [`打开在线版.html`](打开在线版.html)。）
 
 > 不是让数据「解不开」，而是让**逆向方判断不了自己是不是找对了**。
 

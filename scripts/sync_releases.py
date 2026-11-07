@@ -1,6 +1,9 @@
 """把「在线版」入口同步进所有 GitHub Release 的说明里。
 
 幂等：正文里已经有站点地址的会跳过，重复运行不会叠出一堆重复块。
+判断用大小写不敏感比较——GitHub 用户名改写历史时（wei238982377 →
+Velestia-star），正文里的地址大小写可能和常量不一致，严格比较会误判成
+「没有」并叠出重复块。
 全程不打印令牌。
 """
 
@@ -13,6 +16,8 @@ import urllib.request
 
 REPO = "Velestia-star/TarpitCrypt"
 SITE = "https://Velestia-star.github.io/TarpitCrypt/"
+#: 判断「正文里是否已有入口」时用它，忽略大小写。
+SITE_MARKER = SITE.lower()
 
 BLOCK = (
     "\n\n---\n\n"
@@ -67,7 +72,7 @@ def main() -> int:
     for release in releases:
         tag = release["tag_name"]
         current = release.get("body") or ""
-        if SITE in current:
+        if SITE_MARKER in current.lower():
             print(f"  跳过 {tag}：正文里已有站点地址")
             skipped += 1
             continue
