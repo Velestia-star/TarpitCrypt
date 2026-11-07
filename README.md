@@ -237,8 +237,11 @@ Argon2id 是内存硬函数，GPU/ASIC 的并行优势被内存带宽卡死，�
 - **没有自创密码学**：只用 `cryptography` 提供的 AEAD / HKDF，以及
   `argon2-cffi` 的 Argon2id。口令与 keyfile 用 HKDF-SHA256 预哈希合成，
   这是标准的组合方式，不是自研 KDF。
-- **文件头先校验后使用**：`mem` / `time` / `para` / `rounds` / `POW_DIFF` 全部
-  在进入 Argon2 之前过区间检查，恶意文件没法用超大参数拖死你的机器。
+- **文件头先校验后使用**：`mem` / `time` / `para` / `rounds` / `POW_DIFF`
+  全部先过区间检查；`CT_LEN` / `DECOY_LEN` 再检查「至少装得下 16 字节认证
+  标签」并与文件实际长度对齐。截断、尾部残留、`FLAGS.POW` 与 `POW_DIFF`
+  不一致的畸形文件在进入 Argon2 之前就失败，不会为明显坏掉的文件付一次
+  完整 KDF，`info` 也不会再打印自相矛盾的元数据。
 
 ## 什么情况下不安全（请务必读）
 

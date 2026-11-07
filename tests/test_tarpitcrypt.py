@@ -268,6 +268,101 @@ def test_unsupported_version_rejected() -> None:
         tc.decrypt(bytes(blob), PASSWORD)
 
 
+def _fail_derive(*_args: object, **_kwargs: object) -> bytes:
+    """一旦被调用就说明格式校验没能在 KDF 之前拦住文件。"""
+    raise AssertionError("格式校验失败得太晚：已经进入了 Argon2")
+
+
+def test_ct_len_below_tag_rejected_before_kdf(monkeypatch: pytest.MonkeyPatch) -> None:
+    """CT_LEN 装不下 16 字节标签时，必须在进 Argon2 之前就失败。"""
+    blob = bytearray(tc.encrypt(b"payload", PASSWORD, params=FAST))
+    struct.pack_into(">Q", blob, 83, tc.TAG_LEN - 1)
+    truncated = bytes(blob[: tc.HEADER_LEN + tc.TAG_LEN - 1])
+
+    monkeypatch.setattr(tc, "_derive", _fail_derive)
+    with pytest.raises(ValueError, match="CT_LEN"):
+        tc.decrypt(truncated, PASSWORD)
+
+
+def test_decoy_len_below_tag_rejected_before_kdf(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DECOY_LEN 装不下 16 字节标签时，同样不进 Argon2。"""
+    blob = bytearray(
+        tc.encrypt(
+            b"real",
+            PASSWORD,
+            params=FAST,
+            decoy_plaintext=b"fake",
+            decoy_password=DECOY_PASSWORD,
+        )
+    )
+    ct_len = struct.unpack_from(">Q", blob, 83)[0]
+    decoy_len_offset = tc.HEADER_LEN + ct_len + tc.NONCE_LEN
+    struct.pack_into(">Q", blob, decoy_len_offset, tc.TAG_LEN - 1)
+    truncated = bytes(blob[: decoy_len_offset + tc.TAG_LEN - 1])
+
+    monkeypatch.setattr(tc, "_derive", _fail_derive)
+    with pytest.raises(ValueError, match="DECOY_LEN"):
+        tc.decrypt(truncated, DECOY_PASSWORD)
+
+
+def test_pow_flag_and_pow_diff_must_agree() -> None:
+    """FLAGS.POW 与 POW_DIFF 是同一件事的两种写法，不一致就按格式错误拒绝。"""
+    no_pow = bytearray(tc.encrypt(b"payload", PASSWORD, params=FAST))
+    no_pow[18] = 16  # 声明了难度，却没置 FLAG_POW
+    with pytest.raises(ValueError, match="POW"):
+        tc.decrypt(bytes(no_pow), PASSWORD)
+
+    params = tc.CryptoParams(mem=8192, time=1, para=1, rounds=1, pow=16)
+    has_pow = bytearray(tc.encrypt(b"payload", PASSWORD, params=params))
+    assert has_pow[9] & tc.FLAG_POW
+    has_pow[18] = 0  # 置了 FLAG_POW，难度却是 0
+    with pytest.raises(ValueError, match="POW"):
+        tc.decrypt(bytes(has_pow), PASSWORD)
+
+
+def test_describe_reports_valid_decoy_len() -> None:
+    """合法文件的 info 仍要给出诱饵密文长度与总长度。"""
+    blob = tc.encrypt(
+        b"real",
+        PASSWORD,
+        params=FAST,
+        decoy_plaintext=b"fake",
+        decoy_password=DECOY_PASSWORD,
+    )
+    info = tc.describe(blob)
+    assert info["decoy_len"] == len(b"fake") + tc.TAG_LEN
+    assert info["total_len"] == len(blob)
+
+
+def test_describe_rejects_truncated_main() -> None:
+    """主密文被截断时，info 不能再打印一份看似正常的元数据。"""
+    blob = tc.encrypt(b"payload", PASSWORD, params=FAST)
+    with pytest.raises(ValueError, match="CT_LEN"):
+        tc.describe(blob[:-1])
+
+
+def test_describe_rejects_truncated_decoy() -> None:
+    """诱饵密文被截断时同样报错，而不是返回一个对不上的 decoy_len。"""
+    blob = tc.encrypt(
+        b"real",
+        PASSWORD,
+        params=FAST,
+        decoy_plaintext=b"fake",
+        decoy_password=DECOY_PASSWORD,
+    )
+    with pytest.raises(ValueError, match="DECOY_LEN"):
+        tc.describe(blob[:-1])
+
+
+def test_describe_rejects_trailing_bytes() -> None:
+    """主密文之后多出来的字节必须被 info 拒绝。"""
+    blob = tc.encrypt(b"payload", PASSWORD, params=FAST)
+    with pytest.raises(ValueError, match="多余字节"):
+        tc.describe(blob + b"junk")
+
+
 # ---------------------------------------------------------------------------
 # PoW
 # ---------------------------------------------------------------------------

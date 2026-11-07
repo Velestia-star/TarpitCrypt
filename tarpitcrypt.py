@@ -589,6 +589,10 @@ def _parse_header(blob: bytes) -> Header:
 
     pow_diff = blob[offset]
     offset += 1
+    if bool(flags & FLAG_POW) != bool(pow_diff):
+        raise ValueError(
+            f"FLAGS.POW={bool(flags & FLAG_POW)} 与 POW_DIFF={pow_diff} 不一致"
+        )
 
     salt = blob[offset : offset + SALT_LEN]
     offset += SALT_LEN
@@ -624,6 +628,45 @@ def _parse_header(blob: bytes) -> Header:
         ct_len=ct_len,
         raw=blob[:HEADER_LEN],
     )
+
+
+def _validate_blob_layout(blob: bytes, header: Header) -> tuple[bytes, bytes] | None:
+    """校验主密文段与诱饵段的长度，返回诱饵段 ``(nonce, 密文)`` 或 ``None``。
+
+    这是进入 Argon2 之前的最后一道廉价检查：长度字段全部来自不可信文件头，
+    任何不自洽都必须在这里以 :class:`ValueError` 结束，绝不能拿畸形文件去
+    跑一次完整的 KDF。合法文件（含全部历史版本生成的）在这里必然通过。
+
+    Raises:
+        ValueError: 长度字段越界、截断、尾部残留，或装不下认证标签。
+    """
+    ct_start = HEADER_LEN
+    ct_end = ct_start + header.ct_len
+    if header.ct_len < TAG_LEN:
+        raise ValueError(f"CT_LEN={header.ct_len} 小于认证标签长度 {TAG_LEN}")
+    if ct_end > len(blob):
+        raise ValueError(
+            f"CT_LEN={header.ct_len} 超出文件剩余长度（{len(blob) - ct_start} 字节）"
+        )
+
+    if not header.flags & FLAG_DECOY:
+        if ct_end != len(blob):
+            raise ValueError("主密文之后存在多余字节")
+        return None
+
+    rest = blob[ct_end:]
+    if len(rest) < DECOY_FIXED_LEN:
+        raise ValueError("诱饵段过短")
+    d_nonce = rest[:NONCE_LEN]
+    d_len = _U64.unpack_from(rest, NONCE_LEN)[0]
+    if d_len < TAG_LEN:
+        raise ValueError(f"DECOY_LEN={d_len} 小于认证标签长度 {TAG_LEN}")
+    d_payload = rest[DECOY_FIXED_LEN:]
+    if len(d_payload) != d_len:
+        raise ValueError(
+            f"DECOY_LEN={d_len} 与实际诱饵密文长度 {len(d_payload)} 不一致"
+        )
+    return d_nonce, d_payload
 
 
 # ---------------------------------------------------------------------------
@@ -746,30 +789,8 @@ def decrypt(
     """
     _require_deps()
     header = _parse_header(blob)
-
-    ct_start = HEADER_LEN
-    ct_end = ct_start + header.ct_len
-    if ct_end > len(blob):
-        raise ValueError(
-            f"CT_LEN={header.ct_len} 超出文件剩余长度（{len(blob) - ct_start} 字节）"
-        )
-    ciphertext = blob[ct_start:ct_end]
-
-    decoy: tuple[bytes, bytes] | None = None
-    if header.flags & FLAG_DECOY:
-        rest = blob[ct_end:]
-        if len(rest) < DECOY_FIXED_LEN:
-            raise ValueError("诱饵段过短")
-        d_nonce = rest[:NONCE_LEN]
-        d_len = _U64.unpack_from(rest, NONCE_LEN)[0]
-        d_payload = rest[DECOY_FIXED_LEN:]
-        if len(d_payload) != d_len:
-            raise ValueError(
-                f"DECOY_LEN={d_len} 与实际诱饵密文长度 {len(d_payload)} 不一致"
-            )
-        decoy = (d_nonce, d_payload)
-    elif ct_end != len(blob):
-        raise ValueError("主密文之后存在多余字节")
+    decoy = _validate_blob_layout(blob, header)
+    ciphertext = blob[HEADER_LEN : HEADER_LEN + header.ct_len]
 
     keyfile_bytes = keyfile or b""
 
@@ -814,16 +835,17 @@ def decrypt(
 
 
 def describe(blob: bytes) -> dict[str, Any]:
-    """返回文件头的可读描述，无需口令。
+    """返回文件头与分段的可读描述，无需口令。
+
+    校验规则与 :func:`decrypt` 完全一致：截断、尾部残留或诱饵段不自洽的
+    文件会直接抛 :class:`ValueError`，不会再打印一份自相矛盾的元数据。
 
     Raises:
         ValueError: 格式非法。
     """
     header = _parse_header(blob)
-    decoy_len: int | None = None
-    ct_end = HEADER_LEN + header.ct_len
-    if header.flags & FLAG_DECOY and len(blob) >= ct_end + DECOY_FIXED_LEN:
-        decoy_len = _U64.unpack_from(blob, ct_end + NONCE_LEN)[0]
+    decoy = _validate_blob_layout(blob, header)
+    decoy_len = len(decoy[1]) if decoy is not None else None
     return {
         "version": VERSION,
         "flags": {
