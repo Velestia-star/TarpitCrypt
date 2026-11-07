@@ -325,18 +325,11 @@ _INJECTION_REWRITES = (
 )
 
 
-def _apply_injection_level(text: str, level: str, key: str,
-                           rng: _random.Random) -> str:
-    """按档位改写注入口吻。强指令保持原文；混合档按文件分散选档。"""
-    effective = level
-    if level == "混合":
-        # 用「构建号 + 文件名」做确定性选择，同一次构建内自洽；不同构建、
-        # 不同文件各自不同，避免形成新的内容指纹。
-        local = _random.Random(f"{key}|{rng.getrandbits(32)}")
-        effective = local.choice(("强指令", "弱暗示", "中性"))
-    if effective == "强指令":
+def _apply_injection_level(text: str, level: str) -> str:
+    """按单档改写注入口吻。强指令保持原文；混合档由 build_sidecar 分派。"""
+    if level == "强指令":
         return text
-    idx = 1 if effective == "弱暗示" else 2
+    idx = 1 if level == "弱暗示" else 2
     for strong, weak, neutral in _INJECTION_REWRITES:
         text = text.replace(strong, (weak, neutral)[idx - 1])
     return text
@@ -1817,12 +1810,19 @@ def build_sidecar(
         values["NOTE"] = note
     files = _render(values, note, poison)
     # 口吻分档：在渲染完之后统一改写，避免动到几十处模板本身。
+    #
+    # 混合档用「随机起点 + 轮转」而不是每个文件独立随机 —— 纯随机有可能
+    # 整包一个强指令档都没落到（CI 在 ubuntu 上就抓到过），那就不叫混合了。
+    # 轮转保证三档都出现，随机起点保证不同构建不形成固定指纹。
     tone_rng = _rng(values)
-    files = {
-        rel: _apply_injection_level(txt, injection,
-                                    f"{values['BUILD']}|{rel}", tone_rng)
-        for rel, txt in files.items()
-    }
+    start = tone_rng.randrange(3)
+    order = ("强指令", "弱暗示", "中性")
+    toned: dict[str, str] = {}
+    for i, (rel, txt) in enumerate(files.items()):
+        effective = (injection if injection != "混合"
+                     else order[(start + i) % 3])
+        toned[rel] = _apply_injection_level(txt, effective)
+    files = toned
     _audit_isolation(files)
 
     out.mkdir(parents=True, exist_ok=True)

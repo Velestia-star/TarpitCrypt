@@ -547,8 +547,8 @@ def main() -> int:
                 poison="RAG投毒", injection=level, seed="tone-selftest")
             tone_texts[level] = "\n".join(
                 (tone_kit.root / rel).read_text(encoding="utf-8")
-                for rel in (dk.P_ARCH, dk.P_PRIOR, dk.P_INDEX, dk.P_DRAFT_REPORT)
-                if (tone_kit.root / rel).is_file())
+                for rel in tone_kit.files
+                if rel.endswith((".md", ".txt", ".json")))
         def tone_counts(text: str) -> tuple[int, int, int]:
             return (sum(text.count(s) for s, _, _ in dk._INJECTION_REWRITES),
                     sum(text.count(w) for _, w, _ in dk._INJECTION_REWRITES),
