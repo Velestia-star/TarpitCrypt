@@ -56,7 +56,7 @@ def test_content_probe_regression() -> None:
             src = make_package(Path(td))
             out = Path(td) / "sidecar"
             dk.build_sidecar(src, out_dir=out, layers=4, poison=poison)
-            r = cp.probe_package(out, budget=140, poison=poison)
+            r = cp.probe_package(out, budget=256, poison=poison)
             check(f"内容层[{poison}] 安全不变量（无真实主机泄露）",
                   r["safety_ok"], str(r["leaks"]))
             check(f"内容层[{poison}] AI agent 被 TRAPPED",
@@ -524,6 +524,17 @@ def main() -> int:
         ill_brk = (ill_kit.root / "BREAKTHROUGH.draft.md").read_text(encoding="utf-8")
         check("乐观拟稿报告诱导主人持续投入",
               "持续投入" in ill_brk and "突破在即" in ill_brk)
+
+        # 防指纹 + 真实感区间：进度幻觉必须每次构建随机、且数值落在可信范围
+        ill_kit2 = dk.build_sidecar(src, out_dir=root / "ill_kit2",
+                                    armored=container, poison="进度幻觉", layers=4)
+        dash_a = (ill_kit.root / "solve_dashboard.json").read_text(encoding="utf-8")
+        dash_b = (ill_kit2.root / "solve_dashboard.json").read_text(encoding="utf-8")
+        check("进度幻觉每构建随机化（防指纹：两次构建仪表盘不同）",
+              dash_a != dash_b, "两次构建完全一致（可被指纹识别）")
+        total_b = int(ill_dash["rounds"][-1]["blocks"].split("/")[1])
+        check("伪仪表盘分块数为真实感区间（12~28）", 12 <= total_b <= 28, str(total_b))
+        check("伪仪表盘 verified 恒为 False（永不真正收敛）", ill_dash["verified"] is False)
 
         # 内容陷阱文件不得泄露伴生口令（真值只回报告，不落盘）
         _content_files = ["resources/decoy_strings.txt", "ioc_list.json",
