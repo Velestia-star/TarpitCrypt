@@ -27,6 +27,8 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import secrets
+import subprocess
 import sys
 import threading
 import time
@@ -51,6 +53,58 @@ MAX_BODY_BYTES: Final[int] = 512 * 1024 * 1024  # 512 MB
 
 #: Argon2id 是 GiB 级内存硬函数，并发跑两个大参数会直接把机器拖死。
 _CRYPTO_LOCK: Final[threading.Lock] = threading.Lock()
+
+#: 加密/解密的结果会顺手存一份到磁盘，这样「打开所在目录」才有意义。
+_OUT_DIR: Path = Path.home() / "TarpitCrypt"
+
+#: 只有服务端自己登记过的产出物才允许被打开。令牌随机，客户端猜不到。
+_ARTIFACTS: dict[str, Path] = {}
+_ARTIFACT_LOCK: Final[threading.Lock] = threading.Lock()
+_MAX_ARTIFACTS: Final[int] = 200
+
+
+def _unique_path(directory: Path, name: str) -> Path:
+    """在同一目录里找一个不冲突的文件名。"""
+    candidate = directory / name
+    if not candidate.exists():
+        return candidate
+    stem, dot, ext = name.rpartition(".")
+    base = stem if dot else name
+    suffix = f".{ext}" if dot else ""
+    for index in range(1, 1000):
+        candidate = directory / f"{base}({index}){suffix}"
+        if not candidate.exists():
+            return candidate
+    raise OSError("同名文件太多了，换个目录吧")
+
+
+def _save_artifact(name: str, data: bytes) -> Path:
+    """把结果写进输出目录，返回落盘路径。"""
+    _OUT_DIR.mkdir(parents=True, exist_ok=True)
+    path = _unique_path(_OUT_DIR, name)
+    path.write_bytes(data)
+    return path
+
+
+def _remember_artifact(path: Path) -> str:
+    """登记一个可打开的产出物，返回令牌。"""
+    token = secrets.token_hex(8)
+    with _ARTIFACT_LOCK:
+        _ARTIFACTS[token] = path
+        while len(_ARTIFACTS) > _MAX_ARTIFACTS:
+            _ARTIFACTS.pop(next(iter(_ARTIFACTS)), None)
+    return token
+
+
+def open_in_file_manager(path: Path) -> None:
+    """用系统文件管理器打开并选中这个文件。"""
+    if sys.platform.startswith("win"):
+        subprocess.Popen(["explorer", "/select,", str(path)])
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", "-R", str(path)])
+    else:
+        subprocess.Popen(["xdg-open", str(path.parent)])
+
 
 #: 界面上的三档预设。耗时来自 README 的实测数据。
 PRESETS: Final[dict[str, dict[str, Any]]] = {
@@ -289,8 +343,16 @@ class TarpitRequestHandler(BaseHTTPRequestHandler):
             return
 
         route = self.path.rstrip("/")
-        if route not in ("/api/encrypt", "/api/decrypt"):
+        if route not in ("/api/encrypt", "/api/decrypt", "/api/reveal"):
             self._fail(HTTPStatus.NOT_FOUND, "没有这个接口")
+            return
+
+        # reveal 走 JSON，不是 multipart，必须排在表单解析之前
+        if route == "/api/reveal":
+            try:
+                self._handle_reveal(body)
+            except ValueError as exc:
+                self._fail(HTTPStatus.BAD_REQUEST, str(exc))
             return
 
         try:
@@ -354,6 +416,8 @@ class TarpitRequestHandler(BaseHTTPRequestHandler):
             Path(sanitize_member_path(first_name)).parts[0] if is_bundle else first_name
         )
         out_name = _safe_output_name(source_name, "") + ".tarpit"
+        saved = _save_artifact(out_name, blob)
+        artifact = _remember_artifact(saved)
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Content-Length", str(len(blob)))
@@ -363,6 +427,10 @@ class TarpitRequestHandler(BaseHTTPRequestHandler):
             {"mem": params.mem, "time": params.time, "para": params.para,
              "rounds": params.rounds, "pow": params.pow, "cipher": params.cipher}
         ))
+        self.send_header("X-Tarpit-Artifact", artifact)
+        self.send_header("X-Tarpit-Saved-Path", quote(str(saved)))
+        self.send_header("Access-Control-Expose-Headers",
+                         "X-Tarpit-Elapsed, X-Tarpit-Artifact, X-Tarpit-Saved-Path")
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(blob)
@@ -392,16 +460,44 @@ class TarpitRequestHandler(BaseHTTPRequestHandler):
         if zipfile.is_zipfile(io.BytesIO(plaintext)):
             out_name = out_name if out_name.endswith(".zip") else out_name + ".zip"
 
+        safe_name = out_name or "plain.bin"
+        saved = _save_artifact(safe_name, plaintext)
+        artifact = _remember_artifact(saved)
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Content-Length", str(len(plaintext)))
         self.send_header("Content-Disposition", _content_disposition(out_name or "plain.bin"))
         self.send_header("X-Tarpit-Elapsed", f"{elapsed:.2f}")
         self.send_header("X-Tarpit-Decoy", "1" if is_decoy else "0")
-        self.send_header("Access-Control-Expose-Headers", "X-Tarpit-Elapsed, X-Tarpit-Decoy")
+        self.send_header("X-Tarpit-Artifact", artifact)
+        self.send_header("X-Tarpit-Saved-Path", quote(str(saved)))
+        self.send_header("Access-Control-Expose-Headers",
+                         "X-Tarpit-Elapsed, X-Tarpit-Decoy, X-Tarpit-Artifact, X-Tarpit-Saved-Path")
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(plaintext)
+
+    def _handle_reveal(self, body: bytes) -> None:
+        """在文件管理器里打开某个产出物（只认服务端登记过的令牌）。"""
+        try:
+            payload = json.loads(body.decode("utf-8") or "{}")
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise ValueError("请求体不是合法 JSON") from None
+        token = str(payload.get("artifact", ""))
+        with _ARTIFACT_LOCK:
+            path = _ARTIFACTS.get(token)
+        if path is None:
+            self._fail(HTTPStatus.NOT_FOUND, "没有这条产出物记录（服务重启后会失效）")
+            return
+        if not path.exists():
+            self._fail(HTTPStatus.NOT_FOUND, f"文件已经不在了：{path}")
+            return
+        try:
+            open_in_file_manager(path)
+        except OSError as exc:
+            self._fail(HTTPStatus.INTERNAL_SERVER_ERROR, f"打不开文件管理器：{exc}")
+            return
+        self._send_json(HTTPStatus.OK, {"ok": True, "path": str(path)})
 
     @staticmethod
     def _pick_file(files: list[tuple[str, str, bytes]], field: str) -> bytes | None:
@@ -448,6 +544,7 @@ def _configure_stdio() -> None:
 
 def main(argv: list[str] | None = None) -> int:
     """启动本地 Web 服务。"""
+    global _OUT_DIR
     _configure_stdio()
     parser = argparse.ArgumentParser(
         prog="tarpitcrypt-web",
@@ -456,7 +553,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--host", default=HOST, help=f"监听地址，默认 {HOST}")
     parser.add_argument("--port", type=int, default=PORT, help=f"端口，默认 {PORT}")
     parser.add_argument("--open", action="store_true", help="启动后自动打开浏览器")
+    parser.add_argument(
+        "--out-dir",
+        default=str(Path.home() / "TarpitCrypt"),
+        help="加密/解密结果另存到哪个目录，默认 ~/TarpitCrypt",
+    )
     args = parser.parse_args(argv)
+    _OUT_DIR = Path(args.out_dir).expanduser()
 
     if args.host not in ("127.0.0.1", "localhost", "::1"):
         print(
@@ -467,6 +570,7 @@ def main(argv: list[str] | None = None) -> int:
     server = TarpitWebServer((args.host, args.port), TarpitRequestHandler)
     url = f"http://{args.host}:{server.server_address[1]}"
     print(f"TarpitCrypt Web 已启动：{url}")
+    print(f"加密/解密结果会另存到：{_OUT_DIR}")
     print("Ctrl+C 退出。口令只在本机内存里过一遍，不落盘、不进日志。")
     if args.open:
         threading.Timer(0.4, lambda: webbrowser.open(url)).start()
@@ -807,6 +911,44 @@ INDEX_HTML = """<!doctype html>
       hint.className = "hint";
       hint.textContent = "解密时请用对应的口令" + (mode === "encrypt" ? "和 keyfile" : "") + "。";
       result.append(hint);
+      const artifact = res.headers.get("X-Tarpit-Artifact");
+      const savedPath = res.headers.get("X-Tarpit-Saved-Path");
+      if (artifact && savedPath) {
+        const box = document.createElement("p");
+        box.className = "hint";
+        box.append(document.createTextNode("另外存了一份到："));
+        const pathCode = document.createElement("code");
+        pathCode.textContent = decodeURIComponent(savedPath);
+        box.append(pathCode);
+        const openBtn = document.createElement("button");
+        openBtn.type = "button";
+        openBtn.textContent = "打开所在目录";
+        openBtn.style.cssText =
+          "margin-left:10px;padding:6px 12px;border-radius:8px;" +
+          "border:1px solid #3a2f22;background:#241d16;color:#d9a25f;" +
+          "cursor:pointer;font-size:13px";
+        openBtn.addEventListener("click", async () => {
+          openBtn.disabled = true;
+          try {
+            const reply = await fetch("/api/reveal", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ artifact }),
+            });
+            if (!reply.ok) {
+              const detail = await reply.json().catch(() => ({}));
+              throw new Error(detail.error || ("HTTP " + reply.status));
+            }
+          } catch (error) {
+            alert("打不开：" + error.message);
+          } finally {
+            openBtn.disabled = false;
+          }
+        });
+        box.append(openBtn);
+        result.append(box);
+      }
+
       result.className = "result show";
     } catch (err) {
       clearInterval(tick);
