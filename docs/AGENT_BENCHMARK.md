@@ -5,6 +5,12 @@
 > 本文件是拿真实 agent 跑一遍的记录模板与口径，拿到数据后请替换
 > `armor/README.md` 里的「模拟下界」表述并附本文件链接。
 
+> **内容层已有真实实测入口**：`armor/content_probe.py --real` 会用 OpenAI 兼容的
+> `/v1/chat/completions` 跑一个真实逆向 agent（兼容 OpenAI / DeepSeek / 本地 vLLM /
+> ollama）。配置通过环境变量 `TCP_LLM_BASE_URL` / `TCP_LLM_API_KEY` /
+> `TCP_LLM_MODEL`。它只读取 agent 的文本结论，评估是否跟随注入、是否给主人乐观
+> 报告、是否有真实公网泄露。**无凭证时如实报错，不会用模拟结论顶替真值。**
+
 ## 为什么要实测
 
 「让 AI 做无用功、烧 token」是这个项目的核心主张。现在只有模拟器的
