@@ -786,3 +786,95 @@ def test_write_output_cleans_temp_on_failure(
 
     assert not target.exists()
     assert list(tmp_path.glob(".*.tmp")) == []
+
+
+# ---------------------------------------------------------------------------
+# 单次工作预算与 KDF 失败兜底
+# ---------------------------------------------------------------------------
+
+
+def test_crypto_params_work_is_mem_times_time_times_rounds() -> None:
+    params = tc.CryptoParams(mem=8192, time=2, para=4, rounds=3)
+    assert params.work == 8192 * 2 * 3
+
+
+def test_encrypt_rejects_work_over_budget() -> None:
+    """工作量超过 max_work 时在进 Argon2 前拒绝；None 表示显式放行。"""
+    with pytest.raises(ValueError, match="工作量"):
+        tc.encrypt(b"x", PASSWORD, params=FAST, max_work=1)
+    assert tc.encrypt(b"x", PASSWORD, params=FAST, max_work=None)
+
+
+def test_decrypt_rejects_work_over_budget() -> None:
+    blob = tc.encrypt(b"x", PASSWORD, params=FAST)
+    with pytest.raises(ValueError, match="工作量"):
+        tc.decrypt(blob, PASSWORD, max_work=1)
+    assert tc.decrypt(blob, PASSWORD, max_work=None) == (b"x", False)
+
+
+def test_heavy_header_rejected_before_kdf(monkeypatch: pytest.MonkeyPatch) -> None:
+    """恶意文件声明 2 GiB / time=10 / rounds=8 时，不能进 Argon2。"""
+    blob = bytearray(tc.encrypt(b"payload", PASSWORD, params=FAST))
+    struct.pack_into(">IHBB", blob, 10, 2 * 1024 * 1024, 10, 1, 8)
+
+    monkeypatch.setattr(tc, "_derive", _fail_derive)
+    with pytest.raises(ValueError, match="工作量"):
+        tc.decrypt(bytes(blob), PASSWORD)
+
+
+def test_describe_reports_work_and_over_default() -> None:
+    """info 要给出工作量，并标出是否需要 --allow-heavy。"""
+    blob = tc.encrypt(b"x", PASSWORD, params=FAST)
+    info = tc.describe(blob)
+    assert info["work_kib_rounds"] == FAST.work
+    assert info["work_over_default"] is False
+
+    heavy = bytearray(blob)
+    struct.pack_into(">IHBB", heavy, 10, 2 * 1024 * 1024, 10, 1, 8)
+    info = tc.describe(bytes(heavy))
+    assert info["work_kib_rounds"] == 2 * 1024 * 1024 * 10 * 8
+    assert info["work_over_default"] is True
+
+
+def test_memory_error_is_wrapped(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Argon2 内存不足不应把 MemoryError 直接冒给调用方。"""
+
+    def boom(**_kwargs: object) -> bytes:
+        raise MemoryError("no memory")
+
+    monkeypatch.setattr(tc, "hash_secret_raw", boom)
+    with pytest.raises(tc.EnvironmentSetupError, match="内存"):
+        tc.encrypt(b"x", PASSWORD, params=FAST)
+
+
+def test_hashing_error_is_wrapped(monkeypatch: pytest.MonkeyPatch) -> None:
+    """argon2-cffi 的 HashingError 要转成可读的环境错误。"""
+    blob = tc.encrypt(b"x", PASSWORD, params=FAST)
+
+    def boom(**_kwargs: object) -> bytes:
+        raise tc._HashingError("argon2 failed")
+
+    monkeypatch.setattr(tc, "hash_secret_raw", boom)
+    with pytest.raises(tc.EnvironmentSetupError, match="Argon2"):
+        tc.decrypt(blob, PASSWORD)
+
+
+def test_cli_kdf_memory_error_exits_4(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Argon2 资源失败走契约 4（环境错误），而不是 traceback。"""
+    src = tmp_path / "plain.bin"
+    src.write_bytes(b"payload")
+    out = tmp_path / "out.tarpit"
+
+    def boom(**_kwargs: object) -> bytes:
+        raise MemoryError("no memory")
+
+    monkeypatch.setattr(tc, "hash_secret_raw", boom)
+    code = _run_cli(
+        monkeypatch,
+        ["encrypt", str(src), str(out), "--password-stdin", *FAST_CLI],
+        stdin="pw\n",
+    )
+    assert code == tc.EXIT_ENV
+    assert not out.exists()

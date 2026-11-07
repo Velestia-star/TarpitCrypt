@@ -50,6 +50,7 @@ export const LIMITS = {
   maxPara: 8,
   minRounds: 1,
   maxRounds: 8,
+  maxWork: 16 * 1024 * 1024,
 };
 
 export const ALLOWED_POW_BITS = [0, 16, 18, 20];
@@ -155,6 +156,15 @@ export function normalizeParams(input) {
   p.pow = p.pow ?? 0;
   if (!ALLOWED_POW_BITS.includes(p.pow)) {
     throw new Error(`pow 必须是 ${ALLOWED_POW_BITS.join("/")} 之一`);
+  }
+  // 与 Python 的 DEFAULT_MAX_WORK_KIB_ROUNDS 对齐：浏览器版没有 --allow-heavy，
+  // 打开一个声明了 2 GiB / time=10 / rounds=8 的畸形文件时，先在解析阶段拒绝，
+  // 不让标签页为它跑满 Argon2。
+  const work = p.mem * p.time * p.rounds;
+  if (work > LIMITS.maxWork) {
+    throw new Error(
+      `KDF 工作量 ${work} KiB·轮 超过默认上限 ${LIMITS.maxWork}，已拒绝执行`,
+    );
   }
   return p;
 }

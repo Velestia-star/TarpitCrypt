@@ -75,6 +75,16 @@ async function main() {
     ok("KDF rounds=2", hex(await core.derive(pw, empty, salt, { ...base, rounds: 2 })) === EXPECT.k2);
     ok("KDF keyfile", hex(await core.derive(pw, enc.encode("keyfile-bytes"), salt, base)) === EXPECT.k3);
 
+    // 工作量预算：畸形头在 parseHeader 阶段就要被拒，不能进 Argon2。
+    const heavyHeader = core.packHeader({
+      flags: 0, mem: 2 * 1024 * 1024, time: 10, para: 1, rounds: 8, powDiff: 0,
+      salt: new Uint8Array(32), nonce: new Uint8Array(24),
+      powNonce: new Uint8Array(8), ctLen: 16,
+    });
+    let heavyRejected = false;
+    try { core.parseHeader(heavyHeader); } catch (e) { heavyRejected = /工作量/.test(e.message); }
+    ok("工作量上限", heavyRejected);
+
     const params = { mem: 8192, time: 1, para: 1, rounds: 1, pow: 0 };
     const made = await core.encrypt(enc.encode("js-made-payload"), enc.encode("js-pw"), { params });
     ok("JS 自解", dec.decode((await core.decrypt(made, enc.encode("js-pw"))).data) === "js-made-payload");

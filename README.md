@@ -60,7 +60,8 @@ python tarpitcrypt.py info notes.pdf.tarpit
 
 默认流程只问一个口令。`--keyfile` 和 `--decoy` 都是**可选**的高级 / 兼容项；
 不写它们，程序不会要求任何额外秘密。想让 AI 逆向更难受，用 `armor/`
-的多层容器——同样只需要一个主口令。
+的多层容器——同样只需要一个主口令。默认档不会碰到单次工作预算；自定义到
+超过 16 GiB·轮时需要 `--allow-heavy`。
 
 ### 可选：加一个 keyfile
 
@@ -264,6 +265,13 @@ Argon2id 是内存硬函数，GPU/ASIC 的并行优势被内存带宽卡死，�
   标签」并与文件实际长度对齐。截断、尾部残留、`FLAGS.POW` 与 `POW_DIFF`
   不一致的畸形文件在进入 Argon2 之前就失败，不会为明显坏掉的文件付一次
   完整 KDF，`info` 也不会再打印自相矛盾的元数据。
+- **单次工作预算**：解密前还会检查文件头里的 `mem × time × rounds`，默认上限
+  **16 GiB·轮**（覆盖最重的官方预设 12 GiB·轮并留约 33% 余量）。超过就拒绝，
+  需要 `--allow-heavy` 显式放行；`info` 会显示 `work_kib_rounds` 与
+  `work_over_default`。这样 91 字节的畸形文件没法让解密端按
+  `2 GiB / time=10 / rounds=8` 跑满一次 Argon2。
+- **KDF 资源失败可读**：Argon2 抛 `MemoryError` / `HashingError` 时统一转成
+  `EnvironmentSetupError`，CLI 返回退出码 4，不再打 traceback。
 
 ## 什么情况下不安全（请务必读）
 

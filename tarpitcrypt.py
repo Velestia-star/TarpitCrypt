@@ -95,10 +95,14 @@ _LOGGER: Final[logging.Logger] = logging.getLogger("tarpitcrypt")
 # ---------------------------------------------------------------------------
 
 _DEPS_ERROR: str | None = None
+#: 依赖缺失时留一个占位异常类，真正的 ``_require_deps`` 会先失败；
+#: 这样 ``except _HashingError`` 在静态检查里也有确定的名字。
+_HashingError: type[BaseException] = RuntimeError
 try:  # pragma: no cover - 依赖齐全时无分支
     # argon2-cffi 在 low_level 里导出的是 ``Type``（D=0 / I=1 / ID=2）。
     # 注意：``hash_secret_raw`` 的第一个参数 ``secret`` 就是**口令本身**，
     # 它没有单独的 pepper 参数，口令与 keyfile 必须先合成再喂进去。
+    from argon2.exceptions import HashingError as _HashingError
     from argon2.low_level import Type as _Argon2Type
     from argon2.low_level import hash_secret_raw
     from cryptography.exceptions import InvalidTag
@@ -201,6 +205,12 @@ MIN_PARA: Final[int] = 1
 MAX_PARA: Final[int] = 8
 MIN_ROUNDS: Final[int] = 1
 MAX_ROUNDS: Final[int] = 8
+
+#: 单次派生的默认工作量上限，单位是 **KiB·轮**（``mem × time × rounds``）。
+#: 官方最重预设是 1 GiB × time=4 × rounds=3 = 12 GiB·轮，这里留约 33% 余量。
+#: 文件头是不信任输入：一个 91 字节的文件可以声明 2 GiB / time=10 / rounds=8，
+#: 不设上限就等于把「解密」变成「按攻击者的参数跑一次满负荷 Argon2」。
+DEFAULT_MAX_WORK_KIB_ROUNDS: Final[int] = 16 * 1024 * 1024
 
 #: 契约 5：允许的 PoW 难度（前导零比特数）。
 ALLOWED_POW_BITS: Final[frozenset[int]] = frozenset({0, 16, 18, 20})
@@ -385,6 +395,26 @@ def _derive(
     return out
 
 
+def _derive_checked(*args: Any, **kwargs: Any) -> bytes:
+    """v1 加密/解密专用：把 Argon2 的资源失败转成可读错误。
+
+    armor 直接调用 :func:`_derive`，不经过这里，避免改变它的异常契约。
+
+    Raises:
+        EnvironmentSetupError: Argon2 因内存不足等原因无法完成。
+    """
+    try:
+        return _derive(*args, **kwargs)
+    except MemoryError as exc:
+        raise EnvironmentSetupError(
+            "Argon2id 内存不足，无法完成密钥派生；请降低 mem 或换内存更大的机器"
+        ) from exc
+    except _HashingError as exc:  # type: ignore[misc]
+        raise EnvironmentSetupError(
+            f"Argon2id 执行失败（可能是内存不足或参数不可用）：{exc}"
+        ) from exc
+
+
 def _decoy_salt(salt: bytes) -> bytes:
     """由主盐确定性派生诱饵层的盐，确保两层使用彼此独立的密钥。"""
     return hashlib.sha256(_DECOY_SALT_DOMAIN + salt).digest()
@@ -410,6 +440,14 @@ class CryptoParams:
     pow: int = 0
     cipher: Cipher = CIPHER_AESGCM
 
+    @property
+    def work(self) -> int:
+        """相对工作量（KiB·轮）：``mem × time × rounds``。
+
+        ``para`` 影响峰值内存和延迟，但总工作量主要由这三项决定。
+        """
+        return self.mem * self.time * self.rounds
+
     def validate(self) -> None:
         """校验参数是否落在允许区间。
 
@@ -428,6 +466,29 @@ class CryptoParams:
             raise ValueError(f"pow 必须是 {sorted(ALLOWED_POW_BITS)} 之一")
         if self.cipher not in CIPHERS:
             raise ValueError(f"cipher 必须是 {list(CIPHERS)} 之一")
+
+
+def _check_work_budget(
+    mem: int, time: int, rounds: int, *, max_work: int | None
+) -> int:
+    """在进入 Argon2 之前检查 ``mem × time × rounds``。
+
+    Returns:
+        实际工作量（KiB·轮）。
+
+    Raises:
+        ValueError: 超过 *max_work*；``max_work=None`` 表示不限制。
+    """
+    work = mem * time * rounds
+    if max_work is not None and work > max_work:
+        work_gib = work / (1024 * 1024)
+        raise ValueError(
+            f"KDF 工作量约 {work_gib:.1f} GiB·轮（{work} KiB·轮），"
+            f"超过上限 {max_work} KiB·轮，已拒绝执行；"
+            "确认这不是畸形文件或误配参数后，可用 --allow-heavy"
+            "（库调用传 max_work=None）放行。"
+        )
+    return work
 
 
 # ---------------------------------------------------------------------------
@@ -689,6 +750,7 @@ def encrypt(
     keyfile: bytes | None = None,
     decoy_plaintext: bytes | None = None,
     decoy_password: bytes | None = None,
+    max_work: int | None = DEFAULT_MAX_WORK_KIB_ROUNDS,
 ) -> bytes:
     """加密 *plaintext*，返回完整的 ``.tarpit`` 文件字节。
 
@@ -701,17 +763,20 @@ def encrypt(
             实际并没有。
         decoy_plaintext: 诱饵层明文；``None`` 表示不生成诱饵层。
         decoy_password: 诱饵层口令；必须与主口令不同且非空。
+        max_work: 单次派生允许的最大工作量（KiB·轮）；``None`` 表示不限制。
+            默认值挡住「自定义参数重到合法用户也扛不住」的文件。
 
     Returns:
         可直接写盘的完整文件字节。
 
     Raises:
-        ValueError: 参数非法、口令为空、keyfile 为空或过大、诱饵参数缺失，
-            或诱饵口令与主口令相同。
-        EnvironmentSetupError: 密码学依赖缺失。
+        ValueError: 参数非法、口令为空、keyfile 为空或过大、诱饵参数缺失、
+            诱饵口令与主口令相同，或工作量超过 ``max_work``。
+        EnvironmentSetupError: 密码学依赖缺失，或 Argon2 无法完成。
     """
     _require_deps()
     params.validate()
+    _check_work_budget(params.mem, params.time, params.rounds, max_work=max_work)
     if not password:
         raise ValueError("口令不能为空；空口令没有可保护的熵")
     if keyfile is not None and not keyfile:
@@ -740,7 +805,7 @@ def encrypt(
     salt = secrets.token_bytes(SALT_LEN)
     nonce = secrets.token_bytes(NONCE_LEN)
 
-    main_key = _derive(
+    main_key = _derive_checked(
         password, keyfile_bytes, salt, params.mem, params.time, params.para, params.rounds
     )
     pow_nonce = _grind_pow(main_key, params.pow)
@@ -767,7 +832,7 @@ def encrypt(
     if decoy_plaintext is not None:
         assert decoy_password is not None  # 配对检查已保证
         d_nonce = secrets.token_bytes(NONCE_LEN)
-        d_key = _derive(
+        d_key = _derive_checked(
             decoy_password,
             keyfile_bytes,
             _decoy_salt(salt),
@@ -789,6 +854,7 @@ def decrypt(
     password: bytes,
     *,
     keyfile: bytes | None = None,
+    max_work: int | None = DEFAULT_MAX_WORK_KIB_ROUNDS,
 ) -> tuple[bytes, bool]:
     """解密 ``.tarpit`` 文件字节。
 
@@ -797,27 +863,31 @@ def decrypt(
         password: 候选口令字节；空口令仍被接受，用于解开历史上用空口令
             加密的文件。
         keyfile: keyfile 内容；``None`` 表示未提供。
+        max_work: 单次派生允许的最大工作量（KiB·轮）；``None`` 表示不限制。
+            默认值挡住「91 字节文件声明 2 GiB / time=10 / rounds=8」这类
+            把解密变成满负荷 Argon2 的输入。
 
     Returns:
         ``(明文, is_decoy)``；命中诱饵层时 ``is_decoy`` 为 ``True``（契约 3）。
 
     Raises:
-        ValueError: 口令 / keyfile 错误、文件被篡改或格式非法。绝不会静默
-            返回乱码或 ``None``。
-        EnvironmentSetupError: 密码学依赖缺失。
+        ValueError: 口令 / keyfile 错误、文件被篡改或格式非法、工作量超过
+            ``max_work``。绝不会静默返回乱码或 ``None``。
+        EnvironmentSetupError: 密码学依赖缺失，或 Argon2 无法完成。
     """
     _require_deps()
     if keyfile is not None and len(keyfile) > MAX_KEYFILE_BYTES:
         raise ValueError(f"keyfile 不能超过 {MAX_KEYFILE_BYTES // 1024} KiB")
     header = _parse_header(blob)
     decoy = _validate_blob_layout(blob, header)
+    _check_work_budget(header.mem, header.time, header.rounds, max_work=max_work)
     ciphertext = blob[HEADER_LEN : HEADER_LEN + header.ct_len]
 
     keyfile_bytes = keyfile or b""
 
     # 主层：无论 PoW 是否通过，都必须完整跑一遍 _derive。
     # 若在 PoW 处短路返回，诱饵口令会被误判成「不存在」。
-    main_key = _derive(
+    main_key = _derive_checked(
         password,
         keyfile_bytes,
         header.salt,
@@ -834,7 +904,7 @@ def decrypt(
     if decoy is not None:
         d_nonce, d_payload = decoy
         d_aad = header.raw + d_nonce + _U64.pack(len(d_payload))
-        d_key = _derive(
+        d_key = _derive_checked(
             password,
             keyfile_bytes,
             _decoy_salt(header.salt),
@@ -860,6 +930,8 @@ def describe(blob: bytes) -> dict[str, Any]:
 
     校验规则与 :func:`decrypt` 完全一致：截断、尾部残留或诱饵段不自洽的
     文件会直接抛 :class:`ValueError`，不会再打印一份自相矛盾的元数据。
+    只做体检，不跑 KDF；``work_over_default`` 为真时，解密需要
+    ``--allow-heavy`` 才会放行。
 
     Raises:
         ValueError: 格式非法。
@@ -867,6 +939,7 @@ def describe(blob: bytes) -> dict[str, Any]:
     header = _parse_header(blob)
     decoy = _validate_blob_layout(blob, header)
     decoy_len = len(decoy[1]) if decoy is not None else None
+    work = header.mem * header.time * header.rounds
     return {
         "version": VERSION,
         "flags": {
@@ -881,6 +954,8 @@ def describe(blob: bytes) -> dict[str, Any]:
         "pow_diff": header.pow_diff,
         "ct_len": header.ct_len,
         "decoy_len": decoy_len,
+        "work_kib_rounds": work,
+        "work_over_default": work > DEFAULT_MAX_WORK_KIB_ROUNDS,
         "total_len": len(blob),
     }
 
@@ -1035,6 +1110,11 @@ def _build_parser() -> argparse.ArgumentParser:
     enc.add_argument("input", help="明文文件路径")
     enc.add_argument("output", help="输出 .tarpit 文件路径")
     enc.add_argument("--force", action="store_true", help="覆盖已存在的输出文件")
+    enc.add_argument(
+        "--allow-heavy",
+        action="store_true",
+        help=f"允许超过默认单次工作预算（{DEFAULT_MAX_WORK_KIB_ROUNDS // (1024 * 1024)} GiB·轮）",
+    )
     enc.add_argument("--keyfile", help="keyfile 路径（可选，兼容旧文件）")
     enc.add_argument("--decoy", help="诱饵层明文的路径（可选，兼容旧文件）")
     enc.add_argument("--password-stdin", action="store_true", help="从 stdin 读取主口令")
@@ -1051,6 +1131,11 @@ def _build_parser() -> argparse.ArgumentParser:
     dec.add_argument("input", help=".tarpit 文件路径")
     dec.add_argument("output", help="明文输出路径")
     dec.add_argument("--force", action="store_true", help="覆盖已存在的输出文件")
+    dec.add_argument(
+        "--allow-heavy",
+        action="store_true",
+        help=f"允许超过默认单次工作预算（{DEFAULT_MAX_WORK_KIB_ROUNDS // (1024 * 1024)} GiB·轮）",
+    )
     dec.add_argument("--keyfile", help="keyfile 路径（可选，兼容旧文件）")
     dec.add_argument("--password-stdin", action="store_true", help="从 stdin 读取口令")
 
@@ -1242,6 +1327,7 @@ def _run(args: argparse.Namespace) -> int:
             keyfile=keyfile,
             decoy_plaintext=decoy_plaintext,
             decoy_password=decoy_password,
+            max_work=None if args.allow_heavy else DEFAULT_MAX_WORK_KIB_ROUNDS,
         )
         _write_output(output_path, blob, force=args.force)
         print(
@@ -1267,7 +1353,12 @@ def _run(args: argparse.Namespace) -> int:
         )
         keyfile = _read_keyfile(args.keyfile)
         blob = input_path.read_bytes()
-        data, is_decoy = decrypt(blob, password, keyfile=keyfile)
+        data, is_decoy = decrypt(
+            blob,
+            password,
+            keyfile=keyfile,
+            max_work=None if args.allow_heavy else DEFAULT_MAX_WORK_KIB_ROUNDS,
+        )
         _write_output(output_path, data, force=args.force)
         if is_decoy:
             print(f"已解密（诱饵层）：{args.output}（{len(data)} 字节）", file=sys.stderr)

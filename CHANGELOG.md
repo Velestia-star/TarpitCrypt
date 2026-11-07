@@ -41,6 +41,21 @@
 - 新增 `docs/ROADMAP.md`：把「让 AI 判断不了自己是否找对」作为主线，区分
   v1 基础加密与 armor 整活层，列出 P0~P4 与度量口径。
 
+### 安全加固：单次工作预算与 KDF 失败兜底
+
+- `encrypt` / `decrypt` 在进入 Argon2 之前检查文件头或参数的
+  `mem × time × rounds`，默认上限 16 GiB·轮；超过直接拒绝，不再让
+  91 字节的畸形文件按 `2 GiB / time=10 / rounds=8` 跑满一次 KDF。
+- 新增 `--allow-heavy` / `max_work=None` 显式放行；`info` 输出
+  `work_kib_rounds` 与 `work_over_default`，先看再决定要不要放行。
+- Argon2 的 `MemoryError` / `HashingError` 统一包装成
+  `EnvironmentSetupError`，CLI 返回退出码 4，不再打 traceback。
+- 浏览器核心同步工作量上限（`LIMITS.maxWork`）；在线版打开畸形文件时
+  在 `parseHeader` 阶段就拒绝，不会把标签页跑死。
+- 诱饵层逻辑未改动；预算只按文件头的 KDF 参数计算，主层与诱饵层共用同一上限。
+- 行为变化：此前用自定义重参数（超过 16 GiB·轮）生成的文件，解密时需要加
+  `--allow-heavy`；默认档与全部官方预设都不受影响。
+
 ## v0.3.10 — 2026-11-07
 
 补齐 `docs/AI_RE_THREATMODEL.md` 第四节列出的四条诱导层短板。
