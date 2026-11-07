@@ -99,6 +99,11 @@ a { color: var(--accent); }
   font-size: 13px;
 }
 
+.pw-warn {
+  color: var(--bad);
+  margin: 6px 0 0;
+}
+
 .link {
   color: var(--accent);
   cursor: pointer;

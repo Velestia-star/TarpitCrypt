@@ -81,6 +81,7 @@ __all__ = [
     "MAX_KEYFILE_BYTES",
     "TarpitError",
     "UsageError",
+    "check_password_strength",
     "decrypt",
     "describe",
     "encrypt",
@@ -1023,6 +1024,56 @@ def load_ai_config(path: str | os.PathLike[str]) -> tuple[dict[str, Any], list[s
 
 
 # ---------------------------------------------------------------------------
+# 口令强度提示
+# ---------------------------------------------------------------------------
+
+#: 与 ``armor/armor_core.check_password_strength`` 保持同一口径。armor 依赖
+#: 本模块，这里不反向 import；改判定时两边一起改。
+_WEAK_PASSWORDS: Final[frozenset[str]] = frozenset(
+    {"password", "12345678", "qwertyui", "admin123"}
+)
+
+
+def check_password_strength(password: str) -> tuple[bool, str]:
+    """最低强度体检，返回 ``(是否合格, 提示)``。
+
+    只做本地静态检查，不联网、不记录口令。判定刻意保守：长度与字符种类
+    只是必要条件，不代表口令真的高熵。**只用于提示，不阻止加密**——
+    :func:`encrypt` 本身不调用它，CLI / 网页只把结果展示给用户。
+    """
+    if not password:
+        return False, "口令不能为空"
+    if len(password) < 8:
+        return False, "至少 8 个字符"
+    classes = sum(
+        (
+            any(c.islower() for c in password),
+            any(c.isupper() for c in password),
+            any(c.isdigit() for c in password),
+            any(not c.isalnum() for c in password),
+        )
+    )
+    if classes < 2:
+        return False, "建议混用大小写、数字或符号中的至少两类"
+    if password.lower() in _WEAK_PASSWORDS:
+        return False, "这是常见弱口令，换一个"
+    return True, "长度与字符种类达标（不等于高熵，长口令更可靠）"
+
+
+def _warn_weak_password(password: bytes, *, label: str = "口令") -> None:
+    """弱口令只写一条 stderr 警告，绝不阻止加密。"""
+    if not password:
+        return
+    ok, hint = check_password_strength(password.decode("utf-8", "replace"))
+    if not ok:
+        print(
+            f"警告：{label}偏弱——{hint}。仍会继续加密；"
+            "Argon2 只能提高单次尝试成本，挡不住弱口令。",
+            file=sys.stderr,
+        )
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -1308,6 +1359,7 @@ def _run(args: argparse.Namespace) -> int:
             if args.password_stdin
             else _read_password("设置口令：", confirm=True)
         )
+        _warn_weak_password(password)
         keyfile = _read_keyfile(args.keyfile)
         plaintext = input_path.read_bytes()
         decoy_plaintext: bytes | None = None
@@ -1319,6 +1371,7 @@ def _run(args: argparse.Namespace) -> int:
                 if args.decoy_password_stdin
                 else _read_password("设置诱饵口令：", confirm=True)
             )
+            _warn_weak_password(decoy_password, label="诱饵口令")
 
         blob = encrypt(
             plaintext,

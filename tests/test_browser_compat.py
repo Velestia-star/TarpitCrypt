@@ -85,6 +85,10 @@ async function main() {
     try { core.parseHeader(heavyHeader); } catch (e) { heavyRejected = /工作量/.test(e.message); }
     ok("工作量上限", heavyRejected);
 
+    ok("口令体检-短", !core.checkPasswordStrength("short").ok);
+    ok("口令体检-弱", !core.checkPasswordStrength("password").ok);
+    ok("口令体检-强", core.checkPasswordStrength("GoodPass1").ok);
+
     const params = { mem: 8192, time: 1, para: 1, rounds: 1, pow: 0 };
     const made = await core.encrypt(enc.encode("js-made-payload"), enc.encode("js-pw"), { params });
     ok("JS 自解", dec.decode((await core.decrypt(made, enc.encode("js-pw"))).data) === "js-made-payload");

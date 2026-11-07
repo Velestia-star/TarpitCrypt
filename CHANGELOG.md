@@ -56,6 +56,17 @@
 - 行为变化：此前用自定义重参数（超过 16 GiB·轮）生成的文件，解密时需要加
   `--allow-heavy`；默认档与全部官方预设都不受影响。
 
+### 体验：弱口令提示（只警告不强制）
+
+- 新增 `check_password_strength()`，判定与 armor 的
+  `check_password_strength` 同口径（长度 ≥ 8、至少两类字符、常见弱口令表）；
+  只提示，不阻止加密。
+- CLI 在加密 / 设置诱饵口令时写 stderr 警告；网页在口令框下方显示提示，
+  切到解密页自动隐藏。
+- 浏览器核心导出 `checkPasswordStrength()`，与 Python 共用同一口径；
+  不记录口令、不联网。
+- 不改变 `encrypt` / `decrypt` 的行为；弱口令仍然可用，只是会看到提示。
+
 ## v0.3.10 — 2026-11-07
 
 补齐 `docs/AI_RE_THREATMODEL.md` 第四节列出的四条诱导层短板。

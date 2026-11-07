@@ -638,6 +638,7 @@ INDEX_HTML = """<!doctype html>
   .drop.over { border-color: var(--accent); background: #241d16; transform: scale(1.005); }
   .drop p { margin: 6px 0; }
   .hint { color: var(--dim); font-size: 13px; }
+  .pw-warn { color: var(--bad); margin: 6px 0 0; }
   .link { color: var(--accent); cursor: pointer; text-decoration: underline dotted; }
   .files { list-style: none; padding: 0; margin: 12px 0 0; max-height: 190px; overflow: auto; }
   .files li {
@@ -707,6 +708,7 @@ INDEX_HTML = """<!doctype html>
       </select>
     </label>
   </div>
+  <p class="hint pw-warn" id="pwWarning" hidden></p>
   <p class="hint" id="onePwHint">默认只需要一个口令；keyfile、PoW、诱饵层都在「高级」里，通常不用动。</p>
 
   <details id="advanced">
@@ -838,6 +840,14 @@ INDEX_HTML = """<!doctype html>
       $("confirmWrap").style.display = enc ? "" : "none";
       $("preset").closest("label").style.display = enc ? "" : "none";
       $("advanced").style.display = enc ? "" : "none";
+      const pwWarning = $("pwWarning");
+      pwWarning.style.display = enc ? "" : "none";
+      if (enc) {
+        updatePasswordHint();
+      } else {
+        pwWarning.hidden = true;
+        pwWarning.textContent = "";
+      }
       $("go").textContent = enc ? "加密并下载" : "解密并下载";
       $("dropHint").textContent = enc
         ? "支持多文件；文件夹会打包成一个 .tarpit"
@@ -851,6 +861,33 @@ INDEX_HTML = """<!doctype html>
     status.className = "status" + (kind ? " " + kind : "");
     status.textContent = text;
   }
+
+  /** 与 Python / tarpit_core.js 同一口径；只提示，不阻止。 */
+  function checkPasswordStrength(text) {
+    if (!text) return { ok: false, hint: "口令不能为空" };
+    if (Array.from(text).length < 8) return { ok: false, hint: "至少 8 个字符" };
+    const classes = [/\\p{Ll}/u, /\\p{Lu}/u, /\\p{Nd}/u, /[^\\p{L}\\p{N}]/u]
+      .filter((pattern) => pattern.test(text)).length;
+    if (classes < 2) return { ok: false, hint: "建议混用大小写、数字或符号中的至少两类" };
+    if (["password", "12345678", "qwertyui", "admin123"].includes(text.toLowerCase())) {
+      return { ok: false, hint: "这是常见弱口令，换一个" };
+    }
+    return { ok: true, hint: "长度与字符种类达标（不等于高熵，长口令更可靠）" };
+  }
+
+  function updatePasswordHint() {
+    const box = $("pwWarning");
+    if (!box) return;
+    const text = $("password").value;
+    if (!text) { box.hidden = true; box.textContent = ""; return; }
+    const result = checkPasswordStrength(text);
+    if (result.ok) { box.hidden = true; box.textContent = ""; return; }
+    box.hidden = false;
+    box.textContent = `口令偏弱：${result.hint}。仍可继续，但 Argon2 挡不住弱口令。`;
+  }
+
+  $("password").addEventListener("input", updatePasswordHint);
+  updatePasswordHint();
 
   $("go").addEventListener("click", async () => {
     result.className = "result";

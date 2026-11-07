@@ -878,3 +878,81 @@ def test_cli_kdf_memory_error_exits_4(
     )
     assert code == tc.EXIT_ENV
     assert not out.exists()
+
+
+# ---------------------------------------------------------------------------
+# 口令强度提示（只警告，不阻止）
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("password", "expected"),
+    [
+        ("", False),
+        ("short", False),
+        ("alllowercase", False),
+        ("password", False),
+        ("GoodPass1", True),
+        # 空格算「符号」一类，所以 armor 的同口径判定也是合格。
+        ("correct horse battery staple", True),
+    ],
+)
+def test_check_password_strength(password: str, expected: bool) -> None:
+    ok, hint = tc.check_password_strength(password)
+    assert ok is expected
+    assert hint
+
+
+def test_password_policy_matches_armor() -> None:
+    """v1 的口令体检与 armor 必须保持同一口径。"""
+    from armor import armor_core
+
+    samples = [
+        "",
+        "short",
+        "alllowercase",
+        "password",
+        "GoodPass1",
+        "correct horse battery staple",
+    ]
+    for sample in samples:
+        assert tc.check_password_strength(sample) == armor_core.check_password_strength(sample)
+
+
+def test_cli_weak_password_warns_but_encrypts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """弱口令只写警告，不阻止加密。"""
+    src = tmp_path / "plain.bin"
+    src.write_bytes(b"payload")
+    out = tmp_path / "out.tarpit"
+
+    code = _run_cli(
+        monkeypatch,
+        ["encrypt", str(src), str(out), "--password-stdin", *FAST_CLI],
+        stdin="password\n",
+    )
+    assert code == tc.EXIT_OK
+    assert out.exists()
+    assert "偏弱" in capsys.readouterr().err
+
+
+def test_cli_strong_password_does_not_warn(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """达标口令不产生噪音。"""
+    src = tmp_path / "plain.bin"
+    src.write_bytes(b"payload")
+    out = tmp_path / "out.tarpit"
+
+    code = _run_cli(
+        monkeypatch,
+        ["encrypt", str(src), str(out), "--password-stdin", *FAST_CLI],
+        stdin="GoodPass1!\n",
+    )
+    assert code == tc.EXIT_OK
+    assert "偏弱" not in capsys.readouterr().err

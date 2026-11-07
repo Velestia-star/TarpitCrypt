@@ -169,6 +169,30 @@ export function normalizeParams(input) {
   return p;
 }
 
+/**
+ * 口令最低强度体检，返回 `{ ok, hint }`。
+ *
+ * 与 Python `tarpitcrypt.check_password_strength` / armor 的判定保持同一口径；
+ * 只用于提示，不阻止加密，也不记录口令。
+ */
+export function checkPasswordStrength(text) {
+  if (!text) return { ok: false, hint: "口令不能为空" };
+  if (Array.from(text).length < 8) return { ok: false, hint: "至少 8 个字符" };
+  const classes = [
+    /\p{Ll}/u,
+    /\p{Lu}/u,
+    /\p{Nd}/u,
+    /[^\p{L}\p{N}]/u,
+  ].filter((pattern) => pattern.test(text)).length;
+  if (classes < 2) {
+    return { ok: false, hint: "建议混用大小写、数字或符号中的至少两类" };
+  }
+  if (["password", "12345678", "qwertyui", "admin123"].includes(text.toLowerCase())) {
+    return { ok: false, hint: "这是常见弱口令，换一个" };
+  }
+  return { ok: true, hint: "长度与字符种类达标（不等于高熵，长口令更可靠）" };
+}
+
 /** 前导零比特数。 */
 export function leadingZeroBits(bytes) {
   let count = 0;

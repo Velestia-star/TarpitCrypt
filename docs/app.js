@@ -136,6 +136,26 @@ function collectParams() {
   };
 }
 
+/** 弱口令提示：只展示，不阻止提交。 */
+function updatePasswordHint() {
+  const box = $("pwWarning");
+  if (!box) return;
+  const text = $("password").value;
+  if (!text) {
+    box.hidden = true;
+    box.textContent = "";
+    return;
+  }
+  const result = core.checkPasswordStrength(text);
+  if (result.ok) {
+    box.hidden = true;
+    box.textContent = "";
+    return;
+  }
+  box.hidden = false;
+  box.textContent = `口令偏弱：${result.hint}。仍可继续，但 Argon2 挡不住弱口令。`;
+}
+
 function switchMode(mode) {
   state.mode = mode;
   const encrypting = mode === "encrypt";
@@ -145,6 +165,16 @@ function switchMode(mode) {
   $("confirmWrap").style.display = encrypting ? "" : "none";
   $("presetWrap").style.display = encrypting ? "" : "none";
   $("advanced").style.display = encrypting ? "" : "none";
+  const warning = $("pwWarning");
+  if (warning) {
+    warning.style.display = encrypting ? "" : "none";
+    if (encrypting) {
+      updatePasswordHint();
+    } else {
+      warning.hidden = true;
+      warning.textContent = "";
+    }
+  }
   $("go").textContent = encrypting ? "加密并下载" : "解密并下载";
   $("dropHint").textContent = encrypting
     ? "支持多文件；文件夹会打包成一个 .tarpit"
@@ -1187,6 +1217,7 @@ function bind() {
     tab.addEventListener("click", () => switchMode(tab.dataset.mode));
   }
   $("go").addEventListener("click", onSubmit);
+  $("password").addEventListener("input", updatePasswordHint);
   bindWorkspace();
 }
 
