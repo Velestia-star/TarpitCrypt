@@ -97,7 +97,14 @@
     <div class="armor-tabs" role="tablist">
       <button class="armor-tab active" data-armor-mode="pack" type="button">加固</button>
       <button class="armor-tab" data-armor-mode="restore" type="button">还原</button>
+      <button class="armor-tab" data-armor-mode="sidecar" type="button">伴生诱饵</button>
+      <button class="armor-tab" data-armor-mode="report" type="button">运行报告</button>
     </div>
+
+    <div class="grid armor-common">
+      <label>输出子目录 <input id="armorOutSubdir" placeholder="可选，例如 2026-11-08"></label>
+    </div>
+    <pre class="armor-log" id="armorLog" aria-live="polite"></pre>
 
     <div id="armorPackPane">
       <div class="drop" id="armorDrop">
@@ -134,11 +141,55 @@
       </div>
       <div class="grid">
         <label>口令 <input type="password" id="armorRestorePassword" autocomplete="current-password"></label>
+        <label class="armor-check">并行尝试各层 <input type="checkbox" id="armorParallel"></label>
       </div>
-      <button class="go" id="armorRestoreGo" type="button">开始还原</button>
+      <div class="armor-actions">
+        <button class="armor-link" id="armorInspectGo" type="button">查看摘要</button>
+        <button class="go" id="armorRestoreGo" type="button">开始还原</button>
+      </div>
+      <p class="hint" id="armorInspectInfo" hidden></p>
       <div class="status" id="armorRestoreStatus"></div>
       <div class="bar" id="armorRestoreBarWrap" hidden><div class="bar-fill" id="armorRestoreBar"></div></div>
       <div class="result" id="armorRestoreResult"></div>
+    </div>
+
+    <div id="armorSidecarPane" hidden>
+      <div class="drop" id="armorKitDrop">
+        <p><strong>把源程序包（文件或整个文件夹）拖到这里</strong></p>
+        <p class="hint">
+          或 <label class="link">选择文件<input type="file" id="armorKitPickFiles" multiple hidden></label>
+          · <label class="link">选择文件夹<input type="file" id="armorKitPickDir" webkitdirectory multiple hidden></label>
+        </p>
+        <p class="hint">伴生目录会生成在输出目录下，原程序一个字节都不改。</p>
+      </div>
+      <ul class="files" id="armorKitFiles"></ul>
+      <div class="grid">
+        <label>已有容器（可选） <input type="file" id="armorKitArmored" accept=".armored"></label>
+        <label>层数 <input type="number" id="armorKitLayers" min="2" max="8" value="4"></label>
+        <label>拟态风格 <select id="armorKitStyle"></select></label>
+        <label>投毒侧重 <select id="armorKitPoison"></select></label>
+        <label>注入强度 <select id="armorKitInjection"></select></label>
+      </div>
+      <div class="armor-actions">
+        <button class="armor-link" id="armorKitUsePack" type="button">使用加固页的源</button>
+        <button class="go" id="armorKitGo" type="button">生成伴生诱饵包</button>
+      </div>
+      <div class="status" id="armorKitStatus"></div>
+      <div class="bar" id="armorKitBarWrap" hidden><div class="bar-fill" id="armorKitBar"></div></div>
+      <div class="result" id="armorKitResult"></div>
+    </div>
+
+    <div id="armorReportPane" hidden>
+      <p class="hint">只统计本次服务会话的加固 / 还原 / 伴生操作；不记录口令、不写进容器。token 为量级估算，不是真实 LLM 计费。</p>
+      <div class="armor-actions">
+        <button class="armor-link" id="armorReportRefresh" type="button">刷新</button>
+        <button class="armor-link" id="armorReportCsv" type="button">导出 CSV</button>
+        <button class="armor-link" id="armorReportMd" type="button">导出 Markdown</button>
+        <button class="armor-link" id="armorReportClear" type="button">清空记录</button>
+      </div>
+      <div class="armor-report" id="armorReportSummary"></div>
+      <div class="armor-report-list" id="armorReportList"></div>
+      <div class="status" id="armorReportStatus"></div>
     </div>
   </section>
 </main>

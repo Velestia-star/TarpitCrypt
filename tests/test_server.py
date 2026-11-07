@@ -495,6 +495,8 @@ def test_web_index_serves_page(web_base: str) -> None:
     assert "window.TARPIT_LOCAL = true" in html
     assert "app.js" in html
     assert 'id="armorPanel"' in html
+    assert 'data-armor-mode="sidecar"' in html
+    assert 'data-armor-mode="report"' in html
     assert "armor_ui.js" in html
     assert "/api/encrypt" not in html
 
@@ -585,6 +587,7 @@ def test_armor_pack_inspect_restore_roundtrip(web_base: str) -> None:
             "layers": "2",
             "profile": "轻（秒级）",
             "sidecar": "0",
+            "out_subdir": "p4-test",
         },
         [("files", "hello.txt", b"armor payload")],
     )
@@ -594,6 +597,7 @@ def test_armor_pack_inspect_restore_roundtrip(web_base: str) -> None:
     assert job["status"] == "done", job
     saved = Path(job["result"]["savedPath"])
     assert saved.exists()
+    assert saved.parent.name == "p4-test"
     armored = saved.read_bytes()
     assert armored[:8] == b"TPARMOR3"
     with urllib.request.urlopen(
@@ -608,7 +612,8 @@ def test_armor_pack_inspect_restore_roundtrip(web_base: str) -> None:
     assert info["layers"] == 2
 
     content_type, body = build_multipart(
-        {"password": "ArmorPass1!"}, [("files", saved.name, armored)]
+        {"password": "ArmorPass1!", "parallel": "1"},
+        [("files", saved.name, armored)],
     )
     status, _, payload = _post(f"{web_base}/api/armor/restore", content_type, body)
     assert status == HTTPStatus.ACCEPTED
@@ -622,7 +627,12 @@ def test_armor_pack_inspect_restore_roundtrip(web_base: str) -> None:
 def test_armor_pack_with_sidecar(web_base: str) -> None:
     """伴生诱饵目录和它的下载 zip 都要真的落盘。"""
     content_type, body = build_multipart(
-        {"password": "ArmorPass1!", "layers": "2", "sidecar": "1"},
+        {
+            "password": "ArmorPass1!",
+            "layers": "2",
+            "sidecar": "1",
+            "out_subdir": "kit-test",
+        },
         [("files", "hello.txt", b"sidecar payload")],
     )
     status, _, payload = _post(f"{web_base}/api/armor/pack", content_type, body)
@@ -630,8 +640,57 @@ def test_armor_pack_with_sidecar(web_base: str) -> None:
     job = _wait_armor_job(web_base, json.loads(payload)["job"])
     assert job["status"] == "done", job
     result = job["result"]
+    assert Path(result["sidecarPath"]).parent.name == "kit-test"
     assert Path(result["sidecarPath"]).is_dir()
     sidecar_zip = Path(result["sidecarZipPath"])
     assert sidecar_zip.is_file()
     with zipfile.ZipFile(sidecar_zip) as archive:
         assert archive.namelist()
+
+
+def test_armor_standalone_sidecar(web_base: str) -> None:
+    """独立伴生页签：只给源包，不先加固也能生成伴生目录。"""
+    content_type, body = build_multipart(
+        {"layers": "2", "out_subdir": "standalone-kit"},
+        [("files", "hello.txt", b"standalone sidecar")],
+    )
+    status, _, payload = _post(f"{web_base}/api/armor/sidecar", content_type, body)
+    assert status == HTTPStatus.ACCEPTED
+    job = _wait_armor_job(web_base, json.loads(payload)["job"])
+    assert job["status"] == "done", job
+    result = job["result"]
+    assert result["fileCount"] > 0
+    assert result["traps"] >= 1
+    assert Path(result["savedPath"]).parent.name == "standalone-kit"
+    zip_path = Path(result["zipPath"])
+    assert zip_path.is_file()
+    with zipfile.ZipFile(zip_path) as archive:
+        assert archive.namelist()
+
+
+def test_armor_report_and_clear(web_base: str) -> None:
+    """运行报告要记录本次会话，且能被清空。"""
+    _post(f"{web_base}/api/armor/report/clear", "application/json", b"{}")
+    content_type, body = build_multipart(
+        {
+            "password": "ArmorPass1!",
+            "layers": "2",
+            "sidecar": "0",
+        },
+        [("files", "report.txt", b"report payload")],
+    )
+    status, _, payload = _post(f"{web_base}/api/armor/pack", content_type, body)
+    assert status == HTTPStatus.ACCEPTED
+    job = _wait_armor_job(web_base, json.loads(payload)["job"])
+    assert job["status"] == "done", job
+
+    with urllib.request.urlopen(f"{web_base}/api/armor/report", timeout=10) as response:
+        report = json.load(response)
+    assert report["attempts"], report
+    assert any(item["action"] == "加固" for item in report["attempts"])
+    assert report["summary"]
+
+    _post(f"{web_base}/api/armor/report/clear", "application/json", b"{}")
+    with urllib.request.urlopen(f"{web_base}/api/armor/report", timeout=10) as response:
+        cleared = json.load(response)
+    assert cleared["attempts"] == []

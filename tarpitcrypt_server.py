@@ -42,6 +42,7 @@ import webbrowser
 import zipfile
 from email.parser import BytesParser
 from email.policy import HTTP as HTTP_POLICY
+from dataclasses import asdict
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -93,10 +94,11 @@ def _create_unique(directory: Path, name: str) -> tuple[int, Path]:
     raise OSError("同名文件太多了，换个目录吧")
 
 
-def _save_artifact(name: str, data: bytes) -> Path:
+def _save_artifact(name: str, data: bytes, out_dir: Path | None = None) -> Path:
     """把结果写进输出目录；同名文件自动加序号，绝不覆盖。"""
-    _OUT_DIR.mkdir(parents=True, exist_ok=True)
-    fd, path = _create_unique(_OUT_DIR, name)
+    base = out_dir or _OUT_DIR
+    base.mkdir(parents=True, exist_ok=True)
+    fd, path = _create_unique(base, name)
     try:
         with os.fdopen(fd, "wb") as handle:
             handle.write(data)
@@ -130,6 +132,8 @@ _ARMOR_JOBS_LOCK: Final[threading.Lock] = threading.Lock()
 _ARMOR_QUEUE = queue.Queue()
 _ARMOR_WORKER: threading.Thread | None = None
 _ARMOR_JOB_LIMIT: Final[int] = 100
+_ARMOR_METRICS: Any = None
+_ARMOR_METRICS_LOCK: Final[threading.Lock] = threading.Lock()
 
 
 def _armor_modules() -> tuple[Any, Any]:
@@ -146,6 +150,42 @@ def _armor_modules() -> tuple[Any, Any]:
     import decoy_kit
 
     return armor_core, decoy_kit
+
+
+def _armor_metrics_module() -> Any:
+    _armor_modules()
+    import armor_metrics
+
+    return armor_metrics
+
+
+def _armor_metrics_store() -> Any:
+    global _ARMOR_METRICS
+    with _ARMOR_METRICS_LOCK:
+        if _ARMOR_METRICS is None:
+            _ARMOR_METRICS = _armor_metrics_module().Metrics()
+        return _ARMOR_METRICS
+
+
+def _record_armor_metric(**fields: Any) -> None:
+    metrics = _armor_metrics_store()
+    with _ARMOR_METRICS_LOCK:
+        metrics.record(**fields)
+
+
+def _armor_report_payload() -> dict[str, Any]:
+    metrics = _armor_metrics_store()
+    with _ARMOR_METRICS_LOCK:
+        return {
+            "summary": metrics.summary(),
+            "attempts": [asdict(item) for item in metrics.attempts],
+        }
+
+
+def _clear_armor_report() -> None:
+    metrics = _armor_metrics_store()
+    with _ARMOR_METRICS_LOCK:
+        metrics.attempts.clear()
 
 
 def _set_armor_job(job_id: str, **fields: Any) -> None:
@@ -233,16 +273,33 @@ def _armor_tmp_root() -> Path:
     return root
 
 
-def _unique_directory(prefix: str) -> Path:
-    _OUT_DIR.mkdir(parents=True, exist_ok=True)
+def _unique_directory(prefix: str, out_dir: Path | None = None) -> Path:
+    base = out_dir or _OUT_DIR
+    base.mkdir(parents=True, exist_ok=True)
     for index in range(1000):
-        candidate = _OUT_DIR / (prefix if index == 0 else f"{prefix}({index})")
+        candidate = base / (prefix if index == 0 else f"{prefix}({index})")
         try:
             candidate.mkdir()
         except FileExistsError:
             continue
         return candidate
     raise OSError("同名目录太多了，换个目录吧")
+
+
+def _resolve_out_subdir(raw: str | None) -> Path:
+    """把 Web 端提交的相对子目录安全地固定到 ``存放文件/`` 下面。"""
+    text = (raw or "").strip().replace("\\", "/")
+    if not text:
+        return _OUT_DIR
+    if any(part == ".." for part in text.split("/")):
+        raise ValueError("输出子目录不能包含 ..")
+    rel = sanitize_member_path(text)
+    target = (_OUT_DIR / rel).resolve()
+    root = _OUT_DIR.resolve()
+    if target != root and root not in target.parents:
+        raise ValueError("输出子目录越界")
+    target.mkdir(parents=True, exist_ok=True)
+    return target
 
 
 def _zip_directory(directory: Path) -> bytes:
@@ -313,25 +370,48 @@ def _run_armor_job(job: dict[str, Any]) -> dict[str, Any]:
         return _run_armor_pack(job)
     if job["kind"] == "restore":
         return _run_armor_restore(job)
+    if job["kind"] == "sidecar":
+        return _run_armor_sidecar(job)
     raise ValueError(f"未知的 armor 任务：{job['kind']}")
 
 
 def _run_armor_pack(job: dict[str, Any]) -> dict[str, Any]:
     armor_core, decoy_kit = _armor_modules()
     payload = job["_payload"]
+    out_dir = payload.get("out_dir") or _OUT_DIR
+    started = time.perf_counter()
     work = Path(tempfile.mkdtemp(prefix="src-", dir=_armor_tmp_root()))
     try:
         src, display = _materialize_source(work, payload["files"])
-        armored = armor_core.build_armored(
-            src,
-            payload["password"],
-            layers=payload["layers"],
-            profile=payload["profile"],
-            on_progress=_armor_progress(job["id"]),
-            strict=True,
-        )
-        saved = _save_artifact(display + ".armored", armored)
+        try:
+            armored = armor_core.build_armored(
+                src,
+                payload["password"],
+                layers=payload["layers"],
+                profile=payload["profile"],
+                on_progress=_armor_progress(job["id"]),
+                strict=True,
+            )
+        except Exception as exc:
+            _record_armor_metric(
+                action="加固",
+                label=display + ".armored",
+                ok=False,
+                layers_tried=0,
+                seconds=time.perf_counter() - started,
+                note=str(exc),
+            )
+            raise
+        saved = _save_artifact(display + ".armored", armored, out_dir)
         info = armor_core.inspect_armored(armored)
+        _record_armor_metric(
+            action="加固",
+            label=saved.name,
+            ok=True,
+            layers_tried=info.layers,
+            seconds=time.perf_counter() - started,
+            note=f"{payload['profile']} / {len(armored):,} 字节 / {payload['poison']}",
+        )
         result: dict[str, Any] = {
             "artifact": _remember_artifact(saved),
             "savedPath": str(saved),
@@ -342,7 +422,7 @@ def _run_armor_pack(job: dict[str, Any]) -> dict[str, Any]:
 
         if payload["sidecar"]:
             try:
-                kit_dir = _unique_directory(saved.stem + "-kit")
+                kit_dir = _unique_directory(saved.stem + "-kit", out_dir)
                 kit = decoy_kit.build_sidecar(
                     src,
                     out_dir=kit_dir,
@@ -355,7 +435,7 @@ def _run_armor_pack(job: dict[str, Any]) -> dict[str, Any]:
                 )
                 kit_root = Path(getattr(kit, "root", kit_dir))
                 kit_zip = _save_artifact(
-                    saved.stem + "-sidecar.zip", _zip_directory(kit_root)
+                    saved.stem + "-sidecar.zip", _zip_directory(kit_root), out_dir
                 )
                 result["sidecarArtifact"] = _remember_artifact(kit_zip)
                 result["sidecarPath"] = str(kit_root)
@@ -370,16 +450,64 @@ def _run_armor_pack(job: dict[str, Any]) -> dict[str, Any]:
 def _run_armor_restore(job: dict[str, Any]) -> dict[str, Any]:
     armor_core, _decoy_kit = _armor_modules()
     payload = job["_payload"]
-    restored = armor_core.restore_armored(
-        payload["blob"],
-        payload["password"],
-        on_progress=_armor_progress(job["id"]),
-        parallel=False,
-    )
-    base = Path(payload.get("name") or "restored").name
+    out_dir = payload.get("out_dir") or _OUT_DIR
+    source_label = Path(payload.get("name") or "restored").name
+    started = time.perf_counter()
+    tried = {"layers": 0}
+    base_progress = _armor_progress(job["id"])
+
+    def track(done: int, total: int, message: str) -> None:
+        tried["layers"] = max(tried["layers"], max(0, int(done)))
+        base_progress(done, total, message)
+
+    try:
+        armor_core.inspect_armored(payload["blob"])
+    except Exception as exc:
+        _record_armor_metric(
+            action="还原",
+            label=source_label,
+            ok=False,
+            layers_tried=0,
+            seconds=time.perf_counter() - started,
+            note=f"读取容器失败：{exc}",
+        )
+        raise
+
+    try:
+        restored = armor_core.restore_armored(
+            payload["blob"],
+            payload["password"],
+            on_progress=track,
+            parallel=bool(payload.get("parallel", False)),
+        )
+    except Exception as exc:
+        note = (
+            "口令未解开任何层（错误口令同样计入成本）"
+            if isinstance(exc, armor_core.ArmorError)
+            else str(exc)
+        )
+        _record_armor_metric(
+            action="还原",
+            label=source_label,
+            ok=False,
+            layers_tried=tried["layers"],
+            seconds=time.perf_counter() - started,
+            note=note,
+        )
+        raise
+
+    base = source_label
     if base.endswith(".armored"):
         base = base[: -len(".armored")]
-    saved = _save_artifact((base or "restored") + ".zip", restored.payload)
+    saved = _save_artifact((base or "restored") + ".zip", restored.payload, out_dir)
+    _record_armor_metric(
+        action="还原",
+        label=source_label,
+        ok=True,
+        layers_tried=tried["layers"],
+        seconds=time.perf_counter() - started,
+        note=f"写出 {restored.file_count} 个文件" + ("（并行）" if payload.get("parallel") else ""),
+    )
     return {
         "artifact": _remember_artifact(saved),
         "savedPath": str(saved),
@@ -387,6 +515,66 @@ def _run_armor_restore(job: dict[str, Any]) -> dict[str, Any]:
         "fileCount": restored.file_count,
         "size": len(restored.payload),
     }
+
+
+def _run_armor_sidecar(job: dict[str, Any]) -> dict[str, Any]:
+    _armor_core, decoy_kit = _armor_modules()
+    payload = job["_payload"]
+    out_dir = payload.get("out_dir") or _OUT_DIR
+    started = time.perf_counter()
+    work = Path(tempfile.mkdtemp(prefix="kit-", dir=_armor_tmp_root()))
+    try:
+        src, display = _materialize_source(work, payload["files"])
+        container = None
+        if payload.get("container"):
+            container = work / "container.armored"
+            container.write_bytes(payload["container"])
+
+        suffix = decoy_kit.STYLES[payload["style"]][0]
+        kit_dir = _unique_directory(display + suffix, out_dir)
+        try:
+            kit = decoy_kit.build_sidecar(
+                src,
+                out_dir=kit_dir,
+                armored=container,
+                layers=payload["layers"],
+                style=payload["style"],
+                poison=payload["poison"],
+                injection=payload["injection"],
+                on_progress=_armor_progress(job["id"]),
+            )
+        except Exception as exc:
+            _record_armor_metric(
+                action="伴生",
+                label=display,
+                ok=False,
+                layers_tried=0,
+                seconds=time.perf_counter() - started,
+                note=str(exc),
+            )
+            raise
+
+        kit_root = Path(getattr(kit, "root", kit_dir))
+        saved = _save_artifact(
+            display + "-sidecar.zip", _zip_directory(kit_root), out_dir
+        )
+        _record_armor_metric(
+            action="伴生",
+            label=display,
+            ok=True,
+            layers_tried=0,
+            seconds=time.perf_counter() - started,
+            note=f"{len(kit.files)} 份文件 / {kit.traps} 组线索 / {payload['poison']}",
+        )
+        return {
+            "artifact": _remember_artifact(saved),
+            "savedPath": str(kit_root),
+            "zipPath": str(saved),
+            "fileCount": len(kit.files),
+            "traps": kit.traps,
+        }
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
 
 def open_in_file_manager(path: Path) -> None:
@@ -702,6 +890,13 @@ class TarpitRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, {"ok": True, "job": _public_armor_job(job)})
             return
 
+        if path == "/api/armor/report":
+            self._send_json(
+                HTTPStatus.OK,
+                {"ok": True, **_armor_report_payload()},
+            )
+            return
+
         if path.startswith("/api/artifacts/"):
             token = path.rsplit("/", 1)[-1]
             with _ARTIFACT_LOCK:
@@ -776,6 +971,8 @@ class TarpitRequestHandler(BaseHTTPRequestHandler):
             "/api/armor/pack",
             "/api/armor/restore",
             "/api/armor/inspect",
+            "/api/armor/sidecar",
+            "/api/armor/report/clear",
         ):
             self._fail(HTTPStatus.NOT_FOUND, "没有这个接口")
             return
@@ -783,6 +980,10 @@ class TarpitRequestHandler(BaseHTTPRequestHandler):
         # reveal 走 JSON，不是 multipart，必须排在表单解析之前
         if route == "/api/reveal":
             self._handle_reveal(body)
+            return
+        if route == "/api/armor/report/clear":
+            _clear_armor_report()
+            self._send_json(HTTPStatus.OK, {"ok": True})
             return
 
         fields, files = parse_form(self.headers.get("Content-Type", ""), body)
@@ -792,6 +993,7 @@ class TarpitRequestHandler(BaseHTTPRequestHandler):
             "/api/armor/pack": self._handle_armor_pack,
             "/api/armor/restore": self._handle_armor_restore,
             "/api/armor/inspect": self._handle_armor_inspect,
+            "/api/armor/sidecar": self._handle_armor_sidecar,
         }
         handlers[route](fields, files)
 
@@ -915,6 +1117,7 @@ class TarpitRequestHandler(BaseHTTPRequestHandler):
         if not data_files:
             raise ValueError("没有收到任何文件")
 
+        out_dir = _resolve_out_subdir(fields.get("out_subdir"))
         strong, hint = armor_core.check_password_strength(password_raw)
         if not strong:
             raise ValueError(f"口令偏弱：{hint}")
@@ -950,6 +1153,7 @@ class TarpitRequestHandler(BaseHTTPRequestHandler):
             poison=poison,
             style=style,
             injection=injection,
+            out_dir=out_dir,
         )
         self._send_json(HTTPStatus.ACCEPTED, {"ok": True, "job": job})
 
@@ -971,11 +1175,56 @@ class TarpitRequestHandler(BaseHTTPRequestHandler):
             ),
             "restore.armored",
         )
+        out_dir = _resolve_out_subdir(fields.get("out_subdir"))
+        parallel = fields.get("parallel", "0").lower() in ("1", "true", "yes", "on")
         job = _new_armor_job(
             "restore",
             blob=armored,
             password=normalize_password(password_raw),
             name=name,
+            parallel=parallel,
+            out_dir=out_dir,
+        )
+        self._send_json(HTTPStatus.ACCEPTED, {"ok": True, "job": job})
+
+    def _handle_armor_sidecar(
+        self, fields: dict[str, str], files: list[tuple[str, str, bytes]]
+    ) -> None:
+        """独立生成伴生诱饵包；不需要口令，也不需要先加固。"""
+        _armor_core, decoy_kit = _armor_modules()
+        data_files = [
+            (name, filename, data)
+            for name, filename, data in files
+            if name == "files"
+        ]
+        if not data_files:
+            raise ValueError("没有收到源程序包")
+        try:
+            layers = int(fields.get("layers", "4"))
+        except ValueError:
+            raise ValueError("层数必须是整数") from None
+        if not 2 <= layers <= 8:
+            raise ValueError("层数必须在 2~8 之间")
+        style = fields.get("style") or decoy_kit.DEFAULT_STYLE
+        if style not in decoy_kit.STYLES:
+            raise ValueError(f"未知拟态风格：{style}")
+        poison = fields.get("poison") or decoy_kit.DEFAULT_POISON
+        if poison not in decoy_kit.POISON_PROFILES:
+            raise ValueError(f"未知投毒侧重：{poison}")
+        injection = fields.get("injection") or decoy_kit.DEFAULT_INJECTION
+        if injection not in decoy_kit.INJECTION_LEVELS:
+            raise ValueError(f"未知注入强度：{injection}")
+        container = self._pick_file(files, "armored") or self._pick_file(files, "container")
+        out_dir = _resolve_out_subdir(fields.get("out_subdir"))
+        job = _new_armor_job(
+            "sidecar",
+            files=data_files,
+            container=container,
+            layers=layers,
+            style=style,
+            poison=poison,
+            injection=injection,
+            out_dir=out_dir,
         )
         self._send_json(HTTPStatus.ACCEPTED, {"ok": True, "job": job})
 

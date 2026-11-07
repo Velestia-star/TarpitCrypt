@@ -67,21 +67,25 @@ DRAG_TO_ENCRYPT_JS = """
 
 AFTER_RELOAD_JS = """
 (async () => {
-  for (let i = 0; i < 100; i += 1) {
+  let last = { rows: 0, names: [], status: "none", out: "" };
+  for (let i = 0; i < 200; i += 1) {
     const rows = document.querySelectorAll("#queueList .queue-row");
     if (rows.length > 0) {
       const row = rows[0];
-      return {
+      last = {
         rows: rows.length,
         names: [...document.querySelectorAll("#queueList .q-name")].map((e) => e.textContent),
         status: row.classList.contains("done") ? "done"
               : row.classList.contains("error") ? "error" : "pending",
         out: row.querySelector(".q-out") ? row.querySelector(".q-out").textContent : "",
       };
+      // 行先恢复、加密结果稍后从 IndexedDB 回填；必须等 done/error，
+      // 不能一看到行就把 pending 当成最终状态。
+      if (last.status === "done" || last.status === "error") return last;
     }
     await new Promise((r) => setTimeout(r, 100));
   }
-  return { rows: 0, names: [], status: "none", out: "" };
+  return last;
 })()
 """
 

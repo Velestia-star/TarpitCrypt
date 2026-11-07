@@ -1,9 +1,9 @@
 /**
- * 本地版 armor 面板：加固 / 还原。
+ * 本地版 armor 面板：加固 / 还原 / 伴生 / 运行报告。
  *
  * 只在本机 Web（tarpitcrypt_server.py 注入 TARPIT_LOCAL）里启用；在线版
  * 直接 return，面板保持 hidden。所有耗时计算都在服务端 worker 里跑，
- * 这里只负责收集源包、轮询进度、展示下载/打开入口。
+ * 这里只负责收集源包、轮询进度、展示下载/打开入口和会话报告。
  */
 
 import { checkPasswordStrength } from "./core_adapter.js";
@@ -13,6 +13,9 @@ const $ = (id) => document.getElementById(id);
 
 let armorPicked = [];
 let armorRestoreFile = null;
+let armorKitPicked = [];
+let armorKitArmored = null;
+let armorReportData = null;
 
 function formatSize(bytes) {
   if (bytes > 1048576) return `${(bytes / 1048576).toFixed(1)} MB`;
@@ -32,6 +35,16 @@ function setBar(wrap, bar, value) {
 
 function errorText(data, status) {
   return (data && data.error) || `HTTP ${status}`;
+}
+
+function logArmor(message, prefix = "") {
+  const log = $("armorLog");
+  const stamp = new Date().toLocaleTimeString();
+  const line = `[${stamp}]${prefix ? ` ${prefix}` : ""} ${message}`;
+  log.textContent += `${line}\n`;
+  const lines = log.textContent.split("\n");
+  if (lines.length > 240) log.textContent = lines.slice(-240).join("\n");
+  log.scrollTop = log.scrollHeight;
 }
 
 async function readEntry(entry, prefix, out) {
@@ -82,46 +95,47 @@ async function collectDropFiles(dataTransfer) {
   return out;
 }
 
-function renderPicked() {
-  const list = $("armorFiles");
-  list.innerHTML = "";
-  for (const { file, path } of armorPicked) {
+function renderPicked(entries, target) {
+  target.innerHTML = "";
+  for (const { file, path } of entries) {
     const line = document.createElement("li");
     const name = document.createElement("span");
     name.textContent = path;
     const size = document.createElement("span");
     size.textContent = formatSize(file.size);
     line.append(name, size);
-    list.append(line);
+    target.append(line);
   }
 }
 
-function setPicked(entries) {
-  armorPicked = entries;
-  renderPicked();
-}
-
-function bindPickDrop() {
-  const drop = $("armorDrop");
-  const pick = $("armorPickFiles");
-  const pickDir = $("armorPickDir");
-
+function bindDrop(drop, pick, pickDir, setter, list) {
   drop.addEventListener("click", (event) => {
     if (!event.target.closest("label")) pick.click();
   });
   pick.addEventListener("change", (event) => {
-    setPicked([...event.target.files].map((file) => ({ file, path: file.name })));
+    setter([...event.target.files].map((file) => ({ file, path: file.name })));
+    renderPicked(
+      pick.id === "armorPickFiles" ? armorPicked : armorKitPicked,
+      list,
+    );
   });
   pickDir.addEventListener("change", (event) => {
-    setPicked(
+    setter(
       [...event.target.files].map((file) => ({
         file,
         path: file.webkitRelativePath || file.name,
       })),
     );
+    renderPicked(
+      pick.id === "armorPickFiles" ? armorPicked : armorKitPicked,
+      list,
+    );
   });
-
-  for (const [eventName, add] of [["dragenter", true], ["dragover", true], ["dragleave", false]]) {
+  for (const [eventName, add] of [
+    ["dragenter", true],
+    ["dragover", true],
+    ["dragleave", false],
+  ]) {
     drop.addEventListener(eventName, (event) => {
       event.preventDefault();
       drop.classList.toggle("over", add);
@@ -132,11 +146,36 @@ function bindPickDrop() {
     drop.classList.remove("over");
     try {
       const entries = await collectDropFiles(event.dataTransfer);
-      if (entries.length) setPicked(entries);
+      if (entries.length) {
+        setter(entries);
+        renderPicked(
+          pick.id === "armorPickFiles" ? armorPicked : armorKitPicked,
+          list,
+        );
+      }
     } catch (error) {
       setStatus($("armorStatus"), `读取拖入内容失败：${error.message}`, "bad");
     }
   });
+}
+
+function setArmorPicked(entries) {
+  armorPicked = entries;
+}
+
+function setKitPicked(entries) {
+  armorKitPicked = entries;
+}
+
+function bindPickDrop() {
+  bindDrop(
+    $("armorDrop"), $("armorPickFiles"), $("armorPickDir"),
+    setArmorPicked, $("armorFiles"),
+  );
+  bindDrop(
+    $("armorKitDrop"), $("armorKitPickFiles"), $("armorKitPickDir"),
+    setKitPicked, $("armorKitFiles"),
+  );
 
   const restoreDrop = $("armorRestoreDrop");
   const restorePick = $("armorRestorePick");
@@ -149,7 +188,11 @@ function bindPickDrop() {
       ? armorRestoreFile.name
       : "还没有选择文件";
   });
-  for (const [eventName, add] of [["dragenter", true], ["dragover", true], ["dragleave", false]]) {
+  for (const [eventName, add] of [
+    ["dragenter", true],
+    ["dragover", true],
+    ["dragleave", false],
+  ]) {
     restoreDrop.addEventListener(eventName, (event) => {
       event.preventDefault();
       restoreDrop.classList.toggle("over", add);
@@ -163,6 +206,19 @@ function bindPickDrop() {
       armorRestoreFile = file;
       $("armorRestoreName").textContent = file.name;
     }
+  });
+
+  $("armorKitArmored").addEventListener("change", (event) => {
+    armorKitArmored = event.target.files[0] || null;
+  });
+  $("armorKitUsePack").addEventListener("click", () => {
+    if (!armorPicked.length) {
+      setStatus($("armorKitStatus"), "加固页还没有源包", "bad");
+      return;
+    }
+    setKitPicked([...armorPicked]);
+    renderPicked(armorKitPicked, $("armorKitFiles"));
+    setStatus($("armorKitStatus"), `已复用加固页的 ${armorPicked.length} 个文件`, "ok");
   });
 }
 
@@ -187,6 +243,10 @@ async function loadProfiles() {
   fillSelect($("armorInjection"), data.injections, data.defaults.injection);
   $("armorLayers").value = data.defaults.layers;
   $("armorSidecar").checked = Boolean(data.defaults.sidecar);
+  fillSelect($("armorKitStyle"), data.styles, data.defaults.style);
+  fillSelect($("armorKitPoison"), data.poisons, data.defaults.poison);
+  fillSelect($("armorKitInjection"), data.injections, data.defaults.injection);
+  $("armorKitLayers").value = data.defaults.layers;
 }
 
 function updatePasswordHint() {
@@ -207,14 +267,33 @@ function updatePasswordHint() {
   box.textContent = `口令偏弱：${result.hint}。加固要求口令至少 8 位、至少两类字符。`;
 }
 
-async function pollJob(jobId, status, barWrap, bar, timeoutMs = 15 * 60 * 1000) {
+function outSubdir(form) {
+  const value = $("armorOutSubdir").value.trim();
+  if (value) form.append("out_subdir", value);
+}
+
+async function submitJob(url, form, prefix) {
+  const response = await fetch(url, { method: "POST", body: form });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(errorText(data, response.status));
+  logArmor(`任务已提交：${data.job}`, prefix);
+  return data.job;
+}
+
+async function pollJob(jobId, status, barWrap, bar, prefix, timeoutMs = 15 * 60 * 1000) {
   const deadline = Date.now() + timeoutMs;
+  let lastMessage = "";
   while (Date.now() < deadline) {
     const response = await fetch(`/api/armor/jobs/${jobId}`);
     const data = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(errorText(data, response.status));
     const job = data.job;
-    status.textContent = job.message || job.status;
+    const message = job.message || job.status;
+    status.textContent = message;
+    if (message !== lastMessage) {
+      logArmor(message, prefix);
+      lastMessage = message;
+    }
     if (typeof job.progress === "number") setBar(barWrap, bar, job.progress);
     if (job.status === "done") return job;
     if (job.status === "error") throw new Error(job.error || "任务失败");
@@ -238,10 +317,7 @@ function addOpenButton(result, artifact, statusElement, label = "打开所在目
   const button = document.createElement("button");
   button.type = "button";
   button.textContent = label;
-  button.style.cssText = [
-    "background:none", "border:0", "padding:0", "font:inherit",
-    "color:var(--accent)", "cursor:pointer", "text-decoration:underline dotted",
-  ].join(";");
+  button.className = "armor-link";
   button.addEventListener("click", async () => {
     try {
       const response = await fetch("/api/reveal", {
@@ -290,6 +366,7 @@ async function runPack() {
   setStatus(status, "正在提交加固任务…");
   $("armorBarWrap").hidden = false;
   $("armorBar").style.width = "0%";
+  logArmor(`提交加固：${armorPicked.length} 个文件 / ${layers} 层`, "[加固]");
 
   try {
     const form = new FormData();
@@ -300,20 +377,19 @@ async function runPack() {
     form.append("style", $("armorStyle").value);
     form.append("injection", $("armorInjection").value);
     form.append("sidecar", $("armorSidecar").checked ? "1" : "0");
+    outSubdir(form);
     for (const { file, path } of armorPicked) form.append("files", file, path);
 
-    const response = await fetch("/api/armor/pack", { method: "POST", body: form });
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(errorText(data, response.status));
-
+    const jobId = await submitJob("/api/armor/pack", form, "[加固]");
     const job = await pollJob(
-      data.job,
-      status,
-      $("armorBarWrap"),
-      $("armorBar"),
+      jobId, status, $("armorBarWrap"), $("armorBar"), "[加固]",
     );
     const info = job.result;
     setStatus(status, "加固完成", "ok");
+    logArmor(
+      `完成：${info.layers} 层 / ${formatSize(info.size)} / ${info.savedPath}`,
+      "[加固]",
+    );
     result.className = "result show";
     showNotice(
       result,
@@ -327,8 +403,10 @@ async function runPack() {
       showNotice(result, `伴生诱饵未生成：${info.sidecarError}`, "pw-warn");
     }
     addOpenButton(result, info.artifact, status);
+    await loadReport(false);
   } catch (error) {
     setStatus(status, `失败：${error.message}`, "bad");
+    logArmor(`失败：${error.message}`, "[加固]");
   } finally {
     button.disabled = false;
   }
@@ -349,31 +427,268 @@ async function runRestore() {
   setStatus(status, "正在提交还原任务…");
   $("armorRestoreBarWrap").hidden = false;
   $("armorRestoreBar").style.width = "0%";
+  logArmor(
+    `提交还原：${armorRestoreFile.name}${$("armorParallel").checked ? " / 并行" : ""}`,
+    "[还原]",
+  );
 
   try {
     const form = new FormData();
     form.append("password", password);
+    form.append("parallel", $("armorParallel").checked ? "1" : "0");
+    outSubdir(form);
     form.append("files", armorRestoreFile, armorRestoreFile.name);
-    const response = await fetch("/api/armor/restore", { method: "POST", body: form });
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(errorText(data, response.status));
-
+    const jobId = await submitJob("/api/armor/restore", form, "[还原]");
     const job = await pollJob(
-      data.job,
-      status,
-      $("armorRestoreBarWrap"),
-      $("armorRestoreBar"),
+      jobId, status, $("armorRestoreBarWrap"), $("armorRestoreBar"), "[还原]",
     );
     const info = job.result;
     setStatus(status, "还原完成", "ok");
+    logArmor(
+      `完成：${info.fileCount} 个文件 / ${formatSize(info.size)} / ${info.savedPath}`,
+      "[还原]",
+    );
     result.className = "result show";
     showNotice(result, `已还原 ${info.fileCount} 个文件，${formatSize(info.size)}。`);
     addDownload(result, `/api/artifacts/${info.artifact}`, "下载还原 zip");
     addOpenButton(result, info.artifact, status);
+    await loadReport(false);
   } catch (error) {
     setStatus(status, `失败：${error.message}`, "bad");
+    logArmor(`失败：${error.message}`, "[还原]");
   } finally {
     button.disabled = false;
+  }
+}
+
+async function runInspect() {
+  const status = $("armorRestoreStatus");
+  const infoBox = $("armorInspectInfo");
+  if (!armorRestoreFile) return setStatus(status, "先选择 .armored 文件", "bad");
+  try {
+    const form = new FormData();
+    form.append("files", armorRestoreFile, armorRestoreFile.name);
+    const response = await fetch("/api/armor/inspect", { method: "POST", body: form });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(errorText(data, response.status));
+    infoBox.hidden = false;
+    infoBox.textContent = [
+      `版本 v${data.version}`,
+      `${data.layers} 层`,
+      `容器 ${formatSize(data.totalSize)}`,
+      `规格草稿 ${formatSize(data.noteSize)}`,
+      `digest ${data.digest.slice(0, 16)}…`,
+      `层尺寸 ${data.layerSizes.join(" / ")} B`,
+    ].join(" · ");
+    logArmor(`摘要：v${data.version} / ${data.layers} 层 / ${formatSize(data.totalSize)}`, "[摘要]");
+    setStatus(status, "摘要读取成功", "ok");
+  } catch (error) {
+    infoBox.hidden = true;
+    setStatus(status, `读取摘要失败：${error.message}`, "bad");
+    logArmor(`摘要失败：${error.message}`, "[摘要]");
+  }
+}
+
+async function runKit() {
+  const status = $("armorKitStatus");
+  const result = $("armorKitResult");
+  const button = $("armorKitGo");
+  if (!armorKitPicked.length) return setStatus(status, "先拖入或选择源程序包", "bad");
+  const layers = Number($("armorKitLayers").value);
+  if (!Number.isInteger(layers) || layers < 2 || layers > 8) {
+    return setStatus(status, "层数必须是 2~8 的整数", "bad");
+  }
+
+  button.disabled = true;
+  result.className = "result";
+  result.innerHTML = "";
+  setStatus(status, "正在提交伴生任务…");
+  $("armorKitBarWrap").hidden = false;
+  $("armorKitBar").style.width = "0%";
+  logArmor(`提交伴生：${armorKitPicked.length} 个文件 / ${layers} 层`, "[伴生]");
+
+  try {
+    const form = new FormData();
+    form.append("layers", String(layers));
+    form.append("style", $("armorKitStyle").value);
+    form.append("poison", $("armorKitPoison").value);
+    form.append("injection", $("armorKitInjection").value);
+    outSubdir(form);
+    for (const { file, path } of armorKitPicked) form.append("files", file, path);
+    if (armorKitArmored) form.append("armored", armorKitArmored, armorKitArmored.name);
+
+    const jobId = await submitJob("/api/armor/sidecar", form, "[伴生]");
+    const job = await pollJob(
+      jobId, status, $("armorKitBarWrap"), $("armorKitBar"), "[伴生]",
+    );
+    const info = job.result;
+    setStatus(status, "伴生诱饵包生成完成", "ok");
+    logArmor(
+      `完成：${info.fileCount} 份文件 / ${info.traps} 组线索 / ${info.savedPath}`,
+      "[伴生]",
+    );
+    result.className = "result show";
+    showNotice(
+      result,
+      `已生成 ${info.fileCount} 份拟态文件 / ${info.traps} 组互相矛盾的字段线索。`,
+    );
+    addDownload(result, `/api/artifacts/${info.artifact}`, "下载伴生诱饵 zip");
+    addOpenButton(result, info.artifact, status);
+    await loadReport(false);
+  } catch (error) {
+    setStatus(status, `失败：${error.message}`, "bad");
+    logArmor(`失败：${error.message}`, "[伴生]");
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function renderReport(data) {
+  const summary = $("armorReportSummary");
+  const list = $("armorReportList");
+  summary.innerHTML = "";
+  list.innerHTML = "";
+  for (const [key, value] of Object.entries(data.summary || {})) {
+    const card = document.createElement("div");
+    card.className = "metric";
+    const label = document.createElement("span");
+    label.textContent = key;
+    const number = document.createElement("b");
+    number.textContent = String(value);
+    card.append(label, number);
+    summary.append(card);
+  }
+
+  if (!data.attempts || !data.attempts.length) {
+    const empty = document.createElement("p");
+    empty.className = "hint";
+    empty.textContent = "本次会话还没有记录。做一次加固、还原或伴生即可。";
+    list.append(empty);
+    return;
+  }
+
+  const table = document.createElement("table");
+  const head = document.createElement("thead");
+  head.innerHTML =
+    "<tr><th>时间</th><th>操作</th><th>对象</th><th>结果</th>" +
+    "<th>层尝试</th><th>耗时</th><th>估算轮数</th><th>备注</th></tr>";
+  table.append(head);
+  const body = document.createElement("tbody");
+  for (const item of data.attempts) {
+    const row = document.createElement("tr");
+    const cells = [
+      item.ts,
+      item.action,
+      item.label,
+      item.ok ? "成功" : "失败",
+      String(item.layers_tried),
+      `${Number(item.seconds).toFixed(3)}s`,
+      String(item.layers_tried + (item.ok ? 2 : 0)),
+      item.note || "",
+    ];
+    cells.forEach((value, index) => {
+      const cell = document.createElement("td");
+      cell.textContent = value;
+      if (index === 3) cell.className = item.ok ? "ok" : "bad";
+      row.append(cell);
+    });
+    body.append(row);
+  }
+  table.append(body);
+  list.append(table);
+}
+
+async function loadReport(showStatus = true) {
+  const status = $("armorReportStatus");
+  try {
+    const response = await fetch("/api/armor/report");
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(errorText(data, response.status));
+    armorReportData = data;
+    renderReport(data);
+    if (showStatus) {
+      setStatus(status, `已刷新（${(data.attempts || []).length} 条）`, "ok");
+    }
+    return data;
+  } catch (error) {
+    if (showStatus) setStatus(status, `刷新失败：${error.message}`, "bad");
+    return null;
+  }
+}
+
+function downloadText(text, filename, type) {
+  const blob = new Blob([text], { type });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
+}
+
+async function exportReport(kind) {
+  const data = armorReportData || (await loadReport(false));
+  if (!data) {
+    setStatus($("armorReportStatus"), "报告加载失败", "bad");
+    return;
+  }
+  if (kind === "csv") {
+    const escape = (value) => `"${String(value ?? "").replaceAll('"', '""')}"`;
+    const lines = ["ts,action,label,ok,layers_tried,seconds,est_tokens,note"];
+    for (const item of data.attempts || []) {
+      lines.push([
+        item.ts, item.action, item.label, item.ok, item.layers_tried,
+        item.seconds, item.est_tokens, item.note,
+      ].map(escape).join(","));
+    }
+    downloadText("\ufeff" + lines.join("\r\n") + "\r\n", "tarpit_report.csv", "text/csv;charset=utf-8");
+  } else {
+    const lines = [
+      "# TarpitCrypt 本地运行报告",
+      "",
+      `> 生成时间：${new Date().toLocaleString()}`,
+      "> 估算值不是真实 LLM token 计数；数据只来自本机界面操作，不含口令。",
+      "",
+      "## 汇总",
+      "",
+      "| 指标 | 值 |",
+      "| --- | --- |",
+    ];
+    for (const [key, value] of Object.entries(data.summary || {})) {
+      lines.push(`| ${key} | ${value} |`);
+    }
+    lines.push(
+      "",
+      "## 明细",
+      "",
+      "| 时间 | 操作 | 对象 | 结果 | 层尝试 | 耗时(s) | 估算轮数 | 备注 |",
+      "| --- | --- | --- | --- | --- | --- | --- | --- |",
+    );
+    for (const item of data.attempts || []) {
+      lines.push(
+        `| ${item.ts} | ${item.action} | ${item.label} | ${item.ok ? "成功" : "失败"} | ` +
+        `${item.layers_tried} | ${item.seconds} | ` +
+        `${item.layers_tried + (item.ok ? 2 : 0)} | ${(item.note || "").replaceAll("|", "\\|")} |`,
+      );
+    }
+    downloadText(lines.join("\n") + "\n", "tarpit_report.md", "text/markdown;charset=utf-8");
+  }
+  setStatus($("armorReportStatus"), `已导出 ${kind.toUpperCase()}`, "ok");
+}
+
+async function clearReport() {
+  if (!window.confirm("清空本次会话的运行报告？")) return;
+  try {
+    const response = await fetch("/api/armor/report/clear", { method: "POST" });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(errorText(data, response.status));
+    await loadReport(false);
+    setStatus($("armorReportStatus"), "记录已清空", "ok");
+    logArmor("运行报告已清空", "[报告]");
+  } catch (error) {
+    setStatus($("armorReportStatus"), `清空失败：${error.message}`, "bad");
   }
 }
 
@@ -382,6 +697,8 @@ function bindTabs() {
   const panes = {
     pack: $("armorPackPane"),
     restore: $("armorRestorePane"),
+    sidecar: $("armorSidecarPane"),
+    report: $("armorReportPane"),
   };
   for (const tab of tabs) {
     tab.addEventListener("click", () => {
@@ -389,6 +706,7 @@ function bindTabs() {
       for (const [mode, pane] of Object.entries(panes)) {
         pane.hidden = mode !== tab.dataset.armorMode;
       }
+      if (tab.dataset.armorMode === "report") loadReport(true);
     });
   }
 }
@@ -402,12 +720,21 @@ async function init() {
   $("armorPassword").addEventListener("input", updatePasswordHint);
   $("armorGo").addEventListener("click", runPack);
   $("armorRestoreGo").addEventListener("click", runRestore);
+  $("armorInspectGo").addEventListener("click", runInspect);
+  $("armorKitGo").addEventListener("click", runKit);
+  $("armorReportRefresh").addEventListener("click", () => loadReport(true));
+  $("armorReportCsv").addEventListener("click", () => exportReport("csv"));
+  $("armorReportMd").addEventListener("click", () => exportReport("md"));
+  $("armorReportClear").addEventListener("click", clearReport);
 
   try {
     await loadProfiles();
+    logArmor("本地 armor 面板就绪", "[系统]");
   } catch (error) {
     setStatus($("armorStatus"), `加载 armor 参数失败：${error.message}`, "bad");
+    logArmor(`参数加载失败：${error.message}`, "[系统]");
     $("armorGo").disabled = true;
+    $("armorKitGo").disabled = true;
   }
 }
 
