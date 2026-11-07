@@ -573,3 +573,216 @@ def test_cli_info_works_without_password(
     captured = capsys.readouterr().out
     assert '"version": 1' in captured
     assert '"mem_kib": 8192' in captured
+
+
+# ---------------------------------------------------------------------------
+# 口令 / keyfile 输入边界
+# ---------------------------------------------------------------------------
+
+
+def test_encrypt_rejects_empty_password() -> None:
+    """空口令没有可保护的熵，必须在加密时就拒绝。"""
+    with pytest.raises(ValueError, match="口令"):
+        tc.encrypt(b"x", b"", params=FAST)
+
+
+def test_encrypt_rejects_empty_keyfile() -> None:
+    """0 字节 keyfile 不能被静默当成「没启用 keyfile」。"""
+    with pytest.raises(ValueError, match="keyfile"):
+        tc.encrypt(b"x", PASSWORD, params=FAST, keyfile=b"")
+
+
+def test_encrypt_rejects_empty_decoy_password() -> None:
+    """诱饵层也不能用空口令，否则等于留了一个零熵后门。"""
+    with pytest.raises(ValueError, match="诱饵口令"):
+        tc.encrypt(
+            b"real",
+            PASSWORD,
+            params=FAST,
+            decoy_plaintext=b"fake",
+            decoy_password=b"",
+        )
+
+
+def test_encrypt_rejects_oversized_keyfile() -> None:
+    """keyfile 上限 1 MiB，避免把大文件整个读进内存。"""
+    with pytest.raises(ValueError, match="KiB"):
+        tc.encrypt(
+            b"x", PASSWORD, params=FAST, keyfile=b"k" * (tc.MAX_KEYFILE_BYTES + 1)
+        )
+
+
+def test_decrypt_rejects_oversized_keyfile() -> None:
+    """解密端同样不接受超大 keyfile。"""
+    blob = tc.encrypt(b"x", PASSWORD, params=FAST)
+    with pytest.raises(ValueError, match="KiB"):
+        tc.decrypt(blob, PASSWORD, keyfile=b"k" * (tc.MAX_KEYFILE_BYTES + 1))
+
+
+def test_decrypt_still_accepts_empty_password_for_legacy_files() -> None:
+    """空口令只禁止「新加密」；历史上用空口令加密的文件仍要能解。"""
+    salt = bytes(range(tc.SALT_LEN))
+    nonce = bytes(range(tc.NONCE_LEN))
+    key = tc._derive(b"", b"", salt, 8192, 1, 1, 1)
+    ct_len = len(b"legacy") + tc.TAG_LEN
+    header = tc._pack_header(
+        flags=0,
+        mem=8192,
+        time=1,
+        para=1,
+        rounds=1,
+        pow_diff=0,
+        salt=salt,
+        nonce=nonce,
+        pow_nonce=b"\x00" * tc.POW_NONCE_LEN,
+        ct_len=ct_len,
+    )
+    ciphertext = tc._aead_encrypt(tc.CIPHER_AESGCM, key, nonce, header, b"legacy")
+
+    assert tc.decrypt(header + ciphertext, b"") == (b"legacy", False)
+
+
+# ---------------------------------------------------------------------------
+# CLI 落盘与输入安全
+# ---------------------------------------------------------------------------
+
+FAST_CLI = ["--mem", "8192", "--time", "1", "--para", "1", "--rounds", "1"]
+
+
+def test_cli_refuses_in_place(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """输入与输出同一个文件时直接拒绝，绝不覆盖唯一副本。"""
+    src = tmp_path / "plain.bin"
+    src.write_bytes(b"original")
+
+    code = _run_cli(
+        monkeypatch,
+        ["encrypt", str(src), str(src), "--password-stdin", *FAST_CLI],
+        stdin="pw\n",
+    )
+    assert code == tc.EXIT_USAGE
+    assert src.read_bytes() == b"original"
+
+
+def test_cli_refuses_existing_output_without_force(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """已存在的输出默认不覆盖；显式 --force 才允许。"""
+    src = tmp_path / "plain.bin"
+    src.write_bytes(b"payload")
+    out = tmp_path / "out.tarpit"
+    out.write_bytes(b"keep")
+    args = ["encrypt", str(src), str(out), "--password-stdin", *FAST_CLI]
+
+    assert _run_cli(monkeypatch, args, stdin="pw\n") == tc.EXIT_USAGE
+    assert out.read_bytes() == b"keep"
+
+    assert _run_cli(monkeypatch, args + ["--force"], stdin="pw\n") == tc.EXIT_OK
+    assert out.read_bytes()[: len(tc.MAGIC)] == tc.MAGIC
+
+
+def test_cli_empty_password_rejected(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """加密时从 stdin 读到空行 → 退出码 1，且不产生输出文件。"""
+    src = tmp_path / "plain.bin"
+    src.write_bytes(b"payload")
+    out = tmp_path / "out.tarpit"
+
+    code = _run_cli(
+        monkeypatch,
+        ["encrypt", str(src), str(out), "--password-stdin", *FAST_CLI],
+        stdin="\n",
+    )
+    assert code == tc.EXIT_USAGE
+    assert not out.exists()
+
+
+def test_cli_empty_keyfile_rejected(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """0 字节 keyfile → 环境错误，且不产生输出文件。"""
+    src = tmp_path / "plain.bin"
+    src.write_bytes(b"payload")
+    key = tmp_path / "empty.key"
+    key.write_bytes(b"")
+    out = tmp_path / "out.tarpit"
+
+    code = _run_cli(
+        monkeypatch,
+        ["encrypt", str(src), str(out), "--keyfile", str(key), "--password-stdin", *FAST_CLI],
+        stdin="pw\n",
+    )
+    assert code == tc.EXIT_ENV
+    assert not out.exists()
+
+
+def test_cli_oversized_keyfile_rejected(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """超过 1 MiB 的 keyfile → 环境错误。"""
+    src = tmp_path / "plain.bin"
+    src.write_bytes(b"payload")
+    key = tmp_path / "big.key"
+    key.write_bytes(b"k" * (tc.MAX_KEYFILE_BYTES + 1))
+    out = tmp_path / "out.tarpit"
+
+    code = _run_cli(
+        monkeypatch,
+        ["encrypt", str(src), str(out), "--keyfile", str(key), "--password-stdin", *FAST_CLI],
+        stdin="pw\n",
+    )
+    assert code == tc.EXIT_ENV
+    assert not out.exists()
+
+
+def test_cli_refuses_output_same_as_keyfile(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """输出路径就是 keyfile 时，即使 --force 也拒绝，避免一次覆盖弄丢密钥。"""
+    src = tmp_path / "plain.bin"
+    src.write_bytes(b"payload")
+    key = tmp_path / "my.key"
+    key.write_bytes(b"k" * 64)
+
+    code = _run_cli(
+        monkeypatch,
+        ["encrypt", str(src), str(key), "--keyfile", str(key),
+         "--password-stdin", "--force", *FAST_CLI],
+        stdin="pw\n",
+    )
+    assert code == tc.EXIT_USAGE
+    assert key.read_bytes() == b"k" * 64
+
+
+def test_write_output_is_atomic(tmp_path: Path) -> None:
+    """新写、拒绝覆盖、--force 覆盖三条路径都要正常，且不残留临时文件。"""
+    target = tmp_path / "out.bin"
+
+    tc._write_output(target, b"first", force=False)
+    assert target.read_bytes() == b"first"
+    assert list(tmp_path.glob(".*.tmp")) == []
+
+    with pytest.raises(tc.UsageError):
+        tc._write_output(target, b"second", force=False)
+    assert target.read_bytes() == b"first"
+
+    tc._write_output(target, b"second", force=True)
+    assert target.read_bytes() == b"second"
+    assert list(tmp_path.glob(".*.tmp")) == []
+
+
+def test_write_output_cleans_temp_on_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """原子替换失败时目标文件保持原样，临时文件必须清掉。"""
+    target = tmp_path / "out.bin"
+
+    def fail_replace(_src: str, _dst: str) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(tc.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="disk full"):
+        tc._write_output(target, b"data", force=False)
+
+    assert not target.exists()
+    assert list(tmp_path.glob(".*.tmp")) == []

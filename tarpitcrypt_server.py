@@ -242,6 +242,24 @@ def params_from_form(fields: dict[str, str]) -> tc.CryptoParams:
     return params
 
 
+def _validate_keyfile(keyfile: bytes | None) -> bytes | None:
+    """校验上传的 keyfile；空文件或超过上限直接拒绝。
+
+    旧实现里空 keyfile 会被 ``keyfile or b""`` 当成「没启用 keyfile」，
+    用户以为多了一道因子，实际只是主口令。这里在入口把这种情况打回。
+
+    Raises:
+        ValueError: 空文件或超过 :data:`tarpitcrypt.MAX_KEYFILE_BYTES`。
+    """
+    if keyfile is None:
+        return None
+    if not keyfile:
+        raise ValueError("keyfile 是空文件（0 字节），等于没有第二个因子")
+    if len(keyfile) > tc.MAX_KEYFILE_BYTES:
+        raise ValueError(f"keyfile 超过 {tc.MAX_KEYFILE_BYTES // 1024} KiB 上限")
+    return keyfile
+
+
 def _content_disposition(filename: str) -> str:
     """生成兼容中文文件名的 ``Content-Disposition``。"""
     ascii_name = filename.encode("ascii", "ignore").decode("ascii") or "download"
@@ -383,12 +401,12 @@ class TarpitRequestHandler(BaseHTTPRequestHandler):
         data_files = [(filename, data) for name, filename, data in files if name == "files"]
         password_raw = fields.get("password", "")
         if not password_raw:
-            raise ValueError("缺少口令")
+            raise ValueError("口令不能为空")
         if not data_files:
             raise ValueError("没有收到任何文件")
 
         params = params_from_form(fields)
-        keyfile = self._pick_file(files, "keyfile")
+        keyfile = _validate_keyfile(self._pick_file(files, "keyfile"))
 
         is_bundle = fields.get("bundle") == "1" or len(data_files) > 1
         payload = bundle_files(data_files) if is_bundle else data_files[0][1]
@@ -442,12 +460,12 @@ class TarpitRequestHandler(BaseHTTPRequestHandler):
         """解密上传的 ``.tarpit`` 文件。"""
         data_files = [(filename, data) for name, filename, data in files if name == "files"]
         password_raw = fields.get("password", "")
-        if not password_raw:
-            raise ValueError("缺少口令")
+        # 解密不强制非空：历史上用空口令加密的文件仍要能打开。页面端有
+        # 自己的非空校验，这里放行只影响直接调 API 的脚本。
         if len(data_files) != 1:
             raise ValueError("解密一次只能上传一个 .tarpit 文件")
 
-        keyfile = self._pick_file(files, "keyfile")
+        keyfile = _validate_keyfile(self._pick_file(files, "keyfile"))
         name, blob = data_files[0]
 
         started = time.perf_counter()

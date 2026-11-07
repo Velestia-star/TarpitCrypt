@@ -275,6 +275,63 @@ def test_web_missing_password_is_400(web_base: str) -> None:
     assert "口令" in json.loads(payload)["error"]
 
 
+def _legacy_empty_password_blob(payload: bytes = b"legacy") -> bytes:
+    """手工造一份历史上「空口令加密」的 v1 文件（当前 encrypt 已拒绝空口令）。"""
+    salt = bytes(range(tc.SALT_LEN))
+    nonce = bytes(range(tc.NONCE_LEN))
+    key = tc._derive(b"", b"", salt, 8192, 1, 1, 1)
+    ct_len = len(payload) + tc.TAG_LEN
+    header = tc._pack_header(
+        flags=0,
+        mem=8192,
+        time=1,
+        para=1,
+        rounds=1,
+        pow_diff=0,
+        salt=salt,
+        nonce=nonce,
+        pow_nonce=b"\x00" * tc.POW_NONCE_LEN,
+        ct_len=ct_len,
+    )
+    return header + tc._aead_encrypt(tc.CIPHER_AESGCM, key, nonce, header, payload)
+
+
+def test_web_decrypt_accepts_legacy_empty_password(web_base: str) -> None:
+    """解密端保留空口令兼容；页面自己有非空校验，不影响普通用户。"""
+    blob = _legacy_empty_password_blob()
+    content_type, body = build_multipart(
+        {"password": ""}, [("files", "legacy.tarpit", blob)]
+    )
+    status, _, plain = _post(f"{web_base}/api/decrypt", content_type, body)
+    assert status == HTTPStatus.OK
+    assert plain == b"legacy"
+
+
+def test_web_empty_keyfile_is_400(web_base: str) -> None:
+    """0 字节 keyfile 不能被静默当成「没启用 keyfile」。"""
+    content_type, body = build_multipart(
+        {"password": "pw", "mem": "8192", "time": "1", "para": "1", "rounds": "1"},
+        [("files", "a.txt", b"data"), ("keyfile", "empty.key", b"")],
+    )
+    status, _, payload = _post(f"{web_base}/api/encrypt", content_type, body)
+    assert status == HTTPStatus.BAD_REQUEST
+    assert "keyfile" in json.loads(payload)["error"]
+
+
+def test_web_oversized_keyfile_is_400(web_base: str) -> None:
+    """超过 1 MiB 的 keyfile 在 Web 入口同样被拒。"""
+    content_type, body = build_multipart(
+        {"password": "pw", "mem": "8192", "time": "1", "para": "1", "rounds": "1"},
+        [
+            ("files", "a.txt", b"data"),
+            ("keyfile", "big.key", b"k" * (tc.MAX_KEYFILE_BYTES + 1)),
+        ],
+    )
+    status, _, payload = _post(f"{web_base}/api/encrypt", content_type, body)
+    assert status == HTTPStatus.BAD_REQUEST
+    assert "keyfile" in json.loads(payload)["error"]
+
+
 # ---------------------------------------------------------------------------
 # 另存到磁盘 + 打开所在目录
 # ---------------------------------------------------------------------------

@@ -63,8 +63,10 @@ import json
 import logging
 import os
 import secrets
+import stat
 import struct
 import sys
+import tempfile
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -76,6 +78,7 @@ __all__ = [
     "CryptoParams",
     "DecryptError",
     "EnvironmentSetupError",
+    "MAX_KEYFILE_BYTES",
     "TarpitError",
     "UsageError",
     "decrypt",
@@ -167,6 +170,10 @@ GCM_NONCE_LEN: Final[int] = 12
 TAG_LEN: Final[int] = 16
 KEY_LEN: Final[int] = 32
 KEYFILE_HINT_LEN: Final[int] = 64
+
+#: keyfile 只是「第二个因子」，不是数据容器。1 MiB 足够容纳任何合理的
+#: 随机字节文件，同时挡住「误把一个大文件当 keyfile」把内存吃光。
+MAX_KEYFILE_BYTES: Final[int] = 1024 * 1024
 
 _KDF_STRUCT: Final[struct.Struct] = struct.Struct(">IHBB")
 _U64: Final[struct.Struct] = struct.Struct(">Q")
@@ -687,25 +694,36 @@ def encrypt(
 
     Args:
         plaintext: 待加密数据。
-        password: 主口令字节。
+        password: 主口令字节；空口令会被拒绝。
         params: KDF / PoW / cipher 参数。
-        keyfile: keyfile 内容；``None`` 或 ``b""`` 表示不启用。
+        keyfile: keyfile 内容；``None`` 表示不启用。空字节串会被拒绝——
+            旧实现把 0 字节 keyfile 当成「没启用」，用户以为多了一道因子，
+            实际并没有。
         decoy_plaintext: 诱饵层明文；``None`` 表示不生成诱饵层。
-        decoy_password: 诱饵层口令；必须与主口令不同。
+        decoy_password: 诱饵层口令；必须与主口令不同且非空。
 
     Returns:
         可直接写盘的完整文件字节。
 
     Raises:
-        ValueError: 参数非法、诱饵参数缺失，或诱饵口令与主口令相同。
+        ValueError: 参数非法、口令为空、keyfile 为空或过大、诱饵参数缺失，
+            或诱饵口令与主口令相同。
         EnvironmentSetupError: 密码学依赖缺失。
     """
     _require_deps()
     params.validate()
+    if not password:
+        raise ValueError("口令不能为空；空口令没有可保护的熵")
+    if keyfile is not None and not keyfile:
+        raise ValueError("keyfile 不能为空（0 字节等于没有启用 keyfile）")
+    if keyfile is not None and len(keyfile) > MAX_KEYFILE_BYTES:
+        raise ValueError(f"keyfile 不能超过 {MAX_KEYFILE_BYTES // 1024} KiB")
     if not plaintext:
         raise ValueError("plaintext 不能为空")
     if (decoy_plaintext is None) != (decoy_password is None):
         raise ValueError("decoy_plaintext 与 decoy_password 必须同时提供或同时省略")
+    if decoy_password is not None and not decoy_password:
+        raise ValueError("诱饵口令不能为空")
     if decoy_password is not None and decoy_password == password:
         raise ValueError("诱饵口令不能与主口令相同，否则诱饵层永远不可达")
 
@@ -776,7 +794,8 @@ def decrypt(
 
     Args:
         blob: 完整文件内容。
-        password: 候选口令字节。
+        password: 候选口令字节；空口令仍被接受，用于解开历史上用空口令
+            加密的文件。
         keyfile: keyfile 内容；``None`` 表示未提供。
 
     Returns:
@@ -788,6 +807,8 @@ def decrypt(
         EnvironmentSetupError: 密码学依赖缺失。
     """
     _require_deps()
+    if keyfile is not None and len(keyfile) > MAX_KEYFILE_BYTES:
+        raise ValueError(f"keyfile 不能超过 {MAX_KEYFILE_BYTES // 1024} KiB")
     header = _parse_header(blob)
     decoy = _validate_blob_layout(blob, header)
     ciphertext = blob[HEADER_LEN : HEADER_LEN + header.ct_len]
@@ -945,11 +966,17 @@ class _Parser(argparse.ArgumentParser):
 def _read_password(prompt: str, *, confirm: bool) -> bytes:
     """交互式读取口令，NFC 规范化后 UTF-8 编码。
 
+    ``confirm=True`` 用于加密 / 设置诱饵口令：此时空口令直接拒绝。
+    ``confirm=False`` 用于解密：允许空口令，保证历史上用空口令加密的文件
+    仍能打开。
+
     Raises:
-        UsageError: 两次输入不一致。
+        UsageError: 两次输入不一致，或加密时输入了空口令。
     """
     first = getpass.getpass(prompt)
     if confirm:
+        if not first:
+            raise UsageError("口令不能为空")
         second = getpass.getpass("再输入一次：")
         if first != second:
             raise UsageError("两次输入的口令不一致")
@@ -967,15 +994,29 @@ def _read_password_stdin() -> bytes:
 def _read_keyfile(path: str | None) -> bytes | None:
     """读取 keyfile；路径为 ``None`` 时返回 ``None``。
 
+    空文件会被拒绝：0 字节 keyfile 在旧实现里会被 ``keyfile or b""`` 当成
+    「没启用 keyfile」，用户以为多了一道因子，实际只是主口令。超过
+    :data:`MAX_KEYFILE_BYTES` 的文件也拒绝，避免把任意大文件整个读进内存。
+
     Raises:
-        EnvironmentSetupError: 文件不可读。
+        EnvironmentSetupError: 文件不可读、为空或超过上限。
     """
     if path is None:
         return None
     try:
-        return Path(path).read_bytes()
+        with Path(path).open("rb") as handle:
+            data = handle.read(MAX_KEYFILE_BYTES + 1)
     except OSError as exc:
         raise EnvironmentSetupError(f"无法读取 keyfile：{exc}") from exc
+    if not data:
+        raise EnvironmentSetupError(
+            "keyfile 是空文件（0 字节），等于没有第二个因子；请换一个非空文件"
+        )
+    if len(data) > MAX_KEYFILE_BYTES:
+        raise EnvironmentSetupError(
+            f"keyfile 超过 {MAX_KEYFILE_BYTES // 1024} KiB 上限，请换一个小文件"
+        )
+    return data
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -990,6 +1031,7 @@ def _build_parser() -> argparse.ArgumentParser:
     enc = sub.add_parser("encrypt", help="加密文件")
     enc.add_argument("input", help="明文文件路径")
     enc.add_argument("output", help="输出 .tarpit 文件路径")
+    enc.add_argument("--force", action="store_true", help="覆盖已存在的输出文件")
     enc.add_argument("--keyfile", help="keyfile 路径")
     enc.add_argument("--decoy", help="诱饵层明文的路径")
     enc.add_argument("--password-stdin", action="store_true", help="从 stdin 读取主口令")
@@ -1005,6 +1047,7 @@ def _build_parser() -> argparse.ArgumentParser:
     dec = sub.add_parser("decrypt", help="解密文件")
     dec.add_argument("input", help=".tarpit 文件路径")
     dec.add_argument("output", help="明文输出路径")
+    dec.add_argument("--force", action="store_true", help="覆盖已存在的输出文件")
     dec.add_argument("--keyfile", help="keyfile 路径")
     dec.add_argument("--password-stdin", action="store_true", help="从 stdin 读取口令")
 
@@ -1049,6 +1092,91 @@ def _safe_chmod(path: str) -> None:
         pass
 
 
+def _same_path(left: str | os.PathLike[str], right: str | os.PathLike[str]) -> bool:
+    """判断两个路径是否指向同一个文件（跟随符号链接，兼容大小写差异）。"""
+    try:
+        return os.path.samefile(left, right)
+    except OSError:
+        left_path = Path(left).resolve()
+        right_path = Path(right).resolve()
+        return os.path.normcase(str(left_path)) == os.path.normcase(str(right_path))
+
+
+def _check_output(input_path: Path, output_path: Path, *, force: bool) -> None:
+    """在开始 KDF 之前检查输出路径，避免算完才发现写不了。
+
+    Raises:
+        UsageError: 输入与输出相同、输出是目录，或输出已存在且没给 ``--force``。
+    """
+    if _same_path(input_path, output_path):
+        raise UsageError(
+            "输入与输出是同一个文件；为避免覆盖唯一副本，请换一个输出路径"
+        )
+    if output_path.is_dir():
+        raise UsageError(f"输出路径是目录：{output_path}")
+    if output_path.exists() and not force:
+        raise UsageError(f"输出文件已存在：{output_path}\n如确认覆盖，请加 --force")
+
+
+def _fsync_directory(directory: Path) -> None:
+    """尽力让目录项落盘（仅 POSIX；失败不影响主流程）。"""
+    if os.name != "posix":
+        return
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        fd = os.open(directory, flags)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:  # pragma: no cover - 个别文件系统不支持目录 fsync
+        pass
+    finally:
+        os.close(fd)
+
+
+def _write_output(path: str | os.PathLike[str], data: bytes, *, force: bool) -> None:
+    """把 *data* 原子地写到 *path*。
+
+    先写同目录临时文件并 fsync，再 ``os.replace`` 到目标：进程在写入中途
+    退出也不会留下半截目标文件，更不会先把已有文件截断。默认拒绝覆盖；
+    ``force=True`` 时沿用旧文件的权限位。新文件由 ``mkstemp`` 创建，权限
+    为 0600。
+
+    Raises:
+        UsageError: 输出是目录，或已存在且没给 ``force``。
+        OSError: 磁盘 / 权限等写入失败；目标文件保持原样。
+    """
+    target = Path(path)
+    if target.is_dir():
+        raise UsageError(f"输出路径是目录：{target}")
+    if target.exists() and not force:
+        raise UsageError(f"输出文件已存在：{target}\n如确认覆盖，请加 --force")
+
+    previous_mode: int | None = None
+    if target.exists():
+        previous_mode = stat.S_IMODE(target.stat().st_mode)
+
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent)
+    )
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if previous_mode is not None:
+            os.chmod(tmp_name, previous_mode)
+        os.replace(tmp_name, target)
+        _fsync_directory(target.parent)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
 def _run(args: argparse.Namespace) -> int:
     """执行子命令，返回契约 4 的退出码。"""
     if args.verbose:
@@ -1080,6 +1208,12 @@ def _run(args: argparse.Namespace) -> int:
         return EXIT_OK
 
     if args.command == "encrypt":
+        input_path = Path(args.input)
+        output_path = Path(args.output)
+        _check_output(input_path, output_path, force=args.force)
+        if args.keyfile and _same_path(args.keyfile, output_path):
+            raise UsageError("输出路径与 keyfile 相同，覆盖会直接弄丢密钥；请换一个输出路径")
+
         params = _params_from_args(args)
         password = (
             _read_password_stdin()
@@ -1087,7 +1221,7 @@ def _run(args: argparse.Namespace) -> int:
             else _read_password("设置口令：", confirm=True)
         )
         keyfile = _read_keyfile(args.keyfile)
-        plaintext = Path(args.input).read_bytes()
+        plaintext = input_path.read_bytes()
         decoy_plaintext: bytes | None = None
         decoy_password: bytes | None = None
         if args.decoy:
@@ -1106,7 +1240,7 @@ def _run(args: argparse.Namespace) -> int:
             decoy_plaintext=decoy_plaintext,
             decoy_password=decoy_password,
         )
-        Path(args.output).write_bytes(blob)
+        _write_output(output_path, blob, force=args.force)
         print(
             f"已加密：{args.output}（{len(blob)} 字节；mem={params.mem}KiB "
             f"time={params.time} para={params.para} rounds={params.rounds} "
@@ -1117,15 +1251,21 @@ def _run(args: argparse.Namespace) -> int:
         return EXIT_OK
 
     if args.command == "decrypt":
+        input_path = Path(args.input)
+        output_path = Path(args.output)
+        _check_output(input_path, output_path, force=args.force)
+        if args.keyfile and _same_path(args.keyfile, output_path):
+            raise UsageError("输出路径与 keyfile 相同，覆盖会直接弄丢密钥；请换一个输出路径")
+
         password = (
             _read_password_stdin()
             if args.password_stdin
             else _read_password("输入口令：", confirm=False)
         )
         keyfile = _read_keyfile(args.keyfile)
-        blob = Path(args.input).read_bytes()
+        blob = input_path.read_bytes()
         data, is_decoy = decrypt(blob, password, keyfile=keyfile)
-        Path(args.output).write_bytes(data)
+        _write_output(output_path, data, force=args.force)
         if is_decoy:
             print(f"已解密（诱饵层）：{args.output}（{len(data)} 字节）", file=sys.stderr)
             return EXIT_DECOY
