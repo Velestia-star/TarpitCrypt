@@ -345,3 +345,13 @@ CI 在 3 个系统 × Python 3.11/3.12/3.13 上跑同一套命令，配置见
 ## 许可
 
 MIT，版权归 [TarpitCrypt contributors](LICENSE)。
+
+---
+
+## ☕ 请我们喝瓶饮料
+
+<img src="assets/donate-qr.jpg" alt="打赏二维码" width="220">
+
+**自愿打赏**，如果你觉得这个项目不错，可以给我们买瓶饮料，嘿嘿嘿
+
+<sub>打赏纯属心意，不解锁任何功能；项目始终 MIT 开源，全部代码都在这个仓库里。</sub>
