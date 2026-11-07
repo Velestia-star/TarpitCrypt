@@ -1,5 +1,8 @@
 # TarpitCrypt
 
+**🌐 在线版（打开即用）→ [wei238982377.github.io/TarpitCrypt](https://wei238982377.github.io/TarpitCrypt/)**
+—— 拖文件进去就能加解密，运算全在你自己浏览器里，文件不上传。
+
 > 不是让数据「解不开」，而是让**逆向方判断不了自己是不是找对了**。
 
 TarpitCrypt 是一个**反 AI 逆向的整活项目**。底层是一个本地文件加密工具：
