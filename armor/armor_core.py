@@ -87,7 +87,6 @@ __all__ = [
     "revealed_debug_passwords",
     "build_armored",
     "inspect_armored",
-    "leaked_passwords",
     "noise_password",
     "read_note",
     "restore_armored",
