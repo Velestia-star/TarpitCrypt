@@ -812,6 +812,32 @@ def test_decrypt_rejects_work_over_budget() -> None:
     assert tc.decrypt(blob, PASSWORD, max_work=None) == (b"x", False)
 
 
+def test_encrypt_rejects_over_memory_budget() -> None:
+    """内存超过 max_mem 时在分配前拒绝；None 表示显式放行。"""
+    with pytest.raises(ValueError, match="内存"):
+        tc.encrypt(b"x", PASSWORD, params=FAST, max_mem=1)
+    assert tc.encrypt(b"x", PASSWORD, params=FAST, max_mem=None)
+
+
+def test_decrypt_rejects_over_memory_budget() -> None:
+    blob = tc.encrypt(b"x", PASSWORD, params=FAST)
+    with pytest.raises(ValueError, match="内存"):
+        tc.decrypt(blob, PASSWORD, max_mem=1)
+    assert tc.decrypt(blob, PASSWORD, max_mem=None) == (b"x", False)
+
+
+def test_heavy_memory_header_rejected_before_kdf(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """工作量不高、但一次要 2 GiB 的文件，也要在分配前拒绝。"""
+    blob = bytearray(tc.encrypt(b"payload", PASSWORD, params=FAST))
+    struct.pack_into(">IHBB", blob, 10, 2 * 1024 * 1024, 1, 1, 1)
+
+    monkeypatch.setattr(tc, "_derive", _fail_derive)
+    with pytest.raises(ValueError, match="内存"):
+        tc.decrypt(bytes(blob), PASSWORD)
+
+
 def test_heavy_header_rejected_before_kdf(monkeypatch: pytest.MonkeyPatch) -> None:
     """恶意文件声明 2 GiB / time=10 / rounds=8 时，不能进 Argon2。"""
     blob = bytearray(tc.encrypt(b"payload", PASSWORD, params=FAST))
@@ -823,17 +849,19 @@ def test_heavy_header_rejected_before_kdf(monkeypatch: pytest.MonkeyPatch) -> No
 
 
 def test_describe_reports_work_and_over_default() -> None:
-    """info 要给出工作量，并标出是否需要 --allow-heavy。"""
+    """info 要给出工作量 / 内存，并标出是否需要 --allow-heavy。"""
     blob = tc.encrypt(b"x", PASSWORD, params=FAST)
     info = tc.describe(blob)
     assert info["work_kib_rounds"] == FAST.work
     assert info["work_over_default"] is False
+    assert info["mem_over_default"] is False
 
     heavy = bytearray(blob)
     struct.pack_into(">IHBB", heavy, 10, 2 * 1024 * 1024, 10, 1, 8)
     info = tc.describe(bytes(heavy))
     assert info["work_kib_rounds"] == 2 * 1024 * 1024 * 10 * 8
     assert info["work_over_default"] is True
+    assert info["mem_over_default"] is True
 
 
 def test_memory_error_is_wrapped(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -878,6 +906,31 @@ def test_cli_kdf_memory_error_exits_4(
     )
     assert code == tc.EXIT_ENV
     assert not out.exists()
+
+
+def test_cli_allow_heavy_bypasses_both_budgets(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """--allow-heavy 同时解除工作量与内存上限。"""
+    src = tmp_path / "plain.bin"
+    src.write_bytes(b"payload")
+    out = tmp_path / "out.tarpit"
+    seen: dict[str, object] = {}
+    real = tc.encrypt
+
+    def spy(*args: object, **kwargs: object) -> bytes:
+        seen.update(kwargs)
+        return real(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(tc, "encrypt", spy)
+    code = _run_cli(
+        monkeypatch,
+        ["encrypt", str(src), str(out), "--password-stdin", "--allow-heavy", *FAST_CLI],
+        stdin="pw\n",
+    )
+    assert code == tc.EXIT_OK
+    assert seen["max_work"] is None
+    assert seen["max_mem"] is None
 
 
 # ---------------------------------------------------------------------------

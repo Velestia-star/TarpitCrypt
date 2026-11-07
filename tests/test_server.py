@@ -140,6 +140,61 @@ def test_normalize_password_matches_cli_rule() -> None:
     assert ts.normalize_password(composed) == "p\u00e1ss".encode("utf-8")
 
 
+def test_parse_content_length_rejects_bad_values() -> None:
+    """负数 / 非整数 / 超限的 Content-Length 一律拒绝。"""
+    assert ts._parse_content_length("0") == 0
+    assert ts._parse_content_length("123") == 123
+    for raw in (None, "-1", "abc", str(ts.MAX_BODY_BYTES + 1)):
+        with pytest.raises(ValueError):
+            ts._parse_content_length(raw)
+
+
+def test_content_disposition_sanitizes_control_chars() -> None:
+    """文件名里的引号 / CR / LF 不能进入响应头。"""
+    header = ts._content_disposition('a"\r\nX-Evil: 1.txt')
+    assert "\r" not in header and "\n" not in header
+    assert 'filename="aX-Evil: 1.txt"' in header
+
+    chinese = ts._content_disposition("中文.txt")
+    assert "filename*=UTF-8''" in chinese
+    assert "%E4%B8%AD%E6%96%87" in chinese
+
+
+def test_safe_output_name_strips_control_chars() -> None:
+    assert ts._safe_output_name('a"\r\nb.txt', "") == "ab.txt"
+
+
+def test_save_artifact_never_overwrites(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """同名结果自动加序号，两份内容都在。"""
+    monkeypatch.setattr(ts, "_OUT_DIR", tmp_path)
+    first = ts._save_artifact("x.tarpit", b"one")
+    second = ts._save_artifact("x.tarpit", b"two")
+    assert first != second
+    assert first.read_bytes() == b"one"
+    assert second.read_bytes() == b"two"
+
+
+def test_save_artifact_is_race_safe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """并发保存同名结果也不能互相覆盖。"""
+    from concurrent.futures import ThreadPoolExecutor
+
+    monkeypatch.setattr(ts, "_OUT_DIR", tmp_path)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        paths = list(pool.map(lambda _index: ts._save_artifact("same.bin", b"data"), range(8)))
+
+    assert len(set(paths)) == 8
+    assert all(path.read_bytes() == b"data" for path in paths)
+
+
+def test_main_refuses_non_loopback() -> None:
+    """非回环地址默认拒绝启动，必须显式 --allow-remote。"""
+    assert ts.main(["--host", "0.0.0.0", "--port", "9"]) == 2
+
+
 # ---------------------------------------------------------------------------
 # 端到端
 # ---------------------------------------------------------------------------
@@ -273,6 +328,21 @@ def test_web_missing_password_is_400(web_base: str) -> None:
     status, _, payload = _post(f"{web_base}/api/encrypt", content_type, body)
     assert status == HTTPStatus.BAD_REQUEST
     assert "口令" in json.loads(payload)["error"]
+
+
+def test_web_unexpected_exception_returns_500(
+    web_base: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """未预期异常要回可读的 500，而不是直接断连接。"""
+
+    def boom(*_args: object, **_kwargs: object) -> tuple[dict[str, str], list[object]]:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(ts, "parse_form", boom)
+    content_type, body = build_multipart({"password": "pw"}, [("files", "a.txt", b"d")])
+    status, _, payload = _post(f"{web_base}/api/encrypt", content_type, body)
+    assert status == HTTPStatus.INTERNAL_SERVER_ERROR
+    assert json.loads(payload)["ok"] is False
 
 
 def _legacy_empty_password_blob(payload: bytes = b"legacy") -> bytes:

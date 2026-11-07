@@ -213,6 +213,11 @@ MAX_ROUNDS: Final[int] = 8
 #: 不设上限就等于把「解密」变成「按攻击者的参数跑一次满负荷 Argon2」。
 DEFAULT_MAX_WORK_KIB_ROUNDS: Final[int] = 16 * 1024 * 1024
 
+#: 单次 Argon2 的默认峰值内存上限（KiB）。官方最重预设是 1 GiB；文件头
+#: 最多可声明 2 GiB，工作量预算可能放行，但一次性分配 2 GiB 足以在低内存
+#: 机器上触发 OOM / 疯狂换页。需要更大内存时用 --allow-heavy。
+DEFAULT_MAX_MEM_KIB: Final[int] = 1024 * 1024
+
 #: 契约 5：允许的 PoW 难度（前导零比特数）。
 ALLOWED_POW_BITS: Final[frozenset[int]] = frozenset({0, 16, 18, 20})
 
@@ -492,6 +497,25 @@ def _check_work_budget(
     return work
 
 
+def _check_memory_budget(mem: int, *, max_mem: int | None) -> int:
+    """在进入 Argon2 之前检查峰值内存。
+
+    Returns:
+        实际 ``mem``（KiB）。
+
+    Raises:
+        ValueError: 超过 *max_mem*；``max_mem=None`` 表示不限制。
+    """
+    if max_mem is not None and mem > max_mem:
+        raise ValueError(
+            f"KDF 内存 {mem} KiB 超过默认上限 {max_mem} KiB"
+            f"（{max_mem // 1024} MiB），已拒绝在分配前执行；"
+            "确认这不是畸形文件或误配参数后，可用 --allow-heavy"
+            "（库调用传 max_mem=None）放行。"
+        )
+    return mem
+
+
 # ---------------------------------------------------------------------------
 # AEAD
 # ---------------------------------------------------------------------------
@@ -752,6 +776,7 @@ def encrypt(
     decoy_plaintext: bytes | None = None,
     decoy_password: bytes | None = None,
     max_work: int | None = DEFAULT_MAX_WORK_KIB_ROUNDS,
+    max_mem: int | None = DEFAULT_MAX_MEM_KIB,
 ) -> bytes:
     """加密 *plaintext*，返回完整的 ``.tarpit`` 文件字节。
 
@@ -766,18 +791,21 @@ def encrypt(
         decoy_password: 诱饵层口令；必须与主口令不同且非空。
         max_work: 单次派生允许的最大工作量（KiB·轮）；``None`` 表示不限制。
             默认值挡住「自定义参数重到合法用户也扛不住」的文件。
+        max_mem: 单次派生允许的最大峰值内存（KiB）；``None`` 表示不限制。
+            默认值挡住「工作量不高、但一次要分配 2 GiB」的输入。
 
     Returns:
         可直接写盘的完整文件字节。
 
     Raises:
         ValueError: 参数非法、口令为空、keyfile 为空或过大、诱饵参数缺失、
-            诱饵口令与主口令相同，或工作量超过 ``max_work``。
+            诱饵口令与主口令相同，或工作量 / 内存超过上限。
         EnvironmentSetupError: 密码学依赖缺失，或 Argon2 无法完成。
     """
     _require_deps()
     params.validate()
     _check_work_budget(params.mem, params.time, params.rounds, max_work=max_work)
+    _check_memory_budget(params.mem, max_mem=max_mem)
     if not password:
         raise ValueError("口令不能为空；空口令没有可保护的熵")
     if keyfile is not None and not keyfile:
@@ -856,6 +884,7 @@ def decrypt(
     *,
     keyfile: bytes | None = None,
     max_work: int | None = DEFAULT_MAX_WORK_KIB_ROUNDS,
+    max_mem: int | None = DEFAULT_MAX_MEM_KIB,
 ) -> tuple[bytes, bool]:
     """解密 ``.tarpit`` 文件字节。
 
@@ -867,13 +896,15 @@ def decrypt(
         max_work: 单次派生允许的最大工作量（KiB·轮）；``None`` 表示不限制。
             默认值挡住「91 字节文件声明 2 GiB / time=10 / rounds=8」这类
             把解密变成满负荷 Argon2 的输入。
+        max_mem: 单次派生允许的最大峰值内存（KiB）；``None`` 表示不限制。
+            默认值挡住「工作量不高、但一次要分配 2 GiB」的输入。
 
     Returns:
         ``(明文, is_decoy)``；命中诱饵层时 ``is_decoy`` 为 ``True``（契约 3）。
 
     Raises:
-        ValueError: 口令 / keyfile 错误、文件被篡改或格式非法、工作量超过
-            ``max_work``。绝不会静默返回乱码或 ``None``。
+        ValueError: 口令 / keyfile 错误、文件被篡改或格式非法、工作量或
+            内存超过上限。绝不会静默返回乱码或 ``None``。
         EnvironmentSetupError: 密码学依赖缺失，或 Argon2 无法完成。
     """
     _require_deps()
@@ -882,6 +913,7 @@ def decrypt(
     header = _parse_header(blob)
     decoy = _validate_blob_layout(blob, header)
     _check_work_budget(header.mem, header.time, header.rounds, max_work=max_work)
+    _check_memory_budget(header.mem, max_mem=max_mem)
     ciphertext = blob[HEADER_LEN : HEADER_LEN + header.ct_len]
 
     keyfile_bytes = keyfile or b""
@@ -931,8 +963,8 @@ def describe(blob: bytes) -> dict[str, Any]:
 
     校验规则与 :func:`decrypt` 完全一致：截断、尾部残留或诱饵段不自洽的
     文件会直接抛 :class:`ValueError`，不会再打印一份自相矛盾的元数据。
-    只做体检，不跑 KDF；``work_over_default`` 为真时，解密需要
-    ``--allow-heavy`` 才会放行。
+    只做体检，不跑 KDF；``work_over_default`` 或 ``mem_over_default`` 为真时，
+    解密需要 ``--allow-heavy`` 才会放行。
 
     Raises:
         ValueError: 格式非法。
@@ -957,6 +989,7 @@ def describe(blob: bytes) -> dict[str, Any]:
         "decoy_len": decoy_len,
         "work_kib_rounds": work,
         "work_over_default": work > DEFAULT_MAX_WORK_KIB_ROUNDS,
+        "mem_over_default": header.mem > DEFAULT_MAX_MEM_KIB,
         "total_len": len(blob),
     }
 
@@ -1164,7 +1197,10 @@ def _build_parser() -> argparse.ArgumentParser:
     enc.add_argument(
         "--allow-heavy",
         action="store_true",
-        help=f"允许超过默认单次工作预算（{DEFAULT_MAX_WORK_KIB_ROUNDS // (1024 * 1024)} GiB·轮）",
+        help=(
+            f"允许超过默认单次工作预算（{DEFAULT_MAX_WORK_KIB_ROUNDS // (1024 * 1024)} GiB·轮）"
+            f"与内存上限（{DEFAULT_MAX_MEM_KIB // (1024 * 1024)} GiB）"
+        ),
     )
     enc.add_argument("--keyfile", help="keyfile 路径（可选，兼容旧文件）")
     enc.add_argument("--decoy", help="诱饵层明文的路径（可选，兼容旧文件）")
@@ -1185,7 +1221,10 @@ def _build_parser() -> argparse.ArgumentParser:
     dec.add_argument(
         "--allow-heavy",
         action="store_true",
-        help=f"允许超过默认单次工作预算（{DEFAULT_MAX_WORK_KIB_ROUNDS // (1024 * 1024)} GiB·轮）",
+        help=(
+            f"允许超过默认单次工作预算（{DEFAULT_MAX_WORK_KIB_ROUNDS // (1024 * 1024)} GiB·轮）"
+            f"与内存上限（{DEFAULT_MAX_MEM_KIB // (1024 * 1024)} GiB）"
+        ),
     )
     dec.add_argument("--keyfile", help="keyfile 路径（可选，兼容旧文件）")
     dec.add_argument("--password-stdin", action="store_true", help="从 stdin 读取口令")
@@ -1381,6 +1420,7 @@ def _run(args: argparse.Namespace) -> int:
             decoy_plaintext=decoy_plaintext,
             decoy_password=decoy_password,
             max_work=None if args.allow_heavy else DEFAULT_MAX_WORK_KIB_ROUNDS,
+            max_mem=None if args.allow_heavy else DEFAULT_MAX_MEM_KIB,
         )
         _write_output(output_path, blob, force=args.force)
         print(
@@ -1411,6 +1451,7 @@ def _run(args: argparse.Namespace) -> int:
             password,
             keyfile=keyfile,
             max_work=None if args.allow_heavy else DEFAULT_MAX_WORK_KIB_ROUNDS,
+            max_mem=None if args.allow_heavy else DEFAULT_MAX_MEM_KIB,
         )
         _write_output(output_path, data, force=args.force)
         if is_decoy:

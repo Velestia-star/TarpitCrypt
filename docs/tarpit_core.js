@@ -51,6 +51,7 @@ export const LIMITS = {
   minRounds: 1,
   maxRounds: 8,
   maxWork: 16 * 1024 * 1024,
+  maxMemDefault: 1024 * 1024,
 };
 
 export const ALLOWED_POW_BITS = [0, 16, 18, 20];
@@ -164,6 +165,13 @@ export function normalizeParams(input) {
   if (work > LIMITS.maxWork) {
     throw new Error(
       `KDF 工作量 ${work} KiB·轮 超过默认上限 ${LIMITS.maxWork}，已拒绝执行`,
+    );
+  }
+  // 与 Python 的 DEFAULT_MAX_MEM_KIB 对齐：浏览器版没有 --allow-heavy，
+  // 直接拒绝 2 GiB 这类会一次性吃掉大量内存的输入。
+  if (p.mem > LIMITS.maxMemDefault) {
+    throw new Error(
+      `KDF 内存 ${p.mem} KiB 超过默认上限 ${LIMITS.maxMemDefault} KiB，已拒绝执行`,
     );
   }
   return p;

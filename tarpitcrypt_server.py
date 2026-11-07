@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import os
 import secrets
 import subprocess
 import sys
@@ -64,26 +65,40 @@ _ARTIFACT_LOCK: Final[threading.Lock] = threading.Lock()
 _MAX_ARTIFACTS: Final[int] = 200
 
 
-def _unique_path(directory: Path, name: str) -> Path:
-    """在同一目录里找一个不冲突的文件名。"""
-    candidate = directory / name
-    if not candidate.exists():
-        return candidate
-    stem, dot, ext = name.rpartition(".")
-    base = stem if dot else name
-    suffix = f".{ext}" if dot else ""
-    for index in range(1, 1000):
-        candidate = directory / f"{base}({index}){suffix}"
-        if not candidate.exists():
-            return candidate
+def _create_unique(directory: Path, name: str) -> tuple[int, Path]:
+    """独占创建一个不冲突的文件，返回 ``(fd, path)``。
+
+    先探测再写入会有竞态：两个线程可能同时看到同一个「不存在」的名字。
+    ``O_CREAT | O_EXCL`` 把「选名字 + 创建」变成内核里的原子操作。
+    """
+    name = name or "file"
+    stem = Path(name).stem or name
+    suffix = Path(name).suffix
+    for index in range(1000):
+        candidate = directory / (name if index == 0 else f"{stem}({index}){suffix}")
+        try:
+            fd = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            continue
+        return fd, candidate
     raise OSError("同名文件太多了，换个目录吧")
 
 
 def _save_artifact(name: str, data: bytes) -> Path:
-    """把结果写进输出目录，返回落盘路径。"""
+    """把结果写进输出目录；同名文件自动加序号，绝不覆盖。"""
     _OUT_DIR.mkdir(parents=True, exist_ok=True)
-    path = _unique_path(_OUT_DIR, name)
-    path.write_bytes(data)
+    fd, path = _create_unique(_OUT_DIR, name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except BaseException:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        raise
     return path
 
 
@@ -260,18 +275,48 @@ def _validate_keyfile(keyfile: bytes | None) -> bytes | None:
     return keyfile
 
 
+_UNSAFE_FILENAME_CHARS: Final[frozenset[str]] = frozenset({'"', "\\", "/", "\r", "\n"})
+
+
+def _clean_filename(name: str) -> str:
+    """把文件名收敛成可安全写进响应头 / 文件系统的形式。
+
+    去掉引号、反斜杠、路径分隔符和控制字符；中文与普通空格保留。
+    """
+    cleaned = "".join(
+        ch for ch in name if ch.isprintable() and ch not in _UNSAFE_FILENAME_CHARS
+    )
+    return cleaned.strip() or "download"
+
+
 def _content_disposition(filename: str) -> str:
     """生成兼容中文文件名的 ``Content-Disposition``。"""
-    ascii_name = filename.encode("ascii", "ignore").decode("ascii") or "download"
-    return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(filename)}"
+    safe = _clean_filename(filename)
+    ascii_name = safe.encode("ascii", "ignore").decode("ascii") or "download"
+    return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(safe)}"
 
 
 def _safe_output_name(name: str, suffix: str) -> str:
-    """从上传的文件名推出下载文件名，去掉路径分隔符。"""
-    base = Path(sanitize_member_path(name)).name or "file"
+    """从上传的文件名推出下载文件名，去掉路径分隔符与控制字符。"""
+    base = _clean_filename(Path(sanitize_member_path(name)).name or "file")
     if suffix and not base.endswith(suffix):
         return base + suffix
     return base
+
+
+def _parse_content_length(raw: str | None) -> int:
+    """解析并校验 Content-Length；负数、非整数、超限一律拒绝。"""
+    if raw is None:
+        raise ValueError("缺少 Content-Length")
+    try:
+        length = int(raw)
+    except ValueError:
+        raise ValueError("Content-Length 不是整数") from None
+    if length < 0:
+        raise ValueError("Content-Length 不能为负数")
+    if length > MAX_BODY_BYTES:
+        raise ValueError(f"请求体超过上限 {MAX_BODY_BYTES // (1024 * 1024)} MB")
+    return length
 
 
 # ---------------------------------------------------------------------------
@@ -300,13 +345,8 @@ class TarpitRequestHandler(BaseHTTPRequestHandler):
         return host in {"127.0.0.1", "localhost", "::1"}
 
     def _read_body(self) -> bytes:
-        """读取请求体，超过上限直接拒绝。"""
-        length_raw = self.headers.get("Content-Length")
-        if not length_raw:
-            raise ValueError("缺少 Content-Length")
-        length = int(length_raw)
-        if length > MAX_BODY_BYTES:
-            raise ValueError(f"请求体超过上限 {MAX_BODY_BYTES // (1024 * 1024)} MB")
+        """读取请求体；Content-Length 缺失 / 负数 / 超限都拒绝。"""
+        length = _parse_content_length(self.headers.get("Content-Length"))
         return self.rfile.read(length)
 
     def _send_bytes(
@@ -357,6 +397,22 @@ class TarpitRequestHandler(BaseHTTPRequestHandler):
             self._fail(HTTPStatus.BAD_REQUEST, str(exc))
             return
 
+        try:
+            self._dispatch_post(body)
+        except tc.DecryptError as exc:
+            self._fail(HTTPStatus.UNPROCESSABLE_ENTITY, str(exc))
+        except (ValueError, tc.TarpitError) as exc:
+            self._fail(HTTPStatus.BAD_REQUEST, str(exc))
+        except MemoryError:
+            self._fail(HTTPStatus.INSUFFICIENT_STORAGE, "内存不足，请调低 mem 预设")
+        except OSError as exc:
+            self._fail(HTTPStatus.INTERNAL_SERVER_ERROR, f"服务端错误：{exc}")
+        except Exception as exc:  # noqa: BLE001 - 兜底，别让线程带着半截响应退出
+            sys.stderr.write(f"[web] 未处理异常：{type(exc).__name__}\n")
+            self._fail(HTTPStatus.INTERNAL_SERVER_ERROR, "服务端内部错误，请查看终端日志")
+
+    def _dispatch_post(self, body: bytes) -> None:
+        """按路由分发；异常交给 :meth:`do_POST` 统一映射状态码。"""
         if not self._origin_allowed():
             self._fail(HTTPStatus.FORBIDDEN, "拒绝非本机来源的请求")
             return
@@ -368,29 +424,12 @@ class TarpitRequestHandler(BaseHTTPRequestHandler):
 
         # reveal 走 JSON，不是 multipart，必须排在表单解析之前
         if route == "/api/reveal":
-            try:
-                self._handle_reveal(body)
-            except ValueError as exc:
-                self._fail(HTTPStatus.BAD_REQUEST, str(exc))
+            self._handle_reveal(body)
             return
 
-        try:
-            fields, files = parse_form(self.headers.get("Content-Type", ""), body)
-        except ValueError as exc:
-            self._fail(HTTPStatus.BAD_REQUEST, str(exc))
-            return
-
+        fields, files = parse_form(self.headers.get("Content-Type", ""), body)
         handler = self._handle_encrypt if route == "/api/encrypt" else self._handle_decrypt
-        try:
-            handler(fields, files)
-        except tc.DecryptError as exc:
-            self._fail(HTTPStatus.UNPROCESSABLE_ENTITY, str(exc))
-        except (ValueError, tc.TarpitError) as exc:
-            self._fail(HTTPStatus.BAD_REQUEST, str(exc))
-        except MemoryError:
-            self._fail(HTTPStatus.INSUFFICIENT_STORAGE, "内存不足，请调低 mem 预设")
-        except OSError as exc:
-            self._fail(HTTPStatus.INTERNAL_SERVER_ERROR, f"服务端错误：{exc}")
+        handler(fields, files)
 
     # -- 业务 -------------------------------------------------------------
 
@@ -565,27 +604,42 @@ def main(argv: list[str] | None = None) -> int:
     """启动本地 Web 服务。"""
     global _OUT_DIR
     _configure_stdio()
+    default_out = Path(__file__).resolve().parent / "存放文件"
     parser = argparse.ArgumentParser(
         prog="tarpitcrypt-web",
         description="TarpitCrypt 本地 Web 入口：拖文件进来，加密文件出去。",
     )
-    parser.add_argument("--host", default=HOST, help=f"监听地址，默认 {HOST}")
+    parser.add_argument("--host", default=HOST, help=f"监听地址，默认 {HOST}（只允许回环）")
     parser.add_argument("--port", type=int, default=PORT, help=f"端口，默认 {PORT}")
     parser.add_argument("--open", action="store_true", help="启动后自动打开浏览器")
     parser.add_argument(
+        "--allow-remote",
+        action="store_true",
+        help="允许监听非回环地址（口令会以明文 HTTP 经过网络，慎用）",
+    )
+    parser.add_argument(
         "--out-dir",
-        default=str(Path(__file__).resolve().parent / "存放文件"),
-        help="加密/解密结果另存到哪个目录，默认 ~/TarpitCrypt",
+        default=str(default_out),
+        help=f"加密/解密结果另存到哪个目录，默认 {default_out}",
     )
     args = parser.parse_args(argv)
-    _OUT_DIR = Path(args.out_dir).expanduser()
-    _OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    if args.host not in ("127.0.0.1", "localhost", "::1"):
+    loopback_hosts = ("127.0.0.1", "localhost", "::1")
+    if args.host not in loopback_hosts:
+        if not args.allow_remote:
+            print(
+                f"拒绝启动：--host={args.host} 不是回环地址。"
+                "口令会以明文 HTTP 经过网络；如确需局域网访问，加 --allow-remote 并自担风险。",
+                file=sys.stderr,
+            )
+            return 2
         print(
             "警告：正在监听非回环地址。口令会以明文 HTTP 经过网络，只应绑定 127.0.0.1。",
             file=sys.stderr,
         )
+
+    _OUT_DIR = Path(args.out_dir).expanduser()
+    _OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     server = TarpitWebServer((args.host, args.port), TarpitRequestHandler)
     url = f"http://{args.host}:{server.server_address[1]}"

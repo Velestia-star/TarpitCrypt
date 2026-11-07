@@ -85,6 +85,16 @@ async function main() {
     try { core.parseHeader(heavyHeader); } catch (e) { heavyRejected = /工作量/.test(e.message); }
     ok("工作量上限", heavyRejected);
 
+    let memRejected = false;
+    try {
+      core.parseHeader(core.packHeader({
+        flags: 0, mem: 2 * 1024 * 1024, time: 1, para: 1, rounds: 1, powDiff: 0,
+        salt: new Uint8Array(32), nonce: new Uint8Array(24),
+        powNonce: new Uint8Array(8), ctLen: 16,
+      }));
+    } catch (e) { memRejected = /内存/.test(e.message); }
+    ok("内存上限", memRejected);
+
     ok("口令体检-短", !core.checkPasswordStrength("short").ok);
     ok("口令体检-弱", !core.checkPasswordStrength("password").ok);
     ok("口令体检-强", core.checkPasswordStrength("GoodPass1").ok);
