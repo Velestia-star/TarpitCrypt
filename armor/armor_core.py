@@ -779,7 +779,9 @@ def _py_source(rng: random.Random, template: int, tag: str) -> str:
                 .replace("__M__", str(rng.randint(64, 997))))
     # 追加随机 dummy 片段：模板本身只有 6 套且高度雷同，不同诱饵层的
     # .py 会因此长得一模一样，被聚类识别。随机片段打破这种低熵。
-    for _ in range(rng.randint(0, 3)):
+    # 下限取 1：每个诱饵 .py 至少带一段，避免整层恰好抽到 0 段时
+    # 内容层回归（H）随机挂掉，也让"打破模板低熵"这个保证不靠运气。
+    for _ in range(rng.randint(1, 3)):
         text += _random_py_snippet(rng)
     return text
 
