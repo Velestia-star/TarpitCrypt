@@ -94,6 +94,35 @@ async function main() {
     ok("JS 自解", dec.decode((await core.decrypt(made, enc.encode("js-pw"))).data) === "js-made-payload");
     lines.push("JSFILE " + hex(made));
 
+    // 解析器对齐：CT_LEN 下限、FLAGS/POW_DIFF 一致性、u64 精度。
+    let tinyRejected = false;
+    try {
+      const tiny = new Uint8Array(made);
+      new DataView(tiny.buffer).setBigUint64(83, 0n, false);
+      await core.decrypt(tiny, enc.encode("js-pw"));
+    } catch (e) { tinyRejected = /CT_LEN/.test(e.message); }
+    ok("CT_LEN 下限", tinyRejected);
+
+    let flagRejected = false;
+    try {
+      core.parseHeader(core.packHeader({
+        flags: 0, mem: 8192, time: 1, para: 1, rounds: 1, powDiff: 16,
+        salt: new Uint8Array(32), nonce: new Uint8Array(24),
+        powNonce: new Uint8Array(8), ctLen: 16,
+      }));
+    } catch (e) { flagRejected = /POW_DIFF/.test(e.message); }
+    ok("FLAGS/POW_DIFF 一致", flagRejected);
+
+    let bigRejected = false;
+    try {
+      core.parseHeader(core.packHeader({
+        flags: 0, mem: 8192, time: 1, para: 1, rounds: 1, powDiff: 0,
+        salt: new Uint8Array(32), nonce: new Uint8Array(24),
+        powNonce: new Uint8Array(8), ctLen: 2n ** 63n,
+      }));
+    } catch (e) { bigRejected = /安全整数/.test(e.message); }
+    ok("CT_LEN 精度", bigRejected);
+
     const pyBlob = unb64(PY_B64);
     ok("解 Python 文件",
        dec.decode((await core.decrypt(pyBlob, enc.encode("cross-test"))).data) === "python-made-payload");
@@ -109,6 +138,17 @@ async function main() {
     ok("诱饵-主层", dec.decode(mainR.data) === "real" && mainR.isDecoy === false);
     ok("诱饵-诱饵层", dec.decode(decR.data) === "fake" && decR.isDecoy === true);
     lines.push("DECOYFILE " + hex(dBlob));
+
+    let decoyLenRejected = false;
+    try {
+      const badDecoy = new Uint8Array(dBlob);
+      const dv = new DataView(badDecoy.buffer);
+      const ctLen = Number(dv.getBigUint64(83, false));
+      const dLenOffset = core.HEADER_LEN + ctLen + core.NONCE_LEN;
+      dv.setBigUint64(dLenOffset, 15n, false);
+      await core.decrypt(badDecoy.slice(0, dLenOffset + 15), enc.encode("decoy-pw"));
+    } catch (e) { decoyLenRejected = /DECOY_LEN/.test(e.message); }
+    ok("DECOY_LEN 下限", decoyLenRejected);
 
     const kfBlob = await core.encrypt(enc.encode("kf"), enc.encode("kf-pw"),
       { params, keyfile: enc.encode("KEYFILE") });

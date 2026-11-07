@@ -225,6 +225,7 @@ async function runEncrypt() {
     keyfile,
     decoyPlaintext,
     decoyPassword,
+    onProgress: (done) => status(`正在磨 PoW… 已试 ${done.toLocaleString()} 次`),
   });
 
   const sourceName = state.isFolder || state.picked.length > 1
@@ -878,6 +879,7 @@ async function encryptWorkspaceItem(item) {
       keyfile,
       decoyPlaintext,
       decoyPassword: decoyPlaintext ? passwordBytes(decoyText) : null,
+      onProgress: (done) => status(`正在磨 PoW… 已试 ${done.toLocaleString()} 次`),
     });
     const payloadBlob = new Blob([blob], { type: "application/octet-stream" });
     item.output = {

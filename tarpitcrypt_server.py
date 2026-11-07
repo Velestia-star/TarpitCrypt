@@ -722,7 +722,7 @@ INDEX_HTML = """<!doctype html>
           <option value="0" selected>关闭</option>
           <option value="16">16 bit</option>
           <option value="18">18 bit</option>
-          <option value="20">20 bit（造文件会慢几秒）</option>
+          <option value="20">20 bit（可能几十秒）</option>
         </select>
       </label>
       <label>AEAD 算法

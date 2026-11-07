@@ -67,6 +67,17 @@
   不记录口令、不联网。
 - 不改变 `encrypt` / `decrypt` 的行为；弱口令仍然可用，只是会看到提示。
 
+### 性能与兼容：浏览器 PoW 提速 + 解析器对齐
+
+- `grindPow` 改为每批 256 个并发 SHA-256 提交，本机 WebCrypto 实测 1k 次
+  约 61 ms → 20 ms（约 3 倍，具体随浏览器而异）；每 4096 次让出事件循环并
+  回调进度，在线版会显示「已试 N 次」。
+- `parseHeader` 与 Python 对齐：检查 `FLAGS.POW` / `POW_DIFF` 一致性，
+  `CT_LEN` 超过 `Number.MAX_SAFE_INTEGER` 时拒绝，避免 u64 精度问题。
+- `decrypt` 补上 `CT_LEN` / `DECOY_LEN` 至少容纳 16 字节认证标签的下限检查，
+  与 Python 的 `_validate_blob_layout` 一致。
+- 本地网页版 pow=20 的文案从「慢几秒」改为「可能几十秒」。
+
 ## v0.3.10 — 2026-11-07
 
 补齐 `docs/AI_RE_THREATMODEL.md` 第四节列出的四条诱导层短板。
