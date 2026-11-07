@@ -54,8 +54,9 @@ MAX_BODY_BYTES: Final[int] = 512 * 1024 * 1024  # 512 MB
 #: Argon2id 是 GiB 级内存硬函数，并发跑两个大参数会直接把机器拖死。
 _CRYPTO_LOCK: Final[threading.Lock] = threading.Lock()
 
-#: 加密/解密的结果会顺手存一份到磁盘，这样「打开所在目录」才有意义。
-_OUT_DIR: Path = Path.home() / "TarpitCrypt"
+#: 加密/解密的结果会顺手存一份到磁盘，默认放在项目目录下的 `存放文件/`。
+#: 用 __file__ 定位，换到哪个工作目录启动都指向项目里。
+_OUT_DIR: Path = Path(__file__).resolve().parent / "存放文件"
 
 #: 只有服务端自己登记过的产出物才允许被打开。令牌随机，客户端猜不到。
 _ARTIFACTS: dict[str, Path] = {}
@@ -555,11 +556,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--open", action="store_true", help="启动后自动打开浏览器")
     parser.add_argument(
         "--out-dir",
-        default=str(Path.home() / "TarpitCrypt"),
+        default=str(Path(__file__).resolve().parent / "存放文件"),
         help="加密/解密结果另存到哪个目录，默认 ~/TarpitCrypt",
     )
     args = parser.parse_args(argv)
     _OUT_DIR = Path(args.out_dir).expanduser()
+    _OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     if args.host not in ("127.0.0.1", "localhost", "::1"):
         print(

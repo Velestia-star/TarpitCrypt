@@ -20,3 +20,6 @@ venv/
 tarpit_report.csv
 tarpit_report.md
 report.md
+
+# 本地网页版默认落盘目录（加密产物不应入库）
+存放文件/
