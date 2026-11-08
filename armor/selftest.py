@@ -318,6 +318,103 @@ def main() -> int:
         check("K: 旧名 armor_passwords 已移出 __all__",
               "armor_passwords" not in ac.__all__)
 
+        # ===== L/M/O 缺陷修复的回归断言（第二轮实证审计） =====
+        # L: 真层含二进制资源时，诱饵层也必须有高熵(>7.0)二进制文件，
+        #    否则逐个文件算熵就能把真层挑出来。
+        # M: 两层的扩展名集合、文件数、目录条目数必须一致（不许靠额外加文件
+        #    来补熵，那样「条目多几个」本身又成了新的剪枝线索）。
+        import math
+
+        def _entropy(b: bytes) -> float:
+            if not b:
+                return 0.0
+            freq: dict[int, int] = {}
+            for x in b:
+                freq[x] = freq.get(x, 0) + 1
+            n = len(b)
+            return -sum((c / n) * math.log2(c / n) for c in freq.values())
+
+        def _profile(payload: bytes) -> tuple[set[str], int, int, int]:
+            with zipfile.ZipFile(io.BytesIO(payload)) as zf:
+                exts: set[str] = set()
+                n_files = n_dirs = n_high = 0
+                for i in zf.infolist():
+                    if i.is_dir():
+                        n_dirs += 1
+                        continue
+                    n_files += 1
+                    if i.filename.startswith(ac.PAD_PREFIX):
+                        continue
+                    import os as _os
+                    exts.add(_os.path.splitext(i.filename)[1] or ".bin")
+                    if _entropy(zf.read(i)) > 7.0:
+                        n_high += 1
+                return exts, n_files, n_dirs, n_high
+
+        with tempfile.TemporaryDirectory() as fd3:
+            binsrc = Path(fd3) / "BinApp"
+            (binsrc / "src").mkdir(parents=True)
+            (binsrc / "src" / "main.py").write_bytes(
+                b"def main():\n    return 0\n" * 40)
+            (binsrc / "assets").mkdir()
+            (binsrc / "assets" / "model.bin").write_bytes(os.urandom(8000))
+            (binsrc / "assets" / "data.bin").write_bytes(os.urandom(500))
+            (binsrc / "config").mkdir()
+            (binsrc / "config" / "c.json").write_text("{}", encoding="utf-8")
+            bin_blob = ac.build_armored(binsrc, b"lm-test-pw", layers=4,
+                                        profile=profile)
+            bin_real = ac.restore_armored(bin_blob, b"lm-test-pw").payload
+            bin_opened = solved_by(bin_blob,
+                                   ac.revealed_debug_passwords(bin_blob))
+            r_exts, r_files, r_dirs, r_high = _profile(bin_real)
+            check("L: 真层含高熵二进制文件（审计基准）",
+                  r_high >= 1 and ".bin" in r_exts,
+                  f"high={r_high} exts={sorted(r_exts)}")
+            check("L: 诱饵层也带高熵二进制文件（熵值不可分层）",
+                  bool(bin_opened) and all(_profile(p)[3] >= 1 for p in bin_opened),
+                  f"{len(bin_opened)} 层")
+            # 确定性剪枝信号是「诱饵层从不出现二进制扩展名」。文本扩展名
+            # 由固定 layout 池生成、与真层偶发有细微差异（F-K 既有概率性弱
+            # 信号，且各诱饵层彼此也不同，无法稳定分层），故只断言真层全部
+            # 二进制扩展名在诱饵层都出现。
+            r_bin_exts = r_exts & set(ac._BINARY_EXTS)
+            check("M: 诱饵层覆盖真层全部二进制扩展名（消除确定性指纹）",
+                  bool(r_bin_exts) and bool(bin_opened)
+                  and all(r_bin_exts <= _profile(p)[0] for p in bin_opened),
+                  f"real_bin={sorted(r_bin_exts)} "
+                  f"decoy={[sorted(_profile(p)[0]) for p in bin_opened]}")
+            check("M: 诱饵层文件数 / 目录条目数与真层一致（无新增条目）",
+                  bool(bin_opened) and all(_profile(p)[1] == r_files
+                                           and _profile(p)[2] == r_dirs
+                                           for p in bin_opened),
+                  f"real files={r_files} dirs={r_dirs}")
+
+        # O: 层内假 IOC 不得跨容器复用同一组 token（否则可被聚类指纹），
+        #    同时必须继续守住「不出现公网 IP」的安全红线。
+        def _ioc_text(b: bytes) -> str:
+            out = ""
+            for p in solved_by(b, ac.revealed_debug_passwords(b)):
+                with zipfile.ZipFile(io.BytesIO(p)) as zf:
+                    for i in zf.infolist():
+                        if i.filename == ac.LAYER_IOC_PATH:
+                            out += zf.read(i).decode("utf-8", "ignore")
+            return out
+
+        o1 = _ioc_text(blob)
+        o2 = _ioc_text(ac.build_armored(src, b"o-test-pw", layers=4,
+                                        profile=profile))
+        check("O: 层内假 IOC 跨构建不重复（消除聚类指纹）",
+              bool(o1) and o1 != o2, f"len {len(o1)}/{len(o2)}")
+        import ipaddress as _ip
+        public = []
+        for tok in (o1 + " " + o2).replace("=", " ").replace(":", " ").replace("/", " ").split():
+            try:
+                if _ip.ip_address(tok).is_global:
+                    public.append(tok)
+            except ValueError:
+                pass
+        check("O: 随机化后假 IOC 仍不含任何公网 IP", not public, str(public[:3]))
+
         # 7c) 层间不可区分：尺寸之外，元数据分布也不能泄露真伪。
         #     早先只测「尺寸极差 0B」，漏掉了「诱饵层所有条目同一年」
         #     和「诱饵层条目恒多 4~5 个」这两个确定性剪枝信号。

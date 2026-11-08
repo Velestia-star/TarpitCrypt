@@ -71,7 +71,7 @@ except ModuleNotFoundError:  # pragma: no cover - 仅仓库布局触发
     from tarpitcrypt import CIPHER_AESGCM, _aead_decrypt, _aead_encrypt, _derive
 
 #: 整个工具集的发布版本；容器格式版本另见 VERSION。
-__version__ = "0.3.12"
+__version__ = "0.3.13"
 
 __all__ = [
     "__version__",
@@ -546,6 +546,19 @@ def pack_source(src: Path, on_progress: Progress | None = None,
     _notify(on_progress, 1, 1, "真层载荷打包完成")
     return buf.getvalue()
 
+_BINARY_EXTS = frozenset({
+    ".bin", ".dat", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg",
+    ".so", ".dll", ".exe", ".elf", ".o", ".a", ".class", ".jar", ".wasm",
+    ".pdf", ".zip", ".gz", ".tar", ".tgz", ".7z", ".rar", ".sqlite", ".db",
+    ".sqlite3", ".key", ".pem", ".p12", ".pfx", ".wav", ".mp3", ".mp4",
+    ".ttf", ".woff", ".woff2", ".otf", ".ico", ".pyc", ".pyd", ".rdb",
+    ".mdb", ".iso", ".img", ".vhd", ".vmdk", ".blob", ".cache", ".pak",
+    ".bundle", ".swf", ".flv", ".avi", ".mov", ".mkv", ".eps", ".tiff",
+    ".model", ".weights", ".onnx", ".pb", ".h5", ".ckpt", ".parquet",
+    ".avro", ".orc", ".feather", ".npy", ".npz", ".pth", ".pt",
+})
+
+
 def _source_stats(payload: bytes) -> dict:
     """统计真包的可观测特征，诱饵包据此对齐，避免被按大小或结构剪枝。
 
@@ -573,6 +586,12 @@ def _source_stats(payload: bytes) -> dict:
         "sizes": tuple(sorted(sizes)),
         "depth": max((n.count("/") for n in names), default=0),
         "exts": tuple(sorted({Path(n).suffix or ".bin" for n in names})),
+        "bin_exts": tuple(sorted(
+            {Path(n).suffix or ".bin" for n in names
+             if (Path(n).suffix or ".bin") in _BINARY_EXTS})),
+        "bin_sizes": tuple(sorted(
+            sz for n, sz in zip(names, sizes)
+            if (Path(n).suffix or ".bin") in _BINARY_EXTS)),
         "exec_ratio": (execs / len(names)) if names else 0.0,
     }
 
@@ -806,7 +825,12 @@ _LAYER_IOC_NETS = tuple(ipaddress.ip_network(n) for n in (
 _LAYER_IOC_DOC = ("example.com", "example.net", "example.org",
                   "invalid", "localhost", "home.arpa")
 _LAYER_IOC_SVC = ("api", "cdn", "c2", "update", "sync", "login", "telemetry",
-                  "gate", "collector", "beacon", "relay", "metrics")
+                  "gate", "collector", "beacon", "relay", "metrics", "edge", "node",
+                  "proxy", "tunnel", "bridge", "scheduler", "ingest", "dispatch",
+                  "gateway", "resolver", "bootstrap", "control", "endpoint",
+                  "hub", "spoke", "anchor", "pivot", "exfil", "stager", "dropper",
+                  "loader", "panel", "phoenix", "crimson", "vector", "orion",
+                  "nexus", "halcyon", "quartz")
 _LAYER_IOC_FIELDS = ("C2_PRIMARY", "C2_FALLBACK", "SYNC_ENDPOINT", "BEACON_HOST",
                      "TELEMETRY_URL", "RELAY_ADDR", "UPDATE_HOST", "API_KEY",
                      "SESSION_TOKEN", "DEVICE_ID", "BUILD_SECRET")
@@ -903,12 +927,17 @@ def _make_layer_ioc(seed: bytes, index: int, count: int) -> str:
         kind = rng.randrange(9)
         field = rng.choice(_LAYER_KIND_FIELDS[kind])
         if kind == 0:
-            value = f"{_rand_reserved_ip(rng)}:{rng.choice(_LAYER_IOC_PORTS)}"
+            port = rng.randint(1024, 65535)
+            value = f"{_rand_reserved_ip(rng)}:{port}"
         elif kind == 1:
-            value = (f"{rng.choice(_LAYER_IOC_SVC)}."
+            svc_tok = rng.choice(_LAYER_IOC_SVC) + "-" + format(
+                rng.getrandbits(16), "04x")
+            value = (f"{svc_tok}."
                      f"{rng.choice(_LAYER_IOC_DOC)}")
         elif kind == 2:
-            value = (f"https://{rng.choice(_LAYER_IOC_SVC)}."
+            svc_tok2 = rng.choice(_LAYER_IOC_SVC) + "-" + format(
+                rng.getrandbits(16), "04x")
+            value = (f"https://{svc_tok2}."
                      f"{rng.choice(_LAYER_IOC_DOC)}/{rng.choice(_LAYER_IOC_SVC)}")
         elif kind == 3:
             value = "AKIA" + "".join(rng.choice(hexchars) for _ in range(16))
@@ -1179,7 +1208,7 @@ def _make_decoy_zip(seed: bytes, index: int, stats: dict,
         layout = [f"{chosen[i % len(chosen)]}/{stem}"
                   for i, stem in enumerate(stems)]
 
-    files: dict[str, str] = {}
+    files: dict[str, str | bytes] = {}
     for i, path in enumerate(layout):
         if path.endswith(".py"):
             files[path] = _py_source(rng, i + index, f"{tag}-{i}")
@@ -1207,13 +1236,72 @@ def _make_decoy_zip(seed: bytes, index: int, stats: dict,
 
     # 文件大小分布对齐：消除「诱饵层所有文件都落在 50~450B 窄带」的剪枝信号。
     _pad_decoy_files(files, manifest_name, stats, rng)
-    inner = "".join(files.values()).encode("utf-8")
+
+    # 熵值 / 扩展名对齐：真实层含二进制资源时其文件熵≈8.0，诱饵层若只有文本
+    # （熵≤6），逐个文件算熵即可把真层挑出。这里按真实层的二进制扩展名集合与
+    # 大小分布，把等量「已对齐大小的文本文件」原地转成二进制（换扩展名 + 高熵
+    # 随机字节）。只改内容/名字，不增删条目：文件数、目录条目数、大小分布都与
+    # 原诱饵层一致，不会引入新的剪枝线索。
+    real_bin_exts = list(stats.get("bin_exts") or ())
+    real_bin_sizes = list(stats.get("bin_sizes") or ())
+    if real_bin_exts and real_bin_sizes:
+        rng.shuffle(real_bin_sizes)
+        rng.shuffle(real_bin_exts)
+        user_keys = [k for k in files
+                     if k != manifest_name and not k.startswith(LAYER_IOC_DIR)]
+        rng.shuffle(user_keys)
+        # 数量：真层有几种二进制扩展名就至少转几个，保证「每种都覆盖」，
+        # 不留「诱饵层从不出现 .png/.so」这类确定性指纹；再多按真层二进制
+        # 文件数补齐（上限 6，避免过度消耗文本条目）。
+        n_bin = min(len(user_keys),
+                    max(len(real_bin_exts), min(len(real_bin_sizes), 6)))
+
+        def _ext_of(k: str) -> str:
+            leaf = k.split("/")[-1]
+            return "." + leaf.rsplit(".", 1)[1] if "." in leaf else ""
+
+        # 优先转「同扩展名还有别的副本」的文件，避免把某个文本扩展名的
+        # 唯一代表消掉；副本不够时回退到唯一代表，绝不能因此不转换
+        # （否则单二进制源会偶发整层无高熵文件，熵分层漏洞依旧）。
+        ext_left: dict[str, int] = {}
+        for k in user_keys:
+            e = _ext_of(k)
+            ext_left[e] = ext_left.get(e, 0) + 1
+        safe: list[str] = []
+        risky: list[str] = []
+        for k in user_keys:
+            e = _ext_of(k)
+            if ext_left.get(e, 0) >= 2:
+                ext_left[e] -= 1
+                safe.append(k)
+            else:
+                risky.append(k)
+        chosen = (safe + risky)[:n_bin]
+
+        for i, old_key in enumerate(chosen):
+            # 轮转分配：前 len(real_bin_exts) 个必然覆盖每一种二进制扩展名。
+            ext = real_bin_exts[i % len(real_bin_exts)]
+            size = real_bin_sizes[i % len(real_bin_sizes)]
+            base = old_key.rsplit(".", 1)[0] if "." in old_key.split("/")[-1] else old_key
+            new_key = base + ext
+            suffix = 1
+            while (new_key == old_key or new_key in files) and suffix < 100:
+                new_key = f"{base}_{suffix}{ext}"
+                suffix += 1
+            if new_key in files:
+                continue
+            files[new_key] = secrets.token_bytes(size)
+            del files[old_key]
+
+    inner = b"".join(
+        v.encode("utf-8") if isinstance(v, str) else v
+        for v in files.values())
     files[manifest_name] = _manifest(name, sha256_bytes(inner),
                                      "release").decode("utf-8")
 
     # 与真层同构：虚拟目录也写成显式目录条目，清单一律放最后，条目标记
     # 也按同一套规则打。否则「有没有目录条目」本身就成了新的剪枝线索。
-    entries: dict[str, str | None] = {}
+    entries: dict[str, str | bytes | None] = {}
     for path, text in files.items():
         parts = path.split("/")
         for i in range(1, len(parts)):
@@ -1267,7 +1355,8 @@ def _make_decoy_zip(seed: bytes, index: int, stats: dict,
                 body = b""
             else:
                 info.comment = USER_TAG
-                body = text.encode("utf-8") if text is not None else b""
+                body = (text if isinstance(text, (bytes, bytearray))
+                        else text.encode("utf-8") if text is not None else b"")
             zf.writestr(info, body)
     return buf.getvalue()
 
