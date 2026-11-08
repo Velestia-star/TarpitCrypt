@@ -779,3 +779,10 @@ def test_desktop_server_starts_with_token(
             server.server_close()
     finally:
         ts._OUT_DIR, ts._ALLOW_PATHS, ts._PATH_TOKEN = old
+
+
+def test_desktop_self_test_runs_crypto_and_armor() -> None:
+    """冻结 exe 的 --self-test 逻辑：v1 + armor 都要能跑。"""
+    import desktop_web
+
+    assert desktop_web._run_self_test() == 0

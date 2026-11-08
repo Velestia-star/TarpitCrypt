@@ -136,6 +136,139 @@ def _storage_dir() -> Path:
     return path
 
 
+_WEBVIEW2_CLIENT = "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+_WEBVIEW2_URL = "https://developer.microsoft.com/microsoft-edge/webview2/"
+
+
+def _webview2_version() -> str:
+    """返回已安装的 WebView2 Runtime 版本；空字符串表示没找到。"""
+    if not sys.platform.startswith("win"):
+        return ""
+    try:
+        import winreg
+    except ImportError:
+        return ""
+
+    keys = (
+        (winreg.HKEY_LOCAL_MACHINE, rf"SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{_WEBVIEW2_CLIENT}"),
+        (winreg.HKEY_LOCAL_MACHINE, rf"SOFTWARE\Microsoft\EdgeUpdate\Clients\{_WEBVIEW2_CLIENT}"),
+        (winreg.HKEY_CURRENT_USER, rf"Software\Microsoft\EdgeUpdate\Clients\{_WEBVIEW2_CLIENT}"),
+    )
+    for hive, subkey in keys:
+        try:
+            with winreg.OpenKey(hive, subkey) as key:
+                value, _kind = winreg.QueryValueEx(key, "pv")
+                if value:
+                    return str(value)
+        except OSError:
+            continue
+
+    for env in ("ProgramFiles(x86)", "ProgramFiles", "LOCALAPPDATA"):
+        base = os.environ.get(env)
+        if not base:
+            continue
+        root = Path(base) / "Microsoft" / "EdgeWebView" / "Application"
+        if not root.is_dir():
+            continue
+        versions = [
+            item.name
+            for item in root.iterdir()
+            if item.is_dir() and (item / "msedgewebview2.exe").is_file()
+        ]
+        if versions:
+            return sorted(versions)[-1]
+    return ""
+
+
+def _find_webview2_bootstrapper() -> Path | None:
+    names = ("MicrosoftEdgeWebview2Setup.exe", "MicrosoftEdgeWebView2Setup.exe")
+    roots: list[Path] = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        roots.append(Path(meipass))
+    roots.append(Path(sys.executable).resolve().parent)
+    roots.append(Path(__file__).resolve().parent)
+    for root in roots:
+        for name in names:
+            candidate = root / name
+            if candidate.is_file():
+                return candidate
+    return None
+
+
+def _show_error(text: str) -> None:
+    if sys.platform.startswith("win"):
+        import ctypes
+
+        ctypes.windll.user32.MessageBoxW(0, text, "TarpitCrypt", 0x10)
+    else:
+        print(text, file=sys.stderr)
+
+
+def _ensure_webview2() -> bool:
+    """检测 WebView2；优先运行随 exe 附带的 Evergreen Bootstrapper。"""
+    if not sys.platform.startswith("win"):
+        return True
+    if _webview2_version():
+        return True
+
+    bootstrapper = _find_webview2_bootstrapper()
+    if bootstrapper is not None:
+        try:
+            subprocess.run(
+                [str(bootstrapper), "/silent", "/install"],
+                check=False,
+                timeout=300,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        if _webview2_version():
+            return True
+
+    _show_error(
+        "缺少 Microsoft Edge WebView2 Runtime，桌面窗口无法启动。\n\n"
+        f"请安装后重试：{_WEBVIEW2_URL}\n\n"
+        "也可以把 MicrosoftEdgeWebview2Setup.exe 放到 TarpitCrypt.exe 旁边，"
+        "程序会在启动时自动安装。"
+    )
+    return False
+
+
+def _run_self_test() -> int:
+    """验证冻结环境里的 tarpitcrypt / armor 原生依赖都能跑。"""
+    import io
+    import tempfile
+    import zipfile
+
+    armor_core, decoy_kit = ts._armor_modules()
+    import armor_metrics  # noqa: F401 - 验证它能被冻结收集
+    import tarpitcrypt as tc
+
+    params = tc.CryptoParams(mem=8192, time=1, para=1, rounds=1, pow=0)
+    password = b"SelftestPass1!"
+    blob = tc.encrypt(b"tarpitcrypt-selftest", password, params=params)
+    plain, is_decoy = tc.decrypt(blob, password)
+    if plain != b"tarpitcrypt-selftest" or is_decoy:
+        raise RuntimeError("v1 自测失败")
+
+    with tempfile.TemporaryDirectory(prefix="tc-exe-selftest-") as tmp:
+        source = Path(tmp) / "selftest.txt"
+        source.write_text("armor selftest", encoding="utf-8")
+        armored = armor_core.build_armored(
+            source,
+            password,
+            layers=2,
+            profile=next(iter(armor_core.PROFILES)),
+        )
+        restored = armor_core.restore_armored(armored, password)
+        with zipfile.ZipFile(io.BytesIO(restored.payload)) as archive:
+            data = archive.read("selftest.txt")
+        if data != b"armor selftest":
+            raise RuntimeError("armor 自测失败")
+    print("self-test OK")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="TarpitCrypt 桌面 WebView 壳（P5）")
     parser.add_argument("--out-dir", default=None, help="输出目录，默认 存放文件/")
@@ -146,27 +279,37 @@ def main(argv: list[str] | None = None) -> int:
         default=8766,
         help="固定本地端口（默认 8766）；换端口会换持久化空间",
     )
+    parser.add_argument("--self-test", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
 
+    if args.self_test:
+        try:
+            return _run_self_test()
+        except Exception as exc:
+            print(f"self-test failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 1
+
     if webview is None:
-        print(
+        _show_error(
             "没有找到 pywebview。请先安装桌面依赖：\n"
             "  python -m pip install pywebview\n"
-            "然后重新运行 python desktop_web.py。",
-            file=sys.stderr,
+            "然后重新运行 python desktop_web.py。"
         )
         return 2
+
+    if not _ensure_webview2():
+        return 3
 
     try:
         server, url, _token = start_local_server(args.out_dir, port=args.port)
     except FileNotFoundError as exc:
-        print(exc, file=sys.stderr)
+        _show_error(str(exc))
         return 2
     except OSError as exc:
-        print(
+        _show_error(
             f"端口 {args.port} 启动失败：{exc}\n"
-            "请关掉占用它的程序，或用 --port 换一个固定端口（注意：换端口会换一套持久化空间）。",
-            file=sys.stderr,
+            "请关掉占用它的程序，或用 --port 换一个固定端口"
+            "（注意：换端口会换一套持久化空间）。"
         )
         return 2
     api = NativeApi()
@@ -180,7 +323,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     if window is None:
         _stop_server(server)
-        print("WebView 窗口创建失败。", file=sys.stderr)
+        _show_error("WebView 窗口创建失败。")
         return 2
     api._bind_window(window)
     stopped = threading.Event()

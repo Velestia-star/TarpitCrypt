@@ -17,6 +17,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "ruff>=0.6"]
 desktop = ["pywebview>=6.0"]
+build = ["pyinstaller>=6.0"]
 
 [project.urls]
 Homepage = "https://Velestia-star.github.io/TarpitCrypt/"

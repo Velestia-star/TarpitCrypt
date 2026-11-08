@@ -5,10 +5,25 @@
 
 ## 未发布
 
+### 单文件 exe、WebView2 处理与详细教程
+
+- 新增 `scripts/build_exe.ps1`：PyInstaller `--onefile --windowed` 构建
+  `dist/TarpitCrypt.exe`，自动带上 `docs/`、armor 模块和 pywebview 依赖；
+  也可以双击根目录的 `构建单文件exe.cmd`。
+- 内置 WebView2 运行时检测：优先读注册表/安装目录；缺运行时可运行随 exe
+  附带的 Evergreen Bootstrapper 静默安装，否则弹出下载地址。
+- 构建脚本会处理 Python 3.15 的 `python3t.dll` abi3t 兼容 shim，避免
+  cryptography `_rust.pyd` 在冻结环境里加载失败。
+- 新增 `--self-test`：在冻结 exe 里跑一遍 v1 加解密和 armor 加固/还原，
+  验证二进制依赖；当前构建退出码 0。
+- 新增根目录 `使用教程.txt`（详细操作向导），构建后复制到 `dist/`。
+- 删除 `打开在线版.html`（在线版仍保留 README 里的 GitHub Pages 链接）。
+- `.gitignore` 忽略 PyInstaller 生成的 `*.spec`。
+
 ### 桌面 WebView 壳：原生窗口 + 本机路径（P5）
 
 - 新增 `desktop_web.py`：pywebview/WebView2 加载现有 `docs/`，隐藏浏览器
-  地址栏，本地服务只绑 `127.0.0.1` 随机端口。
+  地址栏，本地服务固定监听 `127.0.0.1:8766`。
 - 页面在桌面壳里多出「本机文件 / 本机文件夹 / 本机输出目录」按钮：
   通过原生对话框拿到路径，再把路径交给 Python 核心，不再走浏览器上传。
 - 新增桌面壳专用路径模式：加固 / 伴生 / 还原 / 摘要支持 `source_path`、

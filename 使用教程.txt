@@ -1,0 +1,427 @@
+TarpitCrypt 详细使用教程
+========================
+
+版本：P5 / v0.3.12 代码线
+适用：Windows 10/11（桌面 exe、GUI）、现代浏览器（本地 Web / 在线版）
+语言：简体中文
+
+
+一、TarpitCrypt 是什么
+----------------------
+
+TarpitCrypt 是一个“反 AI 逆向”的整活项目，底层仍然是正常的本地文件加密工具：
+
+- 主加密：生成 `.tarpit` 文件，文件头里写死 Argon2id 猜解成本。
+- 整活加固：生成多层 `.armored` 容器，真实层和诱饵层在容器里不可区分；
+  还可以生成“伴生诱饵”目录，污染“先读项目目录”的逆向流程。
+- 它不提供“找回密码”的后门。口令或 keyfile 丢了，就真的打不开。
+
+它适合：
+- 给自己拥有的程序包、资料做加固 / 整活；
+- 做安全演示、逆向对抗演练、AI agent 评测；
+- 研究“怎么让自动化逆向的成本变高”。
+
+不要拿它处理你不拥有的程序，也不要用于恶意软件分发。
+
+
+二、四种使用入口，先选一个
+----------------------------
+
+1. 在线版（最轻，只有主加密）
+   地址：https://Velestia-star.github.io/TarpitCrypt/
+   打开网页，拖文件，输口令，浏览器本地完成加解密。
+   注意：在线版不显示 armor 加固面板，也不保存服务端文件。
+
+2. 本地 Web（推荐日常用）
+   在仓库目录运行：
+       python tarpitcrypt_server.py
+   会自动打开 http://127.0.0.1:8765 。
+   浏览器界面 + 本机 Python 算力；支持主加密和完整的 armor 面板。
+
+3. 桌面 exe / WebView 壳（推荐发给别人）
+   已经打包好：dist\TarpitCrypt.exe
+   双击运行；不需要浏览器，不需要命令行。
+   也可以用源码运行：
+       python desktop_web.py
+
+4. GUI（原生 tkinter 控制面板）
+       python armor/armor_gui.py
+   适合不依赖浏览器、想要原生文件对话框和运行报告的场合。
+   当前 P5 之后，本地 Web / 桌面 exe 已覆盖大部分功能，GUI 作为备用入口保留。
+
+命令行（CLI）适合脚本和批量：
+       python tarpitcrypt.py encrypt 输入 输出.tarpit
+       python tarpitcrypt.py decrypt 输出.tarpit 还原文件
+       python tarpitcrypt.py info 文件.tarpit
+
+
+三、第一次运行桌面 exe
+------------------------
+
+1. 找到 dist\TarpitCrypt.exe。
+2. 双击。第一次启动会比普通程序慢几秒，因为单文件 exe 要先解压。
+3. 如果系统缺少 Microsoft Edge WebView2 Runtime：
+   - exe 内置了 WebView2 Evergreen Bootstrapper；
+   - 程序会尝试静默安装；
+   - 如果失败，会弹出提示和下载地址。
+   也可以手动安装 WebView2 后重试。
+4. 正常启动后是一个原生窗口，没有浏览器地址栏。
+5. 默认端口是 127.0.0.1:8766，只在本机可用。
+
+常用启动参数：
+       TarpitCrypt.exe --out-dir D:\我的输出
+       TarpitCrypt.exe --port 8767
+       TarpitCrypt.exe --debug
+
+注意：
+- 换 --port 会换一套持久化空间（浏览器 origin 变了）。
+- 8766 被占用时程序会提示；先关掉占用端口的程序，或换端口。
+- 未签名的单文件 exe 偶尔会被 Windows Defender 误报；这是 PyInstaller
+  单文件打包的常见现象，不是程序在联网。
+
+桌面窗口里比浏览器多三个按钮：
+- 本机文件
+- 本机文件夹
+- 本机输出目录
+
+它们会直接打开系统文件对话框，拿到真实路径，再交给 Python 处理；
+不会把整个程序包先上传一遍。
+
+
+四、主加密：生成和打开 .tarpit
+------------------------------
+
+1. 打开任意入口（在线版 / 本地 Web / 桌面 exe）。
+2. 把文件或整个文件夹拖进左侧区域。
+3. 填主口令，再确认一次。
+4. 点“加密并下载”。
+5. 浏览器会下载一个 .tarpit 文件；本地 Web / 桌面版还会在
+   “存放文件”目录里另存一份。
+
+解密：
+1. 切到“解密”标签。
+2. 拖入 .tarpit 文件。
+3. 填主口令。
+4. 点“解密并下载”。
+
+默认只需要一个口令。
+“高级”里还有：
+- keyfile：额外的密钥文件，可选；
+- PoW：工作量证明，增加暴力尝试成本；
+- 诱饵文件：给错误口令准备一份假内容，可选。
+
+文件夹会被打包成一个 .tarpit；解开后是一个 .zip，里面保留目录结构。
+
+
+五、整活加固：生成 .armored
+----------------------------
+
+本地 Web / 桌面 exe 页面底部有“整活加固”区域，四个页签：
+加固 / 还原 / 伴生诱饵 / 运行报告。
+
+### 5.1 加固
+
+1. 拖入程序包（单文件或整个文件夹），或点“本机文件/本机文件夹”。
+2. 填主口令，再确认一次。
+   加固口令要求至少 8 位、至少两类字符；Web / 桌面版默认拒绝弱口令。
+3. 选择：
+   - 层数：2~8；
+   - 加固强度：轻 / 中 / 狠；
+   - 伴生诱饵：是否同时生成假规格、假源码、假解析器；
+   - 投毒侧重；
+   - 拟态风格；
+   - 注入强度。
+4. 可选“输出子目录”，例如填 2026-11-08，结果会进
+   存放文件\2026-11-08\。
+5. 点“开始加固”，看进度条和运行日志。
+6. 完成后可以：
+   - 下载 .armored；
+   - 下载伴生诱饵 zip；
+   - 打开所在目录。
+
+加固不会修改原程序目录；只把结果写到输出目录。
+同名结果会自动加序号，不覆盖旧文件。
+
+### 5.2 还原
+
+1. 切到“还原”。
+2. 拖入 .armored，或点“本机 .armored”。
+3. 可以先点“查看摘要”，只看版本、层数、容器大小、草稿大小、digest，
+   不需要口令。
+4. 填主口令，点“开始还原”。
+5. 完成后下载还原 zip。
+
+也可以勾选“并行尝试各层”。还原结果不会标注“哪层是真的”，这是故意的。
+
+### 5.3 伴生诱饵
+
+这个页签可以单独生成伴生包，不需要先加固：
+1. 选源程序包；
+2. 可选附一个已有 .armored，让规格草稿引用真实容器；
+3. 选风格、层数、投毒、注入；
+4. 生成并下载 zip。
+
+伴生目录会写到输出目录，原程序一个字节都不改。
+
+### 5.4 运行报告
+
+只统计本次服务会话的操作：
+- 加固 / 还原 / 伴生的记录条数；
+- 失败次数；
+- 累计层尝试；
+- 估算轮数和估算 token；
+- 累计耗时。
+
+支持导出 CSV / Markdown、清空记录。
+报告只在内存里，不写进容器，不记录口令；服务重启就清空。
+
+
+六、工作区和历史会不会保留
+--------------------------
+
+### 6.1 工作区
+
+工作区会把文件字节和加密结果存进浏览器的 IndexedDB。
+只要访问的是同一个 origin，关闭再打开会恢复。
+
+- 本地 Web：默认 http://127.0.0.1:8765 。
+- 桌面 exe：默认 http://127.0.0.1:8766 ，并使用固定的 WebView 存储目录。
+
+注意：
+- 换端口 = 换 origin = 之前的工作区不会跟着走。
+- 清理浏览器站点数据 / 换用户 / 换电脑，也会丢。
+- 工作区里已经有“源文件字节”，所以恢复后可以继续加密，不需要重新拖。
+
+### 6.2 历史
+
+历史记录列表会保留，但历史只保存元数据：
+- 文件名、大小、时间、结果名等；
+- 不保存源文件句柄，也不保存历史专用的文件副本。
+
+所以重启后：
+- 历史列表还在；
+- 双击旧记录可能提示“页面刷新过”；
+- 实际生成的 .tarpit / .armored 文件通常还在“存放文件”目录里，没有丢。
+
+如果你要“历史也能像工作区一样保存文件内容”，那是另一套 blob 存储，
+会明显吃磁盘；目前没有做。
+
+
+七、桌面 exe 的“本机路径”模式
+------------------------------
+
+桌面 exe / WebView 壳里，页面会多出：
+- 本机文件
+- 本机文件夹
+- 本机 .armored
+- 本机输出目录
+
+作用：
+- 直接从磁盘读源包，不经过浏览器上传；
+- 大文件夹不用先复制一份；
+- 输出可以写到任意本地目录。
+
+安全边界：
+- 只有桌面壳会打开路径模式；
+- 普通 tarpitcrypt_server.py 永远只允许写 存放文件/；
+- 桌面壳页面会带一个随机会话令牌，路径请求必须带令牌；
+- 没令牌的路径请求会被拒绝；
+- 服务仍然只监听 127.0.0.1。
+
+
+八、GUI 控制面板
+----------------
+
+运行：
+       python armor/armor_gui.py
+
+五个页签：
+- 加固
+- 还原
+- 伴生诱饵
+- 运行报告
+- 说明
+
+GUI 的特点：
+- 原生文件 / 文件夹对话框；
+- 可以直接选任意输入、输出路径；
+- 运行报告支持导出 CSV / Markdown；
+- 有“确认后允许弱口令”“确认覆盖同名文件”这两个逃生口。
+
+Web / 桌面版目前更严格：
+- 默认拒绝弱口令；
+- 同名结果自动加序号，不覆盖。
+
+如果你需要这两个逃生口，可以继续用 GUI；普通使用建议保持安全默认。
+
+
+九、命令行用法
+--------------
+
+主加密：
+
+       python tarpitcrypt.py encrypt notes.pdf notes.pdf.tarpit
+       python tarpitcrypt.py decrypt notes.pdf.tarpit notes.pdf
+       python tarpitcrypt.py info notes.pdf.tarpit
+
+keyfile：
+
+       python tarpitcrypt.py keygen my.key
+       python tarpitcrypt.py encrypt big.iso big.tarpit --keyfile my.key
+       python tarpitcrypt.py decrypt big.tarpit big.iso --keyfile my.key
+
+诱饵文件：
+
+       python tarpitcrypt.py encrypt real.txt out.tarpit --decoy fake.txt
+
+其他参数（PoW、KDF 参数、--force、--allow-heavy 等）见：
+       python tarpitcrypt.py --help
+
+
+十、自己构建单文件 exe
+----------------------
+
+环境：
+- Windows 10/11
+- Python 3.11+
+- 网络（用于下载 WebView2 Bootstrapper；也可跳过）
+
+步骤：
+
+       cd D:\TarpitCrypt
+       python -m pip install -r requirements-desktop.txt
+       python -m pip install pyinstaller
+       powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build_exe.ps1
+
+也可以直接双击根目录的“构建单文件exe.cmd”。
+
+输出：
+       dist\TarpitCrypt.exe
+       dist\使用教程.txt
+
+构建脚本会：
+- 把 docs\ 前端、armor 模块、pywebview 打进单文件 exe；
+- 下载 WebView2 Evergreen Bootstrapper 并一起打包；
+- 如果本机 Python 带 abi3t 兼容 shim（python3t.dll），也会一起带上，
+  避免 cryptography 的 _rust.pyd 在冻结环境里找不到 DLL。
+
+跳过 WebView2 安装器：
+
+       powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build_exe.ps1 -NoWebView2Bundle
+
+验证构建：
+
+       dist\TarpitCrypt.exe --self-test
+
+退出码 0 表示冻结环境里的 tarpitcrypt / armor 依赖都能正常运行。
+
+注意：
+- 单文件 exe 第一次启动慢，是正常解压；
+- 没签名的 exe 可能被杀毒软件误报；
+- 换 Python 版本 / 换依赖版本后建议重新跑 --self-test。
+
+
+十一、输出文件在哪里
+--------------------
+
+默认输出目录：
+       存放文件\
+
+构建产物：
+       dist\TarpitCrypt.exe
+       dist\使用教程.txt
+
+加固可能产生：
+       xxx.armored
+       xxx-kit\              伴生诱饵目录
+       xxx-sidecar.zip       伴生诱饵 zip
+
+主加密可能产生：
+       xxx.tarpit
+       解密后的原文件或 .zip
+
+所有结果同名时自动加序号，不覆盖旧文件。
+
+
+十二、常见问题
+--------------
+
+Q1：双击 exe 没反应 / 白屏？
+A：先确认 WebView2 Runtime 是否安装。安装后重试；也可以用
+    TarpitCrypt.exe --debug 看调试窗口。
+
+Q2：提示端口 8766 被占用？
+A：关掉占用端口的程序，或 TarpitCrypt.exe --port 8767。
+    注意：换端口会换一套工作区/历史存储空间。
+
+Q3：工作区关了再开没了？
+A：确认端口没有变、没有清理浏览器站点数据、没有换 WebView 存储目录。
+    工作区存在 IndexedDB；历史存在 localStorage。
+
+Q4：历史记录还在，但双击提示页面刷新过？
+A：正常。历史只保存元数据，浏览器不允许跨重启持有源文件句柄。
+    重新把文件拖进工作区即可；生成的结果文件还在 存放文件\。
+
+Q5：口令忘了怎么办？
+A：没有后门，无法找回。请备份口令和 keyfile。
+
+Q6：弱口令为什么不让加固？
+A：Web / 桌面版默认拒绝弱口令；GUI 有确认后强上的逃生口。
+    弱口令会让加固形同虚设，建议用长口令。
+
+Q7：为什么同名文件不覆盖？
+A：安全默认，自动加序号，避免手滑丢上一份结果。
+    GUI 有确认覆盖的选项；Web / 桌面版目前没有。
+
+Q8：在线版为什么没有加固面板？
+A：armor 需要本机 Python 运算；在线版只做浏览器内的主加密。
+    要完整加固，用本地 Web 或桌面 exe。
+
+Q9：exe 被杀毒软件报毒？
+A：PyInstaller 单文件 + 未签名容易被误报。可以改用源码运行，
+    或自己做代码签名；不要从不可信来源下载别人的 exe。
+
+Q10：能处理多大的文件？
+A：桌面壳的本机路径模式直接读磁盘，适合大包；浏览器上传模式受
+    本地服务 512 MB 请求限制。单文件源包默认上限 256 MiB，可用
+    TARPIT_MAX_SOURCE_BYTES 调整。
+
+
+十三、安全提醒
+--------------
+
+- 只加固你自己拥有的程序包。
+- 口令和 keyfile 丢了就真的打不开，没有找回。
+- 重要数据先备份，再测试恢复流程。
+- Web / 桌面服务只监听 127.0.0.1，不要随手加 --allow-remote 暴露到局域网。
+- 在线版运算在浏览器；本地 Web / 桌面版运算在本机 Python 进程；
+  两者都不会把文件发到外网。
+- armor 的诱饵层是防御性干扰，不是恶意软件；不要用来伪造真实 IOC。
+
+
+十四、目录结构（主要文件）
+--------------------------
+
+tarpitcrypt.py              主加密 CLI / 核心
+tarpitcrypt_server.py       本地 Web 服务
+desktop_web.py              P5 桌面 WebView 壳
+armor/armor_gui.py          tkinter GUI
+armor/armor_core.py         多层容器核心
+armor/decoy_kit.py          伴生诱饵生成器
+armor/armor_metrics.py      运行报告
+docs/                       本地 Web / 在线版共用前端
+scripts/build_exe.ps1       单文件 exe 构建脚本
+dist/TarpitCrypt.exe        构建产物（不提交 Git）
+存放文件/                   默认输出目录（不提交 Git）
+
+
+十五、最后
+----------
+
+如果你只想做一件事：
+- 发给别人用：dist\TarpitCrypt.exe
+- 自己日常用：python tarpitcrypt_server.py
+- 只想在线快速加解密：打开 GitHub Pages
+- 要原生拖放 / 覆盖 / 弱口令逃生口：python armor/armor_gui.py
+
+更多细节以 README.md 和代码为准；本教程是操作向导，不替代安全审计。

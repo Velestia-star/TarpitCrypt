@@ -2,7 +2,6 @@
 
 **🌐 在线版（打开即用）→ [Velestia-star.github.io/TarpitCrypt](https://Velestia-star.github.io/TarpitCrypt/)**
 —— 拖文件进去就能加解密，运算全在你自己浏览器里，文件不上传。
-（懒得多打一次字的话，直接双击仓库根目录的 [`打开在线版.html`](打开在线版.html)。）
 
 > 不是让数据「解不开」，而是让**逆向方判断不了自己是不是找对了**。
 
@@ -267,7 +266,30 @@ python desktop_web.py
 - 没有装 pywebview 时会明确提示；原来的 `python armor/armor_gui.py`
   仍然保留，作为不依赖浏览器的 fallback。
 
-目前 P5 还是桌面壳形态，尚未做单文件 exe 打包。
+### 单文件 exe 打包
+
+需要 Windows + Python 3.11+：
+
+```powershell
+python -m pip install -r requirements-desktop.txt
+python -m pip install pyinstaller
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build_exe.ps1
+# 或双击 构建单文件exe.cmd
+```
+
+输出：`dist\TarpitCrypt.exe`（约 19 MB），同目录会附带 `使用教程.txt`。
+
+- 构建脚本会自动下载 WebView2 Evergreen Bootstrapper 并打进 exe；第一次在
+  缺 WebView2 的机器上启动时会尝试静默安装。
+- 不想附带安装器：`scripts/build_exe.ps1 -NoWebView2Bundle`；缺运行时会
+  弹出下载地址。
+- 单文件模式第一次启动会解压到临时目录，所以比直接跑 Python 慢几秒；
+  Windows Defender 偶尔会误报未签名 exe。
+- 构建后可用 `dist\TarpitCrypt.exe --self-test` 验证冻结环境里的
+  tarpitcrypt / armor 依赖，退出码 0 表示通过。
+
+完整使用步骤、持久化规则、四种入口（在线版 / 本地 Web / 桌面 exe / GUI）
+和常见问题见 [使用教程.txt](使用教程.txt)。
 
 ---
 
