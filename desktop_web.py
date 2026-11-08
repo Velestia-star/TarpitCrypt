@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """TarpitCrypt 桌面 WebView 壳（P5）。
 
-用 pywebview 把本地 Web 装进一个原生窗口：不显示浏览器地址栏，随机
-loopback 端口只在本机可用；同时给页面开放三个原生能力：
+用 pywebview 把本地 Web 装进一个原生窗口：不显示浏览器地址栏，固定
+loopback 端口（默认 8766）只在本机可用；同时给页面开放三个原生能力：
 
 * 原生文件 / 文件夹选择对话框；
 * 原生输出目录选择；
@@ -22,6 +22,7 @@ loopback 端口只在本机可用；同时给页面开放三个原生能力：
 from __future__ import annotations
 
 import argparse
+import os
 import secrets
 import subprocess
 import sys
@@ -93,10 +94,12 @@ class NativeApi:
 
 def start_local_server(
     out_dir: str | Path | None = None,
+    port: int = 0,
 ) -> tuple[Any, str, str]:
-    """启动随机端口的本地服务，并打开桌面壳专用的路径模式。
+    """启动本地服务，并打开桌面壳专用的路径模式。
 
-    返回 ``(server, url, token)``。调用方负责 ``shutdown()`` / ``server_close()``。
+    ``port=0`` 时由系统分配随机端口（测试用）；桌面主程序使用固定端口，
+    这样 IndexedDB / localStorage 的 origin 不变，工作区和历史才能跨启动保留。
     """
     if out_dir is not None:
         ts._OUT_DIR = Path(out_dir).expanduser().resolve()
@@ -107,11 +110,11 @@ def start_local_server(
         )
     ts._ALLOW_PATHS = True
     ts._PATH_TOKEN = secrets.token_hex(16)
-    server = ts.TarpitWebServer(("127.0.0.1", 0), ts.TarpitRequestHandler)
+    server = ts.TarpitWebServer(("127.0.0.1", port), ts.TarpitRequestHandler)
     thread = threading.Thread(target=server.serve_forever, name="tarpit-web", daemon=True)
     thread.start()
-    port = int(server.server_address[1])
-    return server, f"http://127.0.0.1:{port}/", ts._PATH_TOKEN
+    actual_port = int(server.server_address[1])
+    return server, f"http://127.0.0.1:{actual_port}/", ts._PATH_TOKEN
 
 
 def _stop_server(server: Any) -> None:
@@ -121,10 +124,28 @@ def _stop_server(server: Any) -> None:
         server.server_close()
 
 
+def _storage_dir() -> Path:
+    """给 WebView 一个稳定的用户数据目录，避免 private mode 每次清空。"""
+    if sys.platform.startswith("win"):
+        base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+        root = Path(base) if base else Path.home() / "AppData" / "Local"
+    else:
+        root = Path.home() / ".local" / "share"
+    path = root / "TarpitCrypt" / "webview"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="TarpitCrypt 桌面 WebView 壳（P5）")
     parser.add_argument("--out-dir", default=None, help="输出目录，默认 存放文件/")
     parser.add_argument("--debug", action="store_true", help="打开 WebView 调试工具")
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8766,
+        help="固定本地端口（默认 8766）；换端口会换持久化空间",
+    )
     args = parser.parse_args(argv)
 
     if webview is None:
@@ -137,9 +158,16 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     try:
-        server, url, _token = start_local_server(args.out_dir)
+        server, url, _token = start_local_server(args.out_dir, port=args.port)
     except FileNotFoundError as exc:
         print(exc, file=sys.stderr)
+        return 2
+    except OSError as exc:
+        print(
+            f"端口 {args.port} 启动失败：{exc}\n"
+            "请关掉占用它的程序，或用 --port 换一个固定端口（注意：换端口会换一套持久化空间）。",
+            file=sys.stderr,
+        )
         return 2
     api = NativeApi()
     window = webview.create_window(
@@ -163,8 +191,13 @@ def main(argv: list[str] | None = None) -> int:
             _stop_server(server)
 
     window.events.closed += on_closed
+    storage_path = _storage_dir()
     try:
-        webview.start(debug=args.debug)
+        webview.start(
+            debug=args.debug,
+            private_mode=False,
+            storage_path=str(storage_path),
+        )
     finally:
         if not stopped.is_set():
             stopped.set()
