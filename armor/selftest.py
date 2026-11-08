@@ -111,6 +111,20 @@ def manifest_of(payload: bytes) -> dict:
     return {}
 
 
+def entries_by_tag(payload: bytes, tag: bytes) -> list[zipfile.ZipInfo]:
+    """按 zip comment 标记取条目。伪路径已随机化，只能靠 tag 定位。"""
+    with zipfile.ZipFile(io.BytesIO(payload)) as zf:
+        return [i for i in zf.infolist() if i.comment == tag]
+
+
+def tagged_names(payload: bytes, tag: bytes) -> list[str]:
+    return [i.filename for i in entries_by_tag(payload, tag)]
+
+
+def manifest_names(payload: bytes) -> list[str]:
+    return tagged_names(payload, ac.MANIFEST_TAG)
+
+
 def solved_by(blob: bytes, passwords: tuple[str, ...]) -> list[bytes]:
     """返回这些口令能解开的所有层载荷。"""
     out = []
@@ -190,7 +204,9 @@ def main() -> int:
         check("还原结果不带层号/真伪标记",
               not any(k in ac.RestoreResult.__dataclass_fields__ for k in ("layer", "is_decoy")))
         check("统一尺寸的填充条目不落进用户目录",
-              not any(ac.PAD_PREFIX in str(p) for p in out.rglob("*")))
+              not any(q in {p.relative_to(out).as_posix()
+                            for p in out.rglob("*") if p.is_file()}
+                      for q in tagged_names(real.payload, ac.PAD_TAG)))
 
         pool = ac.armor_passwords(blob)
         noise = ac.noise_password(blob)
@@ -201,16 +217,17 @@ def main() -> int:
               any(zipfile.is_zipfile(io.BytesIO(x)) for x in opened))
 
         # 7b) 层内假 IOC：解开任意一层都能撞上蜜罐，且真层结构完全一致
+        # 伪路径按容器随机化，靠 comment tag + 后缀区分字符串表 / 注入文档。
         def ioc_of(payload: bytes) -> tuple[list, str, str]:
             with zipfile.ZipFile(io.BytesIO(payload)) as zf:
                 items = [i for i in zf.infolist()
                          if i.comment == ac.LAYER_IOC_TAG]
                 text = "".join(zf.read(i).decode("utf-8", errors="ignore")
                                for i in items
-                               if i.filename == ac.LAYER_IOC_PATH)
+                               if i.filename.endswith(".strings"))
                 note = "".join(zf.read(i).decode("utf-8", errors="ignore")
                                for i in items
-                               if i.filename == ac.LAYER_NOTE_PATH)
+                               if i.filename.endswith(".md"))
                 return items, text, note
 
         layer_sets = [ioc_of(p) for p in [real.payload, *opened]]
@@ -244,10 +261,13 @@ def main() -> int:
         except dk.SidecarError as exc:
             ioc_leaks = [str(exc)]
         check("层内假 IOC 通过构建期真实主机审计", not ioc_leaks, str(ioc_leaks))
+        _internal = [q for p in [real.payload, *opened]
+                     for q in tagged_names(p, ac.LAYER_IOC_TAG)
+                     + tagged_names(p, ac.MANIFEST_TAG)]
         check("层内假 IOC 是内部条目，不落进用户目录",
-              not (out / ac.LAYER_IOC_PATH).exists()
-              and not (out / ac.LAYER_NOTE_PATH).exists()
-              and not (out / "resources").exists())
+              bool(_internal)
+              and not any((out / q).exists() for q in _internal),
+              str(_internal[:4]))
         check("层内假 IOC 数量足以诱导 agent（≥12 条）",
               min(len(text.splitlines()) for _, text, _ in layer_sets) >= 14,
               str([len(text.splitlines()) for _, text, _ in layer_sets]))
@@ -343,7 +363,7 @@ def main() -> int:
                         n_dirs += 1
                         continue
                     n_files += 1
-                    if i.filename.startswith(ac.PAD_PREFIX):
+                    if i.comment == ac.PAD_TAG:
                         continue
                     import os as _os
                     exts.add(_os.path.splitext(i.filename)[1] or ".bin")
@@ -396,7 +416,8 @@ def main() -> int:
             for p in solved_by(b, ac.revealed_debug_passwords(b)):
                 with zipfile.ZipFile(io.BytesIO(p)) as zf:
                     for i in zf.infolist():
-                        if i.filename == ac.LAYER_IOC_PATH:
+                        if (i.comment == ac.LAYER_IOC_TAG
+                                and i.filename.endswith(".strings")):
                             out += zf.read(i).decode("utf-8", "ignore")
             return out
 
@@ -414,6 +435,59 @@ def main() -> int:
             except ValueError:
                 pass
         check("O: 随机化后假 IOC 仍不含任何公网 IP", not public, str(public[:3]))
+
+        # ===== P: 固定伪路径随机化的回归断言 =====
+        # 固定路径（resources/telemetry.strings / __tarpit_pad/ / .manifest）
+        # 曾是跨容器一比对就能认出工具身份的稳定指纹。现由容器 seed 派生，
+        # 且真层与全部诱饵层共用同一套（不引入层间差异）。
+        def pseudo_sig(payload: bytes) -> tuple:
+            with zipfile.ZipFile(io.BytesIO(payload)) as zf:
+                pad = [i.filename.rsplit("/", 1)[0] + "/"
+                       for i in zf.infolist() if i.comment == ac.PAD_TAG]
+                ioc = tuple(sorted(i.filename for i in zf.infolist()
+                                   if i.comment == ac.LAYER_IOC_TAG))
+                man = tuple(sorted(i.filename for i in zf.infolist()
+                                   if i.comment == ac.MANIFEST_TAG))
+            return (tuple(sorted(set(pad))), ioc, man)
+
+        p_sigs = []
+        p_consistent = True
+        for k in range(4):
+            p_pw = ("pseudo-path-%d" % k).encode()
+            p_blob = ac.build_armored(src, p_pw, layers=4, profile=profile)
+            p_real = ac.restore_armored(p_blob, p_pw).payload
+            p_opened = solved_by(p_blob, ac.revealed_debug_passwords(p_blob))
+            r_sig = pseudo_sig(p_real)
+            p_sigs.append(r_sig)
+            p_consistent &= all(pseudo_sig(x) == r_sig for x in p_opened)
+        check("P: 跨容器伪路径互不相同（消除跨容器指纹）",
+              len(set(p_sigs)) == len(p_sigs), str([q[2] for q in p_sigs]))
+        check("P: 容器内真层与各诱饵层伪路径完全一致（无层间差异）",
+              p_consistent)
+        check("P: 伪路径不再使用固定常量名",
+              all(ac.LAYER_IOC_PATH not in " ".join(q[1])
+                  and ac.PAD_PREFIX not in " ".join(q[0])
+                  and ".manifest" not in " ".join(q[2])
+                  for q in p_sigs),
+              str(p_sigs[0]))
+        check("P: 伪路径仍是内部条目（带 tag，不落进用户目录）",
+              all(q[1] and q[2] for q in p_sigs)
+              and not any(q in {x.relative_to(out).as_posix()
+                                for x in out.rglob("*") if x.is_file()}
+                          for q in pseudo_sig(real.payload)[1]))
+        # 旧容器（固定伪路径）在新版里仍必须能完整还原。
+        _orig_derive = ac._derive_paths
+        ac._derive_paths = lambda seed, used: ac._LEGACY_PATHS
+        try:
+            legacy_blob = ac.build_armored(src, b"legacy-path-pw", layers=4,
+                                           profile=profile)
+        finally:
+            ac._derive_paths = _orig_derive
+        legacy_res = ac.restore_armored(legacy_blob, b"legacy-path-pw")
+        check("P: 旧固定路径容器仍可还原（向后兼容）",
+              ac.LAYER_IOC_PATH in pseudo_sig(legacy_res.payload)[1]
+              and "src/main.py" in legacy_res.entries,
+              str(pseudo_sig(legacy_res.payload)[1]))
 
         # 7c) 层间不可区分：尺寸之外，元数据分布也不能泄露真伪。
         #     早先只测「尺寸极差 0B」，漏掉了「诱饵层所有条目同一年」
@@ -483,11 +557,15 @@ def main() -> int:
             ac.MAX_DECOY_PAD = saved_cap
         with zipfile.ZipFile(io.BytesIO(real.payload)) as zf:
             real_names = zf.namelist()
+        real_man = manifest_names(real.payload)
         check("诱饵包与真包都带同结构清单",
-              all(".manifest" in zipfile.ZipFile(io.BytesIO(x)).namelist()
-                  for x in opened) and ".manifest" in real_names)
-        check("工具清单不混进用户文件列表", ".manifest" not in real.entries)
-        check("工具清单不落进用户目录", not (out / ".manifest").exists())
+              len(real_man) == 1
+              and all(manifest_names(x) == real_man for x in opened),
+              str([manifest_names(x) for x in opened]))
+        check("工具清单不混进用户文件列表",
+              all(q not in real.entries for q in real_man), str(real_man))
+        check("工具清单不落进用户目录",
+              not any((out / q).exists() for q in real_man), str(real_man))
         manifests = [manifest_of(real.payload)] + [manifest_of(x) for x in opened]
         check("清单字段不标真伪：各层 variant 完全一致",
               all(m and m.get("variant") == manifests[0].get("variant")
@@ -536,8 +614,9 @@ def main() -> int:
         # 尺寸接近还不够：最大层若挤不下填充，会成为唯一没有填充条目的层。
         original_pad, padded = ac._pad_zip, []
 
-        def spy_pad(payload: bytes, target: int, token: bytes) -> bytes:
-            out = original_pad(payload, target, token)
+        def spy_pad(payload: bytes, target: int, token: bytes,
+                    **kwargs) -> bytes:
+            out = original_pad(payload, target, token, **kwargs)
             padded.append(out)
             return out
 
@@ -546,18 +625,20 @@ def main() -> int:
             ac.build_armored(src, pw, layers=4, profile=profile)
         finally:
             ac._pad_zip = original_pad
-        pad_name = ac.PAD_PREFIX.encode()
         check("所有层都带填充条目，真层不会成为唯一例外",
-              len(padded) == 4 and all(pad_name in p for p in padded),
-              f"{sum(pad_name in p for p in padded)}/{len(padded)} 层有填充")
+              len(padded) == 4
+              and all(tagged_names(p, ac.PAD_TAG) for p in padded),
+              f"{sum(bool(tagged_names(p, ac.PAD_TAG)) for p in padded)}"
+              f"/{len(padded)} 层有填充")
         pad_spread = max(len(p) for p in padded) - min(len(p) for p in padded)
         check("各层补齐后尺寸一致（不靠某层不填充凑数）",
               pad_spread <= 16, f"极差 {pad_spread}B")
         shapes, py_bad = [], []
         for payload in opened:
             with zipfile.ZipFile(io.BytesIO(payload)) as zf:
-                names = zf.namelist()
-                shapes.append(tuple(n for n in names if not n.startswith(ac.PAD_PREFIX)))
+                names = [i.filename for i in zf.infolist()
+                         if i.comment != ac.PAD_TAG]
+                shapes.append(tuple(names))
                 for n in names:
                     if n.endswith(".py"):
                         try:
@@ -700,17 +781,25 @@ def main() -> int:
               f"写出 {len(written)} / 条目 {app_res.file_count}")
         with zipfile.ZipFile(io.BytesIO(app_res.payload)) as zf:
             app_names = zf.namelist()
-        check("自带 .manifest 时清单自动避让，不产生重名条目",
-              app_names.count(".manifest") == 1 and ".manifest.1" in app_names,
-              str([n for n in app_names if "manifest" in n]))
+        app_man = manifest_names(app_res.payload)
+        check("工具清单名唯一且不与用户文件重名",
+              len(app_man) == 1 and app_man[0] not in app_before
+              and app_names.count(app_man[0]) == 1,
+              str(app_man))
         decoys = solved_by(app_blob, ac.armor_passwords(app_blob))
-        decoy_names: list[str] = []
-        if decoys:
-            with zipfile.ZipFile(io.BytesIO(decoys[0])) as zf:
-                decoy_names = zf.namelist()
         check("避让清单的容器仍能解开诱饵层", bool(decoys))
         check("诱饵层清单名与真层一致，不泄露结构差异",
-              ".manifest.1" in decoy_names and ".manifest" not in decoy_names)
+              bool(decoys) and all(manifest_names(x) == app_man for x in decoys),
+              str([manifest_names(x) for x in decoys]))
+        # 伪路径派生必须避开用户包里已有的名字（防御性属性测试）。
+        _used = {".manifest", "src/main.py", "assets", "assets/x.bin"}
+        _deriv = [ac._derive_paths(bytes([k]) * 32, set(_used))
+                  for k in range(24)]
+        check("伪路径派生避开用户已有名字",
+              all(q.manifest not in _used
+                  and not any(u == q.pad_prefix.rstrip("/") for u in _used)
+                  and not any(u == q.ioc_dir.rstrip("/") for u in _used)
+                  for q in _deriv))
 
         only_dirs = root / "OnlyDirs"
         (only_dirs / "a" / "b").mkdir(parents=True)

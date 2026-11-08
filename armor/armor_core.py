@@ -71,7 +71,7 @@ except ModuleNotFoundError:  # pragma: no cover - 仅仓库布局触发
     from tarpitcrypt import CIPHER_AESGCM, _aead_decrypt, _aead_encrypt, _derive
 
 #: 整个工具集的发布版本；容器格式版本另见 VERSION。
-__version__ = "0.3.13"
+__version__ = "0.3.14"
 
 __all__ = [
     "__version__",
@@ -151,6 +151,69 @@ LAYER_IOC_PATH = "resources/telemetry.strings"
 LAYER_NOTE_PATH = "resources/triage_notes.md"
 #: 读大文件时的流式块大小，避免把整个程序包反复堆在内存里。
 _COPY_CHUNK = 1 << 20
+
+
+@dataclass(frozen=True, slots=True)
+class _LayerPaths:
+    """单个容器的内部伪路径集合，由 seed 派生。
+
+    固定路径（resources/telemetry.strings / __tarpit_pad/ / .manifest）在
+    每个容器里逐字相同，跨容器一比对就能认出工具身份。这里按容器 seed
+    派生随机目录名与文件名；真层与全部诱饵层共用同一套，层间结构仍完全
+    一致。条目仍是内部条目（带 tag），还原靠 tag 跳过，不依赖路径。
+    """
+    pad_prefix: str        # 尺寸填充目录，/ 结尾
+    ioc_dir: str           # 层内陷阱目录，/ 结尾
+    ioc_path: str          # 假 IOC 字符串表，.strings 结尾
+    note_path: str         # 注入文档，.md 结尾
+    manifest: str          # 工具清单文件名
+
+
+#: v0.3.13 及更早容器用的固定路径，保留供旧容器还原兼容。
+_LEGACY_PATHS = _LayerPaths(
+    PAD_PREFIX, LAYER_IOC_DIR, LAYER_IOC_PATH, LAYER_NOTE_PATH, ".manifest")
+
+_PATH_DIR_WORDS = ("assets", "internal", "runtime", "support", "meta",
+                   "vendor", "state", "cache", "build", "extras", "shared",
+                   "platform", "diagnostics", "local", "generated",
+                   "profiles", "workspace", "resources", "schemas", "fixtures")
+_PATH_IOC_WORDS = ("strings", "registry", "catalog", "index", "descriptors",
+                   "symbols", "metadata", "records", "telemetry", "manifest")
+_PATH_NOTE_WORDS = ("notes", "handover", "review", "triage", "summary",
+                    "checklist", "readme", "changelog")
+
+
+def _derive_paths(seed: bytes, used: set[str]) -> _LayerPaths:
+    """按容器 seed 派生一套内部伪路径，避开用户包里已有的名字。"""
+    rng = _rng(seed, "pseudo-paths")
+
+    def tok() -> str:
+        return format(rng.getrandbits(24), "06x")
+
+    def free_dir() -> str:
+        for _ in range(128):
+            name = rng.choice(_PATH_DIR_WORDS) + "_" + tok()
+            if not any(u == name or u.startswith(name + "/") for u in used):
+                return name
+        return "res_" + secrets.token_hex(8)
+
+    pad_dir = free_dir()
+    ioc_dir = free_dir()
+    while ioc_dir == pad_dir:
+        ioc_dir = free_dir()
+
+    ioc_path = (ioc_dir + "/" + rng.choice(_PATH_IOC_WORDS)
+                + "_" + tok() + ".strings")
+    note_path = (ioc_dir + "/" + rng.choice(_PATH_NOTE_WORDS)
+                 + "_" + tok() + ".md")
+    base = "." + rng.choice(_PATH_IOC_WORDS) + "_" + tok()
+    manifest = base
+    index = 1
+    while manifest in used:
+        manifest = f"{base}.{index}"
+        index += 1
+    return _LayerPaths(pad_dir + "/", ioc_dir + "/",
+                       ioc_path, note_path, manifest)
 
 Progress = Callable[[int, int, str], None]
 
@@ -1039,19 +1102,21 @@ def _make_layer_note_neutral(seed: bytes, index: int) -> str:
 
 
 def _insert_layer_traps(payload: bytes, ioc_text: str, note_text: str,
-                        rng: random.Random) -> bytes:
+                        rng: random.Random,
+                        paths: _LayerPaths | None = None) -> bytes:
     """把假 IOC + 注入文档插进真层，位置在清单之前 —— 与诱饵层一致。"""
     _audit_layer_ioc(ioc_text)
     _audit_layer_ioc(note_text)
+    p = paths or _LEGACY_PATHS
     buf = io.BytesIO()
     inserted = False
 
     def write_traps(dst: zipfile.ZipFile) -> None:
-        d = _zip_entry(LAYER_IOC_DIR, LAYER_IOC_TAG, rng, MODE_EXEC)
+        d = _zip_entry(p.ioc_dir, LAYER_IOC_TAG, rng, MODE_EXEC)
         dst.writestr(d, b"")
-        f = _zip_entry(LAYER_IOC_PATH, LAYER_IOC_TAG, rng, MODE_NORMAL)
+        f = _zip_entry(p.ioc_path, LAYER_IOC_TAG, rng, MODE_NORMAL)
         dst.writestr(f, ioc_text.encode("utf-8"))
-        n = _zip_entry(LAYER_NOTE_PATH, LAYER_IOC_TAG, rng, MODE_NORMAL)
+        n = _zip_entry(p.note_path, LAYER_IOC_TAG, rng, MODE_NORMAL)
         dst.writestr(n, note_text.encode("utf-8"))
 
     with zipfile.ZipFile(io.BytesIO(payload)) as src, \
@@ -1124,8 +1189,9 @@ def _pad_text_file(path: str, text: str, target: int, rng: random.Random) -> str
     return text
 
 
-def _pad_decoy_files(files: dict[str, str], manifest_name: str,
-                     stats: dict, rng: random.Random) -> None:
+def _pad_decoy_files(files: dict[str, str | bytes], manifest_name: str,
+                     stats: dict, rng: random.Random,
+                     ioc_dir: str | None = None) -> None:
     """按真层文件大小分布，给诱饵文件追加 padding（就地修改 files）。"""
     real_sizes = sorted(stats.get("sizes", ()) or ())
     if not real_sizes:
@@ -1134,7 +1200,7 @@ def _pad_decoy_files(files: dict[str, str], manifest_name: str,
     p90 = real_sizes[min(len(real_sizes) - 1,
                          max(0, int(len(real_sizes) * 0.9)))]
     for path in list(files):
-        if path == manifest_name or path.startswith(LAYER_IOC_DIR):
+        if path == manifest_name or path.startswith(ioc_dir or LAYER_IOC_DIR):
             continue
         cur = len(files[path].encode("utf-8"))
         tgt = rng.choice(real_sizes)
@@ -1146,12 +1212,14 @@ def _pad_decoy_files(files: dict[str, str], manifest_name: str,
 
 
 def _make_decoy_zip(seed: bytes, index: int, stats: dict,
-                    manifest_name: str = ".manifest") -> bytes:
+                    manifest_name: str = ".manifest",
+                    paths: _LayerPaths | None = None) -> bytes:
     """生成一份结构、命名、时间戳随机的高仿真诱饵包。
 
     文件数贴近真包，Python 源码由固定可编译模板填充常量而来，不执行任何
     外部动作。统一的层尺寸由 _pad_zip 在打包完成后处理。
     """
+    lp = paths or _LEGACY_PATHS   # 用 lp：函数里 for p in layout 会占用 p
     rng = _rng(seed, "decoy", index)
     name = rng.choice(_NAME_A) + rng.choice(_NAME_B)
     version = f"{rng.randint(0, 4)}.{rng.randint(0, 9)}.{rng.randint(0, 20)}"
@@ -1235,7 +1303,7 @@ def _make_decoy_zip(seed: bytes, index: int, stats: dict,
                            f"> 维护备忘：调试入口在 {rng.choice(('r5', 'r7', 'r9'))} 之后已移除。\n")
 
     # 文件大小分布对齐：消除「诱饵层所有文件都落在 50~450B 窄带」的剪枝信号。
-    _pad_decoy_files(files, manifest_name, stats, rng)
+    _pad_decoy_files(files, manifest_name, stats, rng, ioc_dir=lp.ioc_dir)
 
     # 熵值 / 扩展名对齐：真实层含二进制资源时其文件熵≈8.0，诱饵层若只有文本
     # （熵≤6），逐个文件算熵即可把真层挑出。这里按真实层的二进制扩展名集合与
@@ -1309,7 +1377,7 @@ def _make_decoy_zip(seed: bytes, index: int, stats: dict,
         entries[path] = text
     ordered = sorted(k for k in entries if k != manifest_name)
     # 层内陷阱与真层同位置（清单前三条）、同标记、同条数。
-    ordered += [LAYER_IOC_DIR, LAYER_IOC_PATH, LAYER_NOTE_PATH, manifest_name]
+    ordered += [lp.ioc_dir, lp.ioc_path, lp.note_path, manifest_name]
     ioc_text = _make_layer_ioc(seed, index, _layer_ioc_count(stats))
     note_text = _make_layer_note(seed, index)
     _audit_layer_ioc(ioc_text)
@@ -1321,8 +1389,8 @@ def _make_decoy_zip(seed: bytes, index: int, stats: dict,
     buf = io.BytesIO()
     # 权限分布与真包对齐：真包里有几个可执行入口，诱饵包也得有同样比例。
     exec_ratio = float(stats.get("exec_ratio", 0.0))
-    file_paths = [p for p in ordered
-                  if p != manifest_name and not p.startswith(LAYER_IOC_DIR)]
+    file_paths = [q for q in ordered
+                  if q != manifest_name and not q.startswith(lp.ioc_dir)]
     n_exec = min(len(file_paths), round(exec_ratio * len(file_paths)))
     exec_set = set(rng.sample(file_paths, n_exec)) if n_exec else set()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -1344,13 +1412,13 @@ def _make_decoy_zip(seed: bytes, index: int, stats: dict,
             if path == manifest_name:
                 info.comment = MANIFEST_TAG
                 body = text.encode("utf-8")
-            elif path == LAYER_IOC_PATH:
+            elif path == lp.ioc_path:
                 info.comment = LAYER_IOC_TAG
                 body = ioc_text.encode("utf-8")
-            elif path == LAYER_NOTE_PATH:
+            elif path == lp.note_path:
                 info.comment = LAYER_IOC_TAG
                 body = note_text.encode("utf-8")
-            elif path == LAYER_IOC_DIR:
+            elif path == lp.ioc_dir:
                 info.comment = LAYER_IOC_TAG
                 body = b""
             else:
@@ -1361,14 +1429,15 @@ def _make_decoy_zip(seed: bytes, index: int, stats: dict,
     return buf.getvalue()
 
 
-def _pad_zip(payload: bytes, target_size: int, token: bytes) -> bytes:
+def _pad_zip(payload: bytes, target_size: int, token: bytes,
+             pad_prefix: str | None = None) -> bytes:
     """把任意一层补到 *target_size* 附近，避免「哪层明显更小」被一眼剪枝。
 
     填充写进一个 ZIP_STORED 条目，真层与诱饵层用同一套机制；safe_extract
     会跳过这类条目，因此用户目录里不会出现额外文件。
     """
     stem = hashlib.sha256(token).hexdigest()[:12]
-    rel = PAD_PREFIX + stem + ".dat"
+    rel = (pad_prefix or PAD_PREFIX) + stem + ".dat"
     overhead = 30 + len(rel) + 46 + len(rel) + len(PAD_TAG)
 
     def assemble(size: int) -> bytes:
@@ -1550,10 +1619,15 @@ def build_armored(
         raise ArmorError(f"未知强度档：{profile}")
     mem, time, para, rounds = PROFILES[profile]
 
-    manifest_name = _free_manifest_name(Path(src))
-    real = pack_source(Path(src), on_progress, manifest_name=manifest_name)
-    stats = _source_stats(real)
+    src_path = Path(src)
     seed = secrets.token_bytes(32)
+    used = ({src_path.name} if src_path.is_file()
+            else {q.relative_to(src_path).as_posix()
+                  for q in src_path.rglob("*")})
+    paths = _derive_paths(seed, used)
+    manifest_name = paths.manifest
+    real = pack_source(src_path, on_progress, manifest_name=manifest_name)
+    stats = _source_stats(real)
     global_salt = secrets.token_bytes(SALT_LEN)
     layout_rng = _rng(seed, "layout")
     pw_rng = _rng(seed, "passwords")
@@ -1563,7 +1637,7 @@ def build_armored(
         real,
         _make_layer_ioc(seed, 255, _layer_ioc_count(stats)),
         _make_layer_note_neutral(seed, 255),
-        _rng(seed, "layer-ioc-zip", 255))
+        _rng(seed, "layer-ioc-zip", 255), paths)
 
     slots = layers - 1
     # 至少留一个死层；其余槽位在「诱饵层」和「死层」之间随机分配。
@@ -1595,19 +1669,20 @@ def build_armored(
     raw: list[tuple[bytes, bytes]] = [(password, real)]
     for i, dp in enumerate(decoy_pws):
         raw.append((dp.encode("utf-8"),
-                    _make_decoy_zip(seed, i, stats, manifest_name)))
+                    _make_decoy_zip(seed, i, stats, manifest_name, paths)))
     for i, dp in enumerate(dead_pws):
         # 死层也是完整可解的高仿真包，只是它的口令不出现在任何线索里。
         raw.append((dp.encode("utf-8"),
                     _make_decoy_zip(seed, len(decoy_pws) + i, stats,
-                                    manifest_name)))
+                                    manifest_name, paths)))
 
     # 所有层补到同一尺寸：按大小排序挑真层这条最省事的剪枝路径就此失效。
     # 额外留出至少一条填充条目的开销：若最大层（通常是真层）挤不下填充，
     # 它会成为唯一没有 __tarpit_pad/ 条目的层，结构本身就把真伪标了出来。
     target = max(len(p) for _pw, p in raw) + layout_rng.randint(256, 1024)
     payloads: list[tuple[bytes, bytes]] = [
-        (pw, _pad_zip(p, target, seed + bytes([i % 256])))
+        (pw, _pad_zip(p, target, seed + bytes([i % 256]),
+                      pad_prefix=paths.pad_prefix))
         for i, (pw, p) in enumerate(raw)
     ]
     layout_rng.shuffle(payloads)

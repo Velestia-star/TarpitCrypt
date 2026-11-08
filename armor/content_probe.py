@@ -749,9 +749,10 @@ def probe_layer_ioc(src: Path) -> dict:
                 if info.comment != ac.LAYER_IOC_TAG or info.is_dir():
                     continue
                 body = zf.read(info).decode("utf-8", errors="ignore")
-                if info.filename == ac.LAYER_IOC_PATH:
+                # 路径按容器随机化，靠后缀区分字符串表与注入文档。
+                if info.filename.endswith(".strings"):
                     texts.append(body)
-                elif info.filename == ac.LAYER_NOTE_PATH:
+                elif info.filename.endswith(".md"):
                     notes.append(body)
     joined = "\n".join(texts)
     ips = _IPV4.findall(joined)

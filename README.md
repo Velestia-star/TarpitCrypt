@@ -28,10 +28,10 @@ TarpitCrypt 是一个**反 AI 逆向的整活项目**。底层是一个本地文
 
 | 层面 | 当前值 | 说明 |
 | --- | --- | --- |
-| 发布版本 | **v0.3.13** | 第二轮实证审计：补齐诱饵层高熵二进制与扩展名、消除固定 IOC 跨容器指纹；并含前轮 F–K 全修，见 [CHANGELOG.md](CHANGELOG.md) |
+| 发布版本 | **v0.3.14** | 第三轮实证审计：每容器随机化内部伪路径，消除跨容器固定指纹（兼容旧容器还原）；并含前轮 F–K、L–O 全修，见 [CHANGELOG.md](CHANGELOG.md) |
 | v1 文件格式 | `VERSION = 1`，`MAGIC = TARPITCR` | `.tarpit` 文件，格式冻结 |
 | armor 容器格式 | `VERSION = 3`，`MAGIC = TPARMOR3` | `.armored` 文件；v2 / v0.3.0 容器仍可读 |
-| Python 包元数据 | `0.3.13` | `pyproject.toml` |
+| Python 包元数据 | `0.3.14` | `pyproject.toml` |
 
 两层格式互不依赖：`armor/` 只复用 v1 的 Argon2id 与 AES-256-GCM 原语，
 **v1 文件格式一个字节没改**。
