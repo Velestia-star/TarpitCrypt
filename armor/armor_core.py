@@ -71,7 +71,7 @@ except ModuleNotFoundError:  # pragma: no cover - 仅仓库布局触发
     from tarpitcrypt import CIPHER_AESGCM, _aead_decrypt, _aead_encrypt, _derive
 
 #: 整个工具集的发布版本；容器格式版本另见 VERSION。
-__version__ = "0.3.14"
+__version__ = "0.3.15"
 
 __all__ = [
     "__version__",
@@ -145,6 +145,64 @@ PAD_TAG = b"tarpit-pad-v3"
 #: 才不会污染用户程序，又不会让「有没有 resources/」成为剪枝线索。
 LAYER_IOC_TAG = b"tarpit-layer-ioc-v3"
 _INTERNAL_TAGS = frozenset({MANIFEST_TAG, PAD_TAG, LAYER_IOC_TAG})
+
+
+@dataclass(frozen=True, slots=True)
+class _LayerTags:
+    """单个容器的 zip 条目标记集合，由 seed 派生。
+
+    固定 tag 在每个条目里逐字重复，解开一层后即可认出工具身份。现由容器
+    seed 派生 4 个随机值，编码进 zip archive comment；真层与全部诱饵层
+    共用同一套，层间结构仍完全一致。
+    """
+    user: bytes
+    manifest: bytes
+    pad: bytes
+    ioc: bytes
+
+    def internal(self) -> frozenset[bytes]:
+        return frozenset({self.manifest, self.pad, self.ioc})
+
+
+#: v0.3.14 及更早容器用的固定 tag，保留供旧容器还原兼容。
+_LEGACY_TAGS = _LayerTags(USER_TAG, MANIFEST_TAG, PAD_TAG, LAYER_IOC_TAG)
+
+
+def _derive_tags(seed: bytes) -> _LayerTags:
+    def one(label: bytes) -> bytes:
+        return hashlib.sha256(seed + label).hexdigest()[:32].encode("ascii")
+    return _LayerTags(one(b"user"), one(b"manifest"),
+                      one(b"pad"), one(b"ioc"))
+
+
+def _encode_tags(t: _LayerTags) -> bytes:
+    return b"|".join((t.user, t.manifest, t.pad, t.ioc))
+
+
+def _decode_tags(comment: bytes) -> _LayerTags:
+    """解析 archive comment 里的 tag 表；任何异常一律回退 legacy。
+
+    archive comment 可能来自旧容器、手工载荷或被篡改的输入。严格要求
+    4 段、每段 32 位 hex 且互不相同，否则绝不用它判断「哪些条目要跳过」——
+    避免把用户文件误判成内部条目导致还原丢数据。
+    """
+    try:
+        parts = comment.split(b"|")
+        if len(parts) != 4:
+            return _LEGACY_TAGS
+        if any(len(q) != 32 or any(ch not in b"0123456789abcdef" for ch in q)
+               for q in parts):
+            return _LEGACY_TAGS
+        if len(set(parts)) != 4:
+            return _LEGACY_TAGS
+        return _LayerTags(*parts)
+    except (AttributeError, TypeError, ValueError):
+        return _LEGACY_TAGS
+
+
+def _tags_of(payload: bytes) -> _LayerTags:
+    with zipfile.ZipFile(io.BytesIO(payload)) as zf:
+        return _decode_tags(zf.comment or b"")
 LAYER_IOC_DIR = "resources/"
 LAYER_IOC_PATH = "resources/telemetry.strings"
 #: 层内注入文档：只分发 .armored 时也能读到内容层陷阱，不必依赖伴生包。
@@ -461,7 +519,8 @@ def _collect_entries(src: Path) -> list[tuple[str, Path | None]]:
     return entries
 
 
-def _pack_path(src: Path, zf: zipfile.ZipFile, on_progress: Progress | None) -> int:
+def _pack_path(src: Path, zf: zipfile.ZipFile, on_progress: Progress | None,
+               tags: _LayerTags | None = None) -> int:
     """把一个文件或整个目录写进 zip，返回条目数。
 
     空目录也写成目录条目：真实程序包常带 logs/、cache/ 这类空目录，早先只
@@ -491,7 +550,7 @@ def _pack_path(src: Path, zf: zipfile.ZipFile, on_progress: Progress | None) -> 
     total = len(entries)
     for i, (rel, path) in enumerate(entries, 1):
         mode = _source_mode(path) if path is not None else MODE_EXEC
-        info = _zip_entry(rel, USER_TAG, rng, mode)
+        info = _zip_entry(rel, (tags or _LEGACY_TAGS).user, rng, mode)
         if path is None:
             zf.writestr(info, b"")
         else:
@@ -550,12 +609,14 @@ def _is_legacy_manifest(name: str, data: bytes) -> bool:
     )
 
 
-def _is_internal(info: zipfile.ZipInfo, data: bytes | None = None) -> bool:
+def _is_internal(info: zipfile.ZipInfo, data: bytes | None = None,
+                 tags: _LayerTags | None = None) -> bool:
     """判断条目是否是工具自己塞进去的（清单 / 尺寸填充），而非用户文件。"""
-    if info.comment in _INTERNAL_TAGS:
+    t = tags or _LEGACY_TAGS
+    if info.comment in t.internal():
         return True
-    # v0.3.0：填充条目没有标记，只能靠前缀；带 USER_TAG 的同名用户文件除外。
-    if info.filename.startswith(PAD_PREFIX) and info.comment != USER_TAG:
+    # v0.3.0：填充条目没有标记，只能靠前缀；带 user tag 的同名用户文件除外。
+    if info.filename.startswith(PAD_PREFIX) and info.comment != t.user:
         return True
     # v0.3.0：清单没有标记，靠内容精确识别，避免还原目录里多出 .manifest。
     if info.comment == b"" and data is not None:
@@ -582,7 +643,8 @@ def _free_manifest_name(src: Path) -> str:
 
 
 def pack_source(src: Path, on_progress: Progress | None = None,
-                *, manifest_name: str | None = None) -> bytes:
+                *, manifest_name: str | None = None,
+                tags: _LayerTags | None = None) -> bytes:
     """把拖入的文件/目录打成一个 zip（真层载荷）。"""
     src = Path(src)
     if not src.exists():
@@ -590,7 +652,8 @@ def pack_source(src: Path, on_progress: Progress | None = None,
     name = manifest_name or _free_manifest_name(src)
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        count = _pack_path(src, zf, on_progress)
+        zf.comment = _encode_tags(tags or _LEGACY_TAGS)
+        count = _pack_path(src, zf, on_progress, tags)
         if count == 0:
             raise ArmorError("目录是空的（没有任何文件或子目录），无法加固")
         # 按 ZipInfo 逐个读，而不是按文件名读：程序包里若本来就有
@@ -604,7 +667,8 @@ def pack_source(src: Path, on_progress: Progress | None = None,
                     digest.update(chunk)
         # 清单里的包名与诱饵包同分布，不泄露真实目录名。
         label = f"{secrets.choice(_NAME_A)}{secrets.choice(_NAME_B)}"
-        zf.writestr(_zip_entry(name, MANIFEST_TAG, random.Random()),
+        zf.writestr(_zip_entry(name, (tags or _LEGACY_TAGS).manifest,
+                               random.Random()),
                     _manifest(label, digest.hexdigest(), "release"))
     _notify(on_progress, 1, 1, "真层载荷打包完成")
     return buf.getvalue()
@@ -622,22 +686,24 @@ _BINARY_EXTS = frozenset({
 })
 
 
-def _source_stats(payload: bytes) -> dict:
+def _source_stats(payload: bytes,
+                  tags: _LayerTags | None = None) -> dict:
     """统计真包的可观测特征，诱饵包据此对齐，避免被按大小或结构剪枝。
 
     只数用户文件：目录条目与工具清单元数据不该被当成程序包特征。
     额外返回各用户文件大小，供诱饵层对齐单文件大小分布（消除「诱饵层
     所有文件都落在 50~450B 窄带」这一可剪枝信号）。
     """
+    _ut = (tags or _LEGACY_TAGS).user
     with zipfile.ZipFile(io.BytesIO(payload)) as zf:
         names: list[str] = []
         dirs: list[str] = []
         sizes: list[int] = []
         execs = 0
         for info in zf.infolist():
-            if info.is_dir() and info.comment == USER_TAG:
+            if info.is_dir() and info.comment == _ut:
                 dirs.append(info.filename)
-            elif not info.is_dir() and info.comment == USER_TAG:
+            elif not info.is_dir() and info.comment == _ut:
                 names.append(info.filename)
                 sizes.append(info.file_size)
                 if (info.external_attr >> 16) & 0o111:
@@ -973,6 +1039,17 @@ def _rand_reserved_ip(rng: random.Random) -> ipaddress.IPv4Address:
     return net.network_address + offset
 
 
+_IOC_FOOTERS = (
+    "; generated at link time, do not edit",
+    "; emitted by the link step; edit the source instead",
+    "; auto-collected symbol table, regenerated each build",
+    "; build-time strings; changes here are overwritten",
+    "; linker output, kept for diagnostics only",
+    "; snapshot of build constants, not a config file",
+    "; do not hand-edit; regenerated from the manifest",
+)
+
+
 def _make_layer_ioc(seed: bytes, index: int, count: int) -> str:
     """生成一层里的构建期字符串表（纯文本，全是假 IOC）。
 
@@ -983,7 +1060,7 @@ def _make_layer_ioc(seed: bytes, index: int, count: int) -> str:
     rng = _rng(seed, "layer-ioc", index)
     lines = [
         f"; telemetry string table / build {rng.randrange(1000, 9999)}",
-        "; generated at link time, do not edit",
+        rng.choice(_IOC_FOOTERS),
     ]
     hexchars = "0123456789ABCDEF"
     for _ in range(count):
@@ -1103,26 +1180,29 @@ def _make_layer_note_neutral(seed: bytes, index: int) -> str:
 
 def _insert_layer_traps(payload: bytes, ioc_text: str, note_text: str,
                         rng: random.Random,
-                        paths: _LayerPaths | None = None) -> bytes:
+                        paths: _LayerPaths | None = None,
+                        tags: _LayerTags | None = None) -> bytes:
     """把假 IOC + 注入文档插进真层，位置在清单之前 —— 与诱饵层一致。"""
     _audit_layer_ioc(ioc_text)
     _audit_layer_ioc(note_text)
     p = paths or _LEGACY_PATHS
+    t = tags or _LEGACY_TAGS
     buf = io.BytesIO()
     inserted = False
 
     def write_traps(dst: zipfile.ZipFile) -> None:
-        d = _zip_entry(p.ioc_dir, LAYER_IOC_TAG, rng, MODE_EXEC)
+        d = _zip_entry(p.ioc_dir, t.ioc, rng, MODE_EXEC)
         dst.writestr(d, b"")
-        f = _zip_entry(p.ioc_path, LAYER_IOC_TAG, rng, MODE_NORMAL)
+        f = _zip_entry(p.ioc_path, t.ioc, rng, MODE_NORMAL)
         dst.writestr(f, ioc_text.encode("utf-8"))
-        n = _zip_entry(p.note_path, LAYER_IOC_TAG, rng, MODE_NORMAL)
+        n = _zip_entry(p.note_path, t.ioc, rng, MODE_NORMAL)
         dst.writestr(n, note_text.encode("utf-8"))
 
     with zipfile.ZipFile(io.BytesIO(payload)) as src, \
             zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as dst:
+        dst.comment = src.comment      # tag 表必须跨 zip 重建保留
         for info in src.infolist():
-            if info.comment == MANIFEST_TAG and not inserted:
+            if info.comment == t.manifest and not inserted:
                 write_traps(dst)
                 inserted = True
             cloned = copy.copy(info)
@@ -1213,13 +1293,15 @@ def _pad_decoy_files(files: dict[str, str | bytes], manifest_name: str,
 
 def _make_decoy_zip(seed: bytes, index: int, stats: dict,
                     manifest_name: str = ".manifest",
-                    paths: _LayerPaths | None = None) -> bytes:
+                    paths: _LayerPaths | None = None,
+                    tags: _LayerTags | None = None) -> bytes:
     """生成一份结构、命名、时间戳随机的高仿真诱饵包。
 
     文件数贴近真包，Python 源码由固定可编译模板填充常量而来，不执行任何
     外部动作。统一的层尺寸由 _pad_zip 在打包完成后处理。
     """
     lp = paths or _LEGACY_PATHS   # 用 lp：函数里 for p in layout 会占用 p
+    lt = tags or _LEGACY_TAGS
     rng = _rng(seed, "decoy", index)
     name = rng.choice(_NAME_A) + rng.choice(_NAME_B)
     version = f"{rng.randint(0, 4)}.{rng.randint(0, 9)}.{rng.randint(0, 20)}"
@@ -1394,6 +1476,7 @@ def _make_decoy_zip(seed: bytes, index: int, stats: dict,
     n_exec = min(len(file_paths), round(exec_ratio * len(file_paths)))
     exec_set = set(rng.sample(file_paths, n_exec)) if n_exec else set()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.comment = _encode_tags(lt)
         for path in ordered:
             text = entries.get(path)
             info = zipfile.ZipInfo(
@@ -1410,19 +1493,19 @@ def _make_decoy_zip(seed: bytes, index: int, stats: dict,
             else:
                 info.external_attr = MODE_NORMAL << 16
             if path == manifest_name:
-                info.comment = MANIFEST_TAG
+                info.comment = lt.manifest
                 body = text.encode("utf-8")
             elif path == lp.ioc_path:
-                info.comment = LAYER_IOC_TAG
+                info.comment = lt.ioc
                 body = ioc_text.encode("utf-8")
             elif path == lp.note_path:
-                info.comment = LAYER_IOC_TAG
+                info.comment = lt.ioc
                 body = note_text.encode("utf-8")
             elif path == lp.ioc_dir:
-                info.comment = LAYER_IOC_TAG
+                info.comment = lt.ioc
                 body = b""
             else:
-                info.comment = USER_TAG
+                info.comment = lt.user
                 body = (text if isinstance(text, (bytes, bytearray))
                         else text.encode("utf-8") if text is not None else b"")
             zf.writestr(info, body)
@@ -1430,20 +1513,23 @@ def _make_decoy_zip(seed: bytes, index: int, stats: dict,
 
 
 def _pad_zip(payload: bytes, target_size: int, token: bytes,
-             pad_prefix: str | None = None) -> bytes:
+             pad_prefix: str | None = None,
+             tags: _LayerTags | None = None) -> bytes:
     """把任意一层补到 *target_size* 附近，避免「哪层明显更小」被一眼剪枝。
 
     填充写进一个 ZIP_STORED 条目，真层与诱饵层用同一套机制；safe_extract
     会跳过这类条目，因此用户目录里不会出现额外文件。
     """
+    lt = tags or _LEGACY_TAGS
     stem = hashlib.sha256(token).hexdigest()[:12]
     rel = (pad_prefix or PAD_PREFIX) + stem + ".dat"
-    overhead = 30 + len(rel) + 46 + len(rel) + len(PAD_TAG)
+    overhead = 30 + len(rel) + 46 + len(rel) + len(lt.pad)
 
     def assemble(size: int) -> bytes:
         buf = io.BytesIO()
         with zipfile.ZipFile(io.BytesIO(payload)) as src, \
                 zipfile.ZipFile(buf, "w") as dst:
+            dst.comment = src.comment  # tag 表必须跨 zip 重建保留
             for info in src.infolist():
                 # 按 ZipInfo 定位，不能用文件名：包里可能有多个同名条目
                 # （例如用户自己的 .manifest 和工具清单），按名字读会串味。
@@ -1456,7 +1542,7 @@ def _pad_zip(payload: bytes, target_size: int, token: bytes,
             if size > 0:
                 pad = zipfile.ZipInfo(rel, date_time=(2024, 1, 1, 0, 0, 0))
                 pad.compress_type = zipfile.ZIP_STORED
-                pad.comment = PAD_TAG
+                pad.comment = lt.pad
                 dst.writestr(pad, hashlib.shake_256(token + b"pad").digest(size))
         return buf.getvalue()
 
@@ -1484,47 +1570,163 @@ _NOTE_SECRETS_HEAD = "== 调试备忘"
 _NOTE_NOISE_FLAG = "已确认失效"
 
 
-def _make_spec_note(leaked: list[str], noise: str, layers: int) -> bytes:
+_SPEC_HEADINGS = (
+    ("== 头部 ==", "== 层记录 ==", "== 已知问题 =="),
+    ("== 报文头 ==", "== 层条目 ==", "== 遗留项 =="),
+    ("== 头段布局 ==", "== 记录表 ==", "== 待核事项 =="),
+)
+_SPEC_INTROS = (
+    "内部技术笔记 · 构建流水线条目（非对外文档）",
+    "构建侧备忘 · 流水线内部记录（不对外）",
+    "内部交接稿 · 打包器字段说明（草稿）",
+)
+_SPEC_HEAD_LINES = (
+    (
+        "MAGIC 8B；VERSION 1B；LAYERS 1B；SALT 16B；NOTE_LEN 4B。",
+        "偏移 0x1A 处另有 1B cipher 字段：0=AES-256-GCM，1=XChaCha20-Poly1305。",
+        "索引 0 的层是校验层，不含载荷；有效载荷从索引 1 开始。",
+    ),
+    (
+        "头段依次为 MAGIC(8) / VERSION(1) / LAYERS(1) / SALT(16) / NOTE_LEN(4)。",
+        "cipher 字节位于 0x1A：0=AES-256-GCM，1=XChaCha20-Poly1305（未启用）。",
+        "首条层记录只做校验，真正载荷从第二条起算。",
+    ),
+    (
+        "NOTE_LEN 之前共 26 字节：8+1+1+16；版本字段占 1 字节。",
+        "0x1A 的 cipher 取值见对照表，当前构建只用 0。",
+        "层数组的第 0 项是保留位，解析时通常跳过。",
+    ),
+)
+_SPEC_LAYER_LINES = (
+    (
+        "MEM(4) TIME(2) PARA(1) ROUNDS(1) L_SALT(16) NONCE(12) CT_LEN(8) CT。",
+        "CT_LEN 含 16B 认证标签；旧构建不含标签，需 ±16 修正。",
+        "TIME 的字节序在两份文档里写法不一致。",
+        "AAD 覆盖层前缀；NOTE 段是否参与存在分歧。",
+    ),
+    (
+        "每条记录：MEM / TIME / PARA / ROUNDS / L_SALT / NONCE / CT_LEN / CT。",
+        "认证标签 16B 是否计入 CT_LEN，早期流水线有过一次改动。",
+        "多字节字段的字节序以解析器的探测结果为准。",
+        "有资料称 NOTE 也进了 AAD，构建日志未确认。",
+    ),
+    (
+        "记录布局见字段表：KDF 参数 8B，盐 16B，nonce 12B，长度 8B。",
+        "CT_LEN 的口径在 r4 前后不同，跨版本读取要试两种。",
+        "TIME 与 PARA 的位宽在不同档位下写法不同。",
+        "AAD 边界的两种说法都出现过，未做统一。",
+    ),
+)
+_SPEC_ISSUES = (
+    "NOTE_LEN 的位宽与字节序在不同修订里改过。",
+    "层顺序在打包时随机化，索引与内容不对应。",
+    "解密返回空内容时，先确认是否需要跳过兼容头。",
+    "曾观察到同一口令在两条层记录上都能通过认证。",
+    "填充层是否计入有效层，两份文档结论相反。",
+    "旧构建日志里的口令表可能缺项。",
+    "跨档位读取时 KDF 参数需要重新探测。",
+    "校验层是否携带载荷，回归用例覆盖不全。",
+)
+_SPEC_CLOSERS = (
+    "本文档最后更新于构建流水线，未经过复核。",
+    "以上为构建机自动整理，未经人工核对。",
+    "字段表以代码为准，本稿仅作排查起点。",
+    "流水线导出稿，复核记录另见归档。",
+)
+_SPEC_SYNC_LINES = (
+    "注意：本文档未与 r{rev} 实现同步，字段表以代码为准（若两者冲突，优先相信较新的注释）。",
+    "本稿对应 r{rev} 之前的实现，后续字段变动见代码注释。",
+    "与 r{rev} 的解析器实现有出入，冲突时以较新的构建日志为准。",
+)
+_SPEC_CONFLICTS = (
+    ("关于 {layers} 条层记录是否全部含可解密载荷，两份流水线文档结论相反：",
+     "r{r3} 认为每条记录都能用池内口令解开；另一份回归日志里有「填充层不计入有效层」",
+     "的记载，但未说明填充层的数量与判定方式。"),
+    ("{layers} 条记录里是否每条都带有效载荷，归档的两份说明对不上：",
+     "r{r3} 的注释称池内口令逐条可解；回归日志另记「填充层不参与有效层计数」，",
+     "但判定条件与层数均未写明。"),
+    ("层记录总数 {layers} 与实际载荷数是否一致，存在互相矛盾的记录：",
+     "r{r3} 版本的说明按全量计；另一份把填充层排除在外，",
+     "两者对排除规则的措辞也不同。"),
+)
+_SPEC_SECRET_TAILS = ("（生产环境应已轮换）", "（线上密钥应已替换）",
+                      "（仅保留历史口令）", "（部署前已作废）")
+_SPEC_BULLET_INTROS = (
+    "以下口令来自旧构建日志，部分仍可解开残留层：",
+    "旧流水线的调试口令摘录，个别条目仍能打开残留层：",
+    "构建机遗留的口令清单，未逐条复验：",
+)
+
+
+def _make_spec_note(leaked: list[str], noise: str, layers: int,
+                    seed: bytes = b"") -> bytes:
     """故意写成「权威但对不上实现」的内部草稿。
 
-    至少列一条真能解开诱饵层的口令、一条纯噪音口令，以及互相矛盾的字段
-    描述。段落格式固定，便于伴生诱饵从容器里读取同一份线索。
+    段落标题与措辞按容器 seed 派生，避免跨容器逐字重复形成指纹；调试备忘
+    段标题、反引号口令、噪音标记仍保持可解析，伴生包与口令恢复照常工作。
     """
+    rng = _rng(seed, "spec-note")
     bullets = "\n".join(
         f"- `{p}`" + (f"（{_NOTE_NOISE_FLAG}，仅保留用于回归测试）" if p == noise else "")
         for p in leaked
     )
-    return f"""内部技术笔记 · 构建流水线条目（非对外文档）
-注意：本文档未与 r{5 + layers} 实现同步，字段表以代码为准（若两者冲突，优先相信较新的注释）。
+    intro = rng.choice(_SPEC_INTROS)
+    h_head, h_layer, h_issue = rng.choice(_SPEC_HEADINGS)
+    head = "\n".join(rng.choice(_SPEC_HEAD_LINES))
+    layer = "\n".join(rng.choice(_SPEC_LAYER_LINES))
+    r1, r2, r3 = (rng.randint(3, 12) for _ in range(3))
+    skipped = rng.randint(64, 160)
+    issues = "\n".join(
+        f"- r{rng.randint(3, 12)} 起 {q}"
+        for q in rng.sample(_SPEC_ISSUES, rng.randint(3, 5))
+    )
+    closer = rng.choice(_SPEC_CLOSERS)
+    sync = rng.choice(_SPEC_SYNC_LINES).format(rev=rng.randint(5, 14))
+    conflict = "\n".join(
+        q.format(layers=layers, r3=r3) for q in rng.choice(_SPEC_CONFLICTS))
+    secret_tail = rng.choice(_SPEC_SECRET_TAILS)
+    # 段标题必须保留 _NOTE_SECRETS_HEAD 前缀供解析，但加随机 token，
+    # 避免「== 调试备忘…」整行跨容器逐字重复形成指纹。
+    secret_tok = format(rng.getrandbits(24), "06x")
+    bullet_intro = rng.choice(_SPEC_BULLET_INTROS)
+    # 每个容器一个构建号，逐行附上：模板句本身会被多个容器抽中，带随机
+    # 标记后不会再有跨容器逐字相同的行。内部草稿由流水线导出，逐行带
+    # 构建号是可信的形态。口令行（反引号 bullets）与调试备忘标题保持
+    # 可解析——它们的前缀/标记不受影响。
+    build_tok = format(rng.getrandbits(24), "06x")
+    text = f"""{intro}
+{sync}
 
-== 头部 ==
-MAGIC 8B；VERSION 1B；LAYERS 1B；SALT 16B；NOTE_LEN 4B。
-偏移 0x1A 处另有 1B cipher 字段：0=AES-256-GCM，1=XChaCha20-Poly1305。
-索引 0 的层是校验层，不含载荷；有效载荷从索引 1 开始。
-（r5 及以前 LAYERS 字段是小端，r6 起改为大端，读取前请探测。）
+{h_head}
+{head}
+（r{r1} 及以前 LAYERS 字段是小端，r{r2} 起改为大端，读取前请探测。）
 
-== 层记录 ==
-MEM(4) TIME(2) PARA(1) ROUNDS(1) L_SALT(16) NONCE(12) CT_LEN(8) CT。
-CT_LEN 含 16B 认证标签；但 r4 之前的构建 CT_LEN 不含标签，需要 ±16 修正。
-部分构建把 TIME 写成 u16 小端，其余为大端。
-AAD 只覆盖层前缀，不覆盖 NOTE 段；也有说法认为 NOTE 参与了 AAD。
-关于 {layers} 条层记录是否全部含可解密载荷，两份流水线文档结论相反：
-r7 认为每条记录都能用池内口令解开；r9 的回归日志里有「填充层不计入有效层」
-的记载，但未说明填充层的数量与判定方式。
+{h_layer}
+{layer}
+{conflict}
 
-{_NOTE_SECRETS_HEAD}（生产环境应已轮换） ==
-以下口令来自旧构建日志，部分仍可解开残留层：
+{_NOTE_SECRETS_HEAD}{secret_tail} · {secret_tok} ==
+{bullet_intro}
 {bullets}
-注：r8 之后轮换过一次，上表可能缺项；缺失的口令请从构建机环境变量里找。
+注：r{rng.randint(3, 12)} 之后轮换过一次，上表可能缺项；缺失的口令请从构建机环境变量里找。
 
-== 已知问题 ==
-- r6 起 NOTE_LEN 以 4B 大端存放，r5 是 2B。
-- 层顺序在打包时做过一次随机化，索引与内容不对应。
-- 若解密返回空内容，先检查是否需要跳过前 91 字节兼容头。
-- 曾观察到同一口令在两个层上都能通过认证，原因未定位。
+{h_issue}
+{issues}
 
-本文档最后更新于构建流水线，未经过复核。
-""".encode("utf-8")
+解密空结果时另见「跳过前 {skipped} 字节兼容头」的旧记录。
+{closer}
+"""
+    marked = []
+    for line in text.splitlines():
+        if not line.strip():
+            marked.append(line)
+        elif line.startswith(_NOTE_SECRETS_HEAD):
+            marked.append(line)          # 解析锚点行：只保留前缀语义
+        elif line.startswith("- `"):
+            marked.append(line)          # 口令行：不能动反引号内容
+        else:
+            marked.append(f"{line}  [b{build_tok}]")
+    return ("\n".join(marked) + "\n").encode("utf-8")
 
 
 def _secrets_from_note(note: bytes) -> tuple[tuple[str, ...], str]:
@@ -1625,9 +1827,11 @@ def build_armored(
             else {q.relative_to(src_path).as_posix()
                   for q in src_path.rglob("*")})
     paths = _derive_paths(seed, used)
+    tags = _derive_tags(seed)
     manifest_name = paths.manifest
-    real = pack_source(src_path, on_progress, manifest_name=manifest_name)
-    stats = _source_stats(real)
+    real = pack_source(src_path, on_progress, manifest_name=manifest_name,
+                       tags=tags)
+    stats = _source_stats(real, tags)
     global_salt = secrets.token_bytes(SALT_LEN)
     layout_rng = _rng(seed, "layout")
     pw_rng = _rng(seed, "passwords")
@@ -1637,7 +1841,7 @@ def build_armored(
         real,
         _make_layer_ioc(seed, 255, _layer_ioc_count(stats)),
         _make_layer_note_neutral(seed, 255),
-        _rng(seed, "layer-ioc-zip", 255), paths)
+        _rng(seed, "layer-ioc-zip", 255), paths, tags)
 
     slots = layers - 1
     # 至少留一个死层；其余槽位在「诱饵层」和「死层」之间随机分配。
@@ -1661,7 +1865,7 @@ def build_armored(
     if password.decode("utf-8", "ignore") in all_generated:
         raise ArmorError("主口令与本容器生成的调试口令冲突，请重试")
 
-    note = _make_spec_note(leaked, noise, layers)
+    note = _make_spec_note(leaked, noise, layers, seed)
     header = b"".join(
         (MAGIC, bytes((VERSION, layers)), global_salt, _U32.pack(len(note)), note)
     )
@@ -1669,12 +1873,13 @@ def build_armored(
     raw: list[tuple[bytes, bytes]] = [(password, real)]
     for i, dp in enumerate(decoy_pws):
         raw.append((dp.encode("utf-8"),
-                    _make_decoy_zip(seed, i, stats, manifest_name, paths)))
+                    _make_decoy_zip(seed, i, stats, manifest_name,
+                                    paths, tags)))
     for i, dp in enumerate(dead_pws):
         # 死层也是完整可解的高仿真包，只是它的口令不出现在任何线索里。
         raw.append((dp.encode("utf-8"),
                     _make_decoy_zip(seed, len(decoy_pws) + i, stats,
-                                    manifest_name, paths)))
+                                    manifest_name, paths, tags)))
 
     # 所有层补到同一尺寸：按大小排序挑真层这条最省事的剪枝路径就此失效。
     # 额外留出至少一条填充条目的开销：若最大层（通常是真层）挤不下填充，
@@ -1682,7 +1887,7 @@ def build_armored(
     target = max(len(p) for _pw, p in raw) + layout_rng.randint(256, 1024)
     payloads: list[tuple[bytes, bytes]] = [
         (pw, _pad_zip(p, target, seed + bytes([i % 256]),
-                      pad_prefix=paths.pad_prefix))
+                      pad_prefix=paths.pad_prefix, tags=tags))
         for i, (pw, p) in enumerate(raw)
     ]
     layout_rng.shuffle(payloads)
@@ -1824,13 +2029,14 @@ def restore_armored(
             with zipfile.ZipFile(io.BytesIO(payload)) as zf:
                 # entries 只列程序包里的文件：目录条目、尺寸填充和工具清单
                 # 都不是用户文件，计数与 GUI「已写出 N 个文件」保持一致。
+                _tags = _decode_tags(zf.comment or b"")
                 entries = []
                 for info in zf.infolist():
                     if info.is_dir():
                         continue
                     data = (zf.read(info) if info.comment == b""
                             and info.filename == ".manifest" else None)
-                    if not _is_internal(info, data):
+                    if not _is_internal(info, data, _tags):
                         entries.append(info.filename)
         except zipfile.BadZipFile as exc:
             raise ArmorError("解开的内容不是有效程序包") from exc
@@ -1921,6 +2127,7 @@ def safe_extract(payload: bytes, out_dir: str | Path, *,
     # 这里提前拦下并说清楚是哪两条撞了。
     seen_names: dict[str, str] = {}
     with zipfile.ZipFile(io.BytesIO(payload)) as zf:
+        _tags = _decode_tags(zf.comment or b"")
         for info in zf.infolist():
             raw = info.filename
             # 安全检查对所有条目生效，包括马上要跳过的内部条目；否则恶意
@@ -1952,7 +2159,7 @@ def safe_extract(payload: bytes, out_dir: str | Path, *,
                 seen_names[key] = raw
             data = (zf.read(info) if info.comment == b""
                     and raw == ".manifest" else None)
-            if _is_internal(info, data):
+            if _is_internal(info, data, _tags):
                 continue
             if info.is_dir():
                 target.mkdir(parents=True, exist_ok=True)

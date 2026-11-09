@@ -5,6 +5,35 @@
 
 ## 未发布
 
+### 安全加固：第四轮实证审计 Q 缺陷修复（v0.3.15）
+
+第四轮用「逐行比对 6~8 个容器」量化跨容器残留的固定字符串，确证两处：
+
+- **Q1（🔴 固定 zip 条目标记）**：`USER_TAG` / `MANIFEST_TAG` / `PAD_TAG` /
+  `LAYER_IOC_TAG` 在每个容器、每个条目里逐字相同（一个容器几十条），解开
+  任意一层后即可认出工具身份，并据此直接跳过内部条目。
+  - 新增 `_LayerTags`：由容器 seed 派生 4 个随机 tag，编码进 **zip archive
+    comment**（自包含：`safe_extract` 只收 payload 也能解析）。`build_armored`
+    只生成一次并传给真层与全部诱饵层，层间结构仍完全一致。
+  - 所有 zip 重建点（`_insert_layer_traps` / `_pad_zip`）保留 archive comment。
+  - 解析严格校验：4 段、每段 32 位 hex、互不相同；空 / 非法 / 重复一律回退
+    `_LEGACY_TAGS`。旧容器照常可还原；伪造 comment 不会把用户文件误判成
+    内部条目（避免还原丢数据）。
+  - `content_probe` 与自测改为按 payload 解析 tag，不再硬编码常量。
+- **Q2（🟠 固定明文模板）**：明文规格草稿有 **24 行**跨容器逐字相同
+  （`== 头部 ==`、`MAGIC 8B；VERSION 1B...` 等），且草稿在 header 里是明文、
+  无需破解任何层即可读到；IOC 字符串表还有 1 行固定尾注释。
+  - 段落标题 / 措辞 / 修订号 / 已知问题项改为按 seed 从多套模板派生；
+    IOC 表尾从 7 条词表里随机选。
+  - 解析锚点保留：调试备忘段标题、反引号口令 bullets、噪音标记，
+    `revealed_debug_passwords` / `noise_password` / 伴生包照常工作。
+
+实证结果：草稿与 IOC 表跨 8 个容器**逐字相同行数归零**（24→0、1→0）。
+
+新增 8 个回归断言，全量自测 **249 项通过**；3 种源形态 × 8 次随机构建
+（含用户自带 `.manifest` / `__tarpit_pad/` / `resources/` 碰撞场景）
+= 24 组压测零失败，跨容器 tag 24/24 互不相同，还原逐字节保真。
+
 ### 安全加固：第三轮实证审计 P 缺陷修复（v0.3.14）
 
 **P（🟠 固定伪路径 = 跨容器指纹）**：`resources/telemetry.strings`、

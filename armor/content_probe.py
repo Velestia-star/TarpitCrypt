@@ -745,8 +745,9 @@ def probe_layer_ioc(src: Path) -> dict:
             continue
         opened += 1
         with zipfile.ZipFile(io.BytesIO(payload)) as zf:
+            _tags = ac._tags_of(payload)
             for info in zf.infolist():
-                if info.comment != ac.LAYER_IOC_TAG or info.is_dir():
+                if info.comment != _tags.ioc or info.is_dir():
                     continue
                 body = zf.read(info).decode("utf-8", errors="ignore")
                 # 路径按容器随机化，靠后缀区分字符串表与注入文档。
