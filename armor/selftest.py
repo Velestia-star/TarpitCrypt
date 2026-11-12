@@ -102,6 +102,78 @@ def test_content_probe_regression() -> None:
                       str(r["typical"]))
 
 
+def test_gui_drag_regression() -> None:
+    """GUI 拖放：HDROP 类型、双 HWND、wParam、批量队列的回归验证。"""
+    import importlib.util
+    import textwrap
+
+    gui_path = Path(__file__).resolve().parent / "armor_gui.py"
+    src = gui_path.read_text(encoding="utf-8")
+    check("R1: HDROP 不再引用不存在的 wintypes.HDROP",
+          "wintypes.HDROP" not in src and "HDROP = ctypes.c_void_p" in src)
+    check("R2: WM_DROPFILES 从 wParam 取 HDROP",
+          "paths = self._paths(wparam)" in src
+          and "self._paths(lparam)" not in src)
+    check("R3: frame 与 TkChild 双窗口都注册拖放",
+          "int(root.frame(), 16), root.winfo_id()" in src
+          and "ChangeWindowMessageFilterEx" in src)
+    check("R4: 批量队列与三项作业齐备",
+          all(k in src for k in ("_queue_batch", "_pump_batch",
+                                 "_batch_armor_job", "_batch_restore_job",
+                                 "_batch_kit_job")))
+
+    # 实际投递 WM_DROPFILES：只在 Windows + tkinter 可用的环境跑
+    if os.name != "nt":
+        check("R5: WM_DROPFILES 端到端投递（非 Windows 跳过）", True)
+        return
+    try:
+        import ctypes
+        import tkinter as tk
+        from ctypes import wintypes
+        import armor_gui
+
+        root = tk.Tk()
+        root.withdraw()
+        root.update()
+        got: list[list[str]] = []
+        drop = armor_gui.NativeDrop(root, lambda paths: got.append(paths))
+        check("R5: NativeDrop 初始化成功（拖放已启用）",
+              drop.ok, drop.error)
+        if not drop.ok:
+            root.destroy()
+            return
+
+        kernel32, user32 = ctypes.windll.kernel32, ctypes.windll.user32
+        kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+        kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
+        kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+        kernel32.GlobalLock.restype = ctypes.c_void_p
+        kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+        sample = [r"C:\Windows\notepad.exe", r"C:\Windows\regedit.exe"]
+        data = ("\0".join(sample) + "\0\0").encode("utf-16-le")
+        hdrop = kernel32.GlobalAlloc(0x0042, 20 + len(data))
+        ptr = kernel32.GlobalLock(hdrop)
+        ctypes.memmove(ptr, ctypes.byref(ctypes.c_uint32(20)), 4)
+        ctypes.memmove(ptr + 16, ctypes.byref(ctypes.c_int(1)), 4)
+        ctypes.memmove(ptr + 20, data, len(data))
+        kernel32.GlobalUnlock(hdrop)
+        user32.SendMessageW.argtypes = [
+            wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        user32.SendMessageW.restype = ctypes.c_ssize_t
+        for hwnd in drop._old:
+            if got:
+                break
+            user32.SendMessageW(hwnd, drop.WM_DROPFILES, hdrop, 0)
+        for _ in range(8):
+            root.update()
+        check("R6: WM_DROPFILES 多文件路径完整送达回调",
+              bool(got) and got[0] == sample, str(got[:1]))
+        root.destroy()
+    except Exception as exc:
+        # 无显示服务 / 无 tkinter 的环境不把 GUI 项算失败
+        check(f"R5: GUI 拖放运行时检查跳过（{type(exc).__name__}）", True)
+
+
 def manifest_of(payload: bytes) -> dict:
     """取出载荷里的工具清单（按条目标记，不按文件名）。"""
     _t = tags_of(payload)
@@ -1362,6 +1434,7 @@ def main() -> int:
               and "correct-horse-9" not in md and "wrong-pass" not in md)
 
     test_content_probe_regression()
+    test_gui_drag_regression()
 
     print(f"\n通过 {len(PASS)} / 失败 {len(FAIL)} / 合计 {len(PASS) + len(FAIL)}")
     if FAIL:

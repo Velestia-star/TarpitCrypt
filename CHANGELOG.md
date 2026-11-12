@@ -5,6 +5,34 @@
 
 ## 未发布
 
+### GUI 拖放修复 + 批量拖入（v0.3.16）
+
+`启动.bat` 打开后把文件拖进窗口没有反应。代码里本来实现了 Windows 原生
+`WM_DROPFILES` 拖放，但四处缺陷叠加导致它从未真正启用：
+
+- **R1 类型错误**：`wintypes.HDROP` 在 CPython 3.12 不存在，
+  `NativeDrop.__init__` 抛 `AttributeError` 被 `except` 静默吞掉 →
+  `self.ok=False`，界面降级成「请用按钮」。改为 `HDROP = ctypes.c_void_p`。
+- **R2 参数位置**：`WM_DROPFILES` 的 `HDROP` 在 **wParam**（lParam 恒为 0），
+  原代码读 `lParam`，永远解析不到文件。
+- **R3 窗口句柄**：只把消息钩子挂在 `root.frame()`（`TkTopLevel` 外层容器），
+  拖放实际落在 `root.winfo_id()`（`TkChild` 客户区）。现在两个 HWND 都
+  子类化 + `DragAcceptFiles(True)`。
+- **R4 UIPI**：提权的资源管理器发来的 `WM_DROPFILES` 默认被完整性级别过滤，
+  新增 `ChangeWindowMessageFilterEx` 放行 `WM_DROPFILES` /
+  `WM_COPYGLOBALDATA` / `WM_COPYDATA`。
+- 初始化失败原因不再吞掉：状态栏显示具体错误并写 stderr。
+
+功能增强：一次拖入多个文件按类型分派，串行排队批处理（加固 / 还原 /
+伴生诱饵三类作业），单项失败不中断后续；状态栏显示剩余项数。
+
+新增 6 个回归断言（源码级 4 项 + 真实构造 HDROP 投递 `WM_DROPFILES` 2 项）。
+全量自测 **255/255**（含 tkinter 的 py312 下为 256 项、R5/R6 真测通过）；
+批量队列端到端验证：3 个源 → 3 个容器、混合 `.armored` + 源目录 → 还原与
+加固各自产出，队列清空无残留。
+
+### 安全加固：第四轮实证审计 Q 缺陷修复（v0.3.15）
+
 ### 安全加固：第四轮实证审计 Q 缺陷修复（v0.3.15）
 
 第四轮用「逐行比对 6~8 个容器」量化跨容器残留的固定字符串，确证两处：

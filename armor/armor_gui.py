@@ -50,50 +50,73 @@ def _enable_dpi() -> None:
 
 
 class NativeDrop:
-    """给 Tk 顶层窗口挂上系统拖放（WM_DROPFILES）。"""
+    """给 Tk 窗口挂上系统拖放（WM_DROPFILES）。
+
+    Tk 在 Windows 上有两个 HWND：root.frame() 是 TkTopLevel（外层容器），
+    root.winfo_id() 是 TkChild（实际客户区、真正接收拖放消息）。两者都要
+    注册 DragAcceptFiles 并子类化窗口过程，否则文件拖进客户区没有反应。
+    """
 
     WM_DROPFILES = 0x0233
+    WM_COPYGLOBALDATA = 0x0049
+    WM_COPYDATA = 0x004A
     GWL_WNDPROC = -4
+    MSGFLT_ALLOW = 1
 
     def __init__(self, root: tk.Tk, callback) -> None:
         self.ok = False
+        self.error = ""
         self._root = root
         self._callback = callback
+        self._old: dict[int, int] = {}
         if os.name != "nt":
+            self.error = "仅 Windows 支持原生拖放"
             return
         try:
             self._user32 = ctypes.windll.user32
             self._shell32 = ctypes.windll.shell32
             LRESULT = ctypes.c_ssize_t
+            HDROP = ctypes.c_void_p   # wintypes 没有 HDROP，3.12 下会 AttributeError
             self._WNDPROC = ctypes.WINFUNCTYPE(
                 LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM
             )
             self._shell32.DragQueryFileW.argtypes = [
-                wintypes.HDROP, wintypes.UINT, wintypes.LPWSTR, wintypes.UINT
+                HDROP, wintypes.UINT, wintypes.LPWSTR, wintypes.UINT
             ]
             self._shell32.DragQueryFileW.restype = wintypes.UINT
             self._shell32.DragAcceptFiles.argtypes = [wintypes.HWND, wintypes.BOOL]
-            self._shell32.DragFinish.argtypes = [wintypes.HDROP]
+            self._shell32.DragFinish.argtypes = [HDROP]
             self._user32.CallWindowProcW.argtypes = [
                 ctypes.c_void_p, wintypes.HWND, wintypes.UINT,
                 wintypes.WPARAM, wintypes.LPARAM,
             ]
             self._user32.CallWindowProcW.restype = LRESULT
+            self._user32.ChangeWindowMessageFilterEx.argtypes = [
+                wintypes.HWND, wintypes.UINT, wintypes.DWORD, ctypes.c_void_p
+            ]
+            self._user32.ChangeWindowMessageFilterEx.restype = wintypes.BOOL
             setter = getattr(self._user32, "SetWindowLongPtrW", None) or self._user32.SetWindowLongW
             setter.argtypes = [wintypes.HWND, ctypes.c_int, self._WNDPROC]
             setter.restype = ctypes.c_void_p
 
             root.update_idletasks()
-            hwnd = int(root.frame(), 16)
             proc = self._WNDPROC(self._wndproc)
-            self._proc_ref = proc  # 防 GC
-            self._old = setter(hwnd, self.GWL_WNDPROC, proc)
-            if not self._old:
-                raise OSError("无法替换窗口过程")
-            self._shell32.DragAcceptFiles(hwnd, True)
+            self._proc_ref = proc          # 防 GC
+            for hwnd in dict.fromkeys((int(root.frame(), 16), root.winfo_id())):
+                old = setter(hwnd, self.GWL_WNDPROC, proc)
+                if not old:
+                    raise OSError(f"无法替换窗口过程 HWND={hwnd:#x}")
+                self._old[hwnd] = old
+                self._shell32.DragAcceptFiles(hwnd, True)
+                # 提权的资源管理器发来的消息默认被 UIPI 丢掉，逐窗口放行。
+                for msg in (self.WM_DROPFILES, self.WM_COPYGLOBALDATA,
+                            self.WM_COPYDATA):
+                    self._user32.ChangeWindowMessageFilterEx(
+                        hwnd, msg, self.MSGFLT_ALLOW, None)
             self.ok = True
-        except Exception:
+        except Exception as exc:
             self.ok = False
+            self.error = f"{type(exc).__name__}: {exc}"
 
     def _paths(self, lparam: int) -> list[str]:
         hdrop = ctypes.c_void_p(lparam)
@@ -109,14 +132,16 @@ class NativeDrop:
 
     def _wndproc(self, hwnd, msg, wparam, lparam):
         if msg == self.WM_DROPFILES:
+            # WM_DROPFILES: wParam = HDROP, lParam = 0（此前误读 lParam）。
             try:
-                paths = self._paths(lparam)
+                paths = self._paths(wparam)
             except Exception:
                 paths = []
             if paths:
                 self._root.after(0, self._callback, paths)
             return 0
-        return self._user32.CallWindowProcW(self._old, hwnd, msg, wparam, lparam)
+        old = self._old.get(hwnd) or next(iter(self._old.values()), 0)
+        return self._user32.CallWindowProcW(old, hwnd, msg, wparam, lparam)
 
 
 class App(tk.Tk):
@@ -133,6 +158,7 @@ class App(tk.Tk):
 
         self.q: queue.Queue = queue.Queue()
         self.busy = False
+        self._batch: list[tuple[str, Path]] = []
         self.src = tk.StringVar()
         self.armored = tk.StringVar()
         self.enc_pw = tk.StringVar()
@@ -162,7 +188,8 @@ class App(tk.Tk):
         self._build()
         self._drop = NativeDrop(self, self._on_drop)
         if not self._drop.ok:
-            self.status.set("拖放不可用，请用「选择文件 / 选择文件夹」按钮")
+            self.status.set(f"拖放不可用（{self._drop.error}），请用「选择文件 / 选择文件夹」按钮")
+            print(f"[NativeDrop] {self._drop.error}", file=sys.stderr)
 
     # ------------------------------------------------------------------
     # 界面
@@ -526,18 +553,145 @@ pip install argon2-cffi cryptography
         widget.configure(state="disabled")
 
     def _on_drop(self, paths: list[str]) -> None:
-        path = Path(paths[0])
-        if self.nb.index(self.nb.select()) == 2 and path.suffix.lower() != ".armored":
-            self._set_kit_src(path)
+        paths = [p for p in paths if p and Path(p).exists()]
+        if not paths:
             return
-        if path.suffix.lower() == ".armored":
-            self.nb.select(1)
-            self._set_armored(path)
-        else:
+        if len(paths) == 1:
+            path = Path(paths[0])
+            if (self.nb.index(self.nb.select()) == 2
+                    and path.suffix.lower() != ".armored"):
+                self._set_kit_src(path)
+                return
+            if path.suffix.lower() == ".armored":
+                self.nb.select(1)
+                self._set_armored(path)
+            else:
+                self.nb.select(0)
+                self._set_src(path)
+            self.status.set(f"已载入：{path.name}")
+            return
+        self._queue_batch(paths)
+
+    def _queue_batch(self, paths: list[str]) -> None:
+        """一次拖入多个：按目标页分派，串行排队处理。"""
+        on_kit = self.nb.index(self.nb.select()) == 2
+        items: list[tuple[str, Path]] = []
+        for raw in paths:
+            p = Path(raw)
+            if on_kit and p.suffix.lower() != ".armored":
+                items.append(("kit", p))
+            elif p.suffix.lower() == ".armored":
+                items.append(("restore", p))
+            else:
+                items.append(("armor", p))
+        if self._batch:
+            items = self._batch + items
+        self._batch = items
+        self.status.set(f"已排队 {len(items)} 项，开始批量处理")
+        self.after(60, self._pump_batch)
+
+    def _pump_batch(self) -> None:
+        if self.busy:
+            self.after(160, self._pump_batch)
+            return
+        if not self._batch:
+            return
+        kind, path = self._batch.pop(0)
+        left = len(self._batch)
+        self.status.set(f"批量处理：{path.name}（剩余 {left} 项）")
+        if kind == "armor":
             self.nb.select(0)
             self._set_src(path)
-        if len(paths) > 1:
-            self.status.set(f"只处理第一个：{path.name}（一次拖一个）")
+            self._run_async(self._batch_armor_job(path), self.enc_log,
+                            [self.armor_btn])
+        elif kind == "restore":
+            self.nb.select(1)
+            self._set_armored(path)
+            self._run_async(self._batch_restore_job(path), self.dec_log,
+                            [self.restore_btn])
+        else:
+            self.nb.select(2)
+            self._set_kit_src(path)
+            self._run_async(self._batch_kit_job(path), self.kit_log,
+                            [self.kit_btn])
+
+    def _batch_armor_job(self, path: Path):
+        import armor_core as ac
+
+        out = Path(self.out_armored.get())
+        pw = self.enc_pw.get()
+        layers, profile = self.layers.get(), self.profile.get()
+        want_kit = self.sidecar_on.get()
+        kit_style, poison = self.kit_style.get(), self.poison.get()
+
+        def job(progress, emit):
+            emit("log", f"[批量] 开始加固：{path.name} / {layers} 层 / {profile}")
+            strong, _hint = ac.check_password_strength(pw)
+            with Stopwatch() as sw:
+                blob = ac.build_armored(path, pw.encode("utf-8"), layers=layers,
+                                        profile=profile, on_progress=progress,
+                                        strict=False if not strong else True)
+                out.write_bytes(blob)
+            emit("record", dict(action="加固", label=out.name, ok=True,
+                                layers_tried=layers, seconds=sw.elapsed,
+                                note=f"批量 / {profile} / {len(blob):,} 字节"))
+            emit("log", f"[批量] 已写出：{out}")
+            if want_kit:
+                try:
+                    import decoy_kit as dk
+                    kit = dk.build_sidecar(path, armored=out, layers=layers,
+                                           style=kit_style, poison=poison,
+                                           on_progress=progress)
+                    emit("log", f"[批量] 伴生诱饵：{kit.root}")
+                except Exception as exc:
+                    emit("log", f"[批量] 伴生诱饵未生成：{exc}")
+            return f"[批量] 加固完成：{out.name}"
+
+        return job
+
+    def _batch_restore_job(self, path: Path):
+        import armor_core as ac
+
+        out = Path(self.out_dir.get())
+        pw = self.dec_pw.get()
+
+        def job(progress, emit):
+            emit("log", f"[批量] 开始还原：{path.name}")
+            with Stopwatch() as sw:
+                result = ac.restore_armored(path.read_bytes(),
+                                            pw.encode("utf-8"),
+                                            on_progress=progress)
+                written = ac.safe_extract(result.payload, out, overwrite=True)
+            emit("record", dict(action="还原", label=path.name, ok=True,
+                                layers_tried=0, seconds=sw.elapsed,
+                                note=f"批量 / 写出 {len(written)} 个文件"))
+            emit("log", f"[批量] 已写出 {len(written)} 个文件：{out}")
+            return f"[批量] 还原完成：{path.name}"
+
+        return job
+
+    def _batch_kit_job(self, path: Path):
+        import decoy_kit as dk
+
+        style, poison = self.kit_style.get(), self.poison.get()
+        layers = self.layers.get()
+        container = Path(self.armored.get()) if (
+            self.armored.get() and Path(self.armored.get()).is_file()
+        ) else None
+
+        def job(progress, emit):
+            emit("log", f"[批量] 生成伴生诱饵：{path.name} / {style}")
+            with Stopwatch() as sw:
+                r = dk.build_sidecar(path, armored=container, layers=layers,
+                                     style=style, poison=poison,
+                                     on_progress=progress)
+            emit("record", dict(action="伴生", label=path.name, ok=True,
+                                layers_tried=0, seconds=sw.elapsed,
+                                note=f"批量 / {len(r.files)} 份文件"))
+            emit("log", f"[批量] 输出目录：{r.root}")
+            return f"[批量] 伴生诱饵完成：{path.name}"
+
+        return job
 
     def _set_src(self, path: Path) -> None:
         self.src.set(str(path))
@@ -719,6 +873,10 @@ pip install argon2-cffi cryptography
                         b.configure(state="normal")
                     self.busy = False
                     self.pb.configure(value=self.pb.cget("maximum"))
+                    if self._batch:
+                        self.after(60, self._pump_batch)
+                    else:
+                        self.status.set("批量处理完成")
                     return
                 elif kind == "record":
                     self.metrics.record(**payload[0])
@@ -730,6 +888,9 @@ pip install argon2-cffi cryptography
                     for b in buttons:
                         b.configure(state="normal")
                     self.busy = False
+                    if self._batch:
+                        self.status.set(f"该项失败，继续剩余 {len(self._batch)} 项")
+                        self.after(60, self._pump_batch)
                     return
         except queue.Empty:
             pass
