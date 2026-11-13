@@ -29,9 +29,13 @@ Issues = "https://github.com/Velestia-star/TarpitCrypt/issues"
 tarpitcrypt = "tarpitcrypt:main"
 tarpitcrypt-web = "tarpitcrypt_server:main"
 tarpitcrypt-desktop = "desktop_web:main"
+tarpitcrypt-armor = "armor.armor_gui:main"
 
 [tool.setuptools]
 py-modules = ["tarpitcrypt", "tarpitcrypt_server", "desktop_web"]
+
+[tool.setuptools.packages.find]
+include = ["armor*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

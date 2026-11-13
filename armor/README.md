@@ -100,6 +100,7 @@ AI 逆向通常先列目录、读 README 和规格文档。伴生模式在原程
 
 | 文件 | 作用 |
 | --- | --- |
+| `__init__.py` | 包登记：统一把本目录加进搜索路径，使顶层名导入在包式导入下同样可用；不加载子模块 |
 | `armor_gui.py` | tkinter 界面（5 页签）；Windows 原生 `WM_DROPFILES` 拖放，无第三方拖放库 |
 | `armor_core.py` | v3 容器：随机口令、死层、去模板化诱饵、层尺寸对齐、并行还原、安全解包；权限位如实记录与还原、符号链接处理；兼容读取 v2 |
 | `decoy_kit.py` | 伴生诱饵包生成器、七种投毒侧重、原程序隔离与构建期真实主机审计 |
@@ -115,6 +116,11 @@ AI 逆向通常先列目录、读 README 和规格文档。伴生模式在原程
 | `启动.bat` / `运行自测.bat` / `打包exe.bat` | Windows 双击入口（**GBK 编码，勿转 UTF-8**） |
 
 根目录 `tarpitcrypt.py` 是 v1 模块，本工具直接复用它的 Argon2id 与 AES-256-GCM 原语，不复制、不修改。`armor_core.py` 同时兼容「与 v1 同目录」和「位于 `armor/` 子目录」两种布局。
+
+`armor/` 已是正式 Python 子包，`pip install .` 会把它一起安装，并注册 `tarpitcrypt-armor`
+控制台入口。两种运行姿势都保留：目录内脚本直跑（`python armor/selftest.py`）与包式运行
+（`python -m armor.runtime_check`、`python -m armor.content_probe`）。目录内模块继续用
+`import armor_core` 这类顶层名互相引用，由 `__init__.py` 统一登记路径，避免逐个改写导入。
 
 ## 容器格式 v3（全部大端）
 

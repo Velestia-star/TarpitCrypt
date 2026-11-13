@@ -5,6 +5,12 @@
 
 ## 未发布
 
+### 包结构整合（结构整理，功能不变）
+- `armor/` 新增 `__init__.py`，从隐式命名空间目录变为正式 Python 子包；统一登记搜索路径，目录内既有的顶层名导入（`import armor_core` 等）保持可用，脚本直跑与包式运行两种姿势都不变。
+- `pyproject.toml` 纳入 `armor` 包并新增 `tarpitcrypt-armor` 控制台入口。此前打包配置只列 3 个根模块，pip 安装后 GUI 与加固核心都缺失。
+- `.gitignore` 补 `*.exe`，避免 20MB 级打包产物继续入库；已跟踪的 `打包一件套/TarpitCrypt.exe` 保留不动。
+- README 补「项目结构」章节，`armor/README.md` 补包导入说明。
+
 ### 拖放闪退修复（v0.3.17）
 - **根因**：真实拖放由 Tk/Tcl 消息循环派发 `WM_DROPFILES`，原实现在窗口过程内直接调用
   `self._root.after(...)` 触发 `_on_drop`，这会重入 Tcl，在 Python 3.12 + tkinter 下触发

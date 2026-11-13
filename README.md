@@ -428,6 +428,31 @@ Argon2id 是内存硬函数，GPU/ASIC 的并行优势被内存带宽卡死，�
 
 ---
 
+## 项目结构
+
+```text
+TarpitCrypt/
+├── tarpitcrypt.py          # v1 核心：Argon2id + AES-256-GCM，命令行入口
+├── tarpitcrypt_server.py   # 本地网页版服务端
+├── desktop_web.py          # WebView 桌面壳
+├── armor/                  # Python 子包：程序包加固工具集
+│   ├── __init__.py         # 包登记，兼容目录内既有的顶层名导入
+│   ├── armor_gui.py        # tkinter 界面（Windows 原生拖放）
+│   ├── armor_core.py       # v3 容器：加固 / 还原
+│   ├── decoy_kit.py        # 伴生诱饵包生成
+│   ├── selftest.py         # 端到端自测
+│   └── ...                 # 探针、评估、保真度矩阵、打包脚本
+├── tests/                  # v1 单元测试与格式兼容
+├── docs/                   # GitHub Pages 纯前端版
+└── scripts/                # 打包辅助脚本
+```
+
+`pip install .` 现在会把 `armor` 一起装上，并提供 `tarpitcrypt-armor` 入口启动 GUI。
+此前打包配置只列出 3 个根模块，GUI 与加固核心都装不进 wheel。
+
+`armor/` 内模块沿用顶层名互相导入，`__init__.py` 负责统一登记搜索路径：
+脚本直跑（`python armor/selftest.py`）与包式运行（`python -m armor.runtime_check`）都保持可用。
+
 ## 开发
 
 ```bash
