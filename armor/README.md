@@ -1,6 +1,6 @@
 # TarpitCrypt Armor · 反 AI 逆向加固工具
 
-> 发布版本 **v0.3.16** · 容器格式 **v3** · 详见仓库根 [CHANGELOG.md](../CHANGELOG.md)
+> 发布版本 **v0.3.17** · 容器格式 **v3** · 详见仓库根 [CHANGELOG.md](../CHANGELOG.md)
 
 把一个程序包拖进窗口，就能给它套上「让 AI 逆向 agent 反复做无用功」的外壳。
 

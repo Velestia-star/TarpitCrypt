@@ -161,13 +161,30 @@ def test_gui_drag_regression() -> None:
             wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
         user32.SendMessageW.restype = ctypes.c_ssize_t
         for hwnd in drop._old:
-            if got:
+            if not drop._queue.empty():
                 break
             user32.SendMessageW(hwnd, drop.WM_DROPFILES, hdrop, 0)
-        for _ in range(8):
-            root.update()
-        check("R6: WM_DROPFILES 多文件路径完整送达回调",
-              bool(got) and got[0] == sample, str(got[:1]))
+        # wndproc 只把路径放进队列（不再同步回调，避免重入 Tcl 崩溃）
+        try:
+            delivered = drop._queue.get(timeout=3)
+        except Exception:
+            delivered = []
+        check("R6: WM_DROPFILES 多文件路径完整送达队列",
+              delivered == sample, str(delivered))
+
+        # R7: App._poll_drop_q 在 Tcl 安全时机消费队列并触发载入
+        import tempfile as _tf, pathlib as _pl
+        app = armor_gui.App()
+        app.withdraw()
+        _d = _pl.Path(_tf.mkdtemp())
+        (_d / "src").mkdir()
+        (_d / "src" / "m.py").write_bytes(b"x")
+        app._drop._queue.put([str(_d)])
+        app._poll_drop_q()
+        check("R7: App 消费拖放队列并触发载入",
+              str(_d) in app.src.get(), app.src.get())
+        app.destroy()
+
         root.destroy()
     except Exception as exc:
         # 无显示服务 / 无 tkinter 的环境不把 GUI 项算失败

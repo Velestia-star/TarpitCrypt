@@ -28,10 +28,10 @@ TarpitCrypt 是一个**反 AI 逆向的整活项目**。底层是一个本地文
 
 | 层面 | 当前值 | 说明 |
 | --- | --- | --- |
-| 发布版本 | **v0.3.16** | GUI 原生拖放修复（HDROP/wParam/双 HWND/UIPI）并支持一次拖入多个批量排队；并含前轮 F–K、L–O、P、Q 全修，见 [CHANGELOG.md](CHANGELOG.md) |
+| 发布版本 | **v0.3.17** | 修复拖放导致 GUI 闪退（窗口过程内重入 Tcl 的 GIL 致命错误）；并含 v0.3.16 的原生拖放修复与批量拖入，见 [CHANGELOG.md](CHANGELOG.md) |
 | v1 文件格式 | `VERSION = 1`，`MAGIC = TARPITCR` | `.tarpit` 文件，格式冻结 |
 | armor 容器格式 | `VERSION = 3`，`MAGIC = TPARMOR3` | `.armored` 文件；v2 / v0.3.0 容器仍可读 |
-| Python 包元数据 | `0.3.16` | `pyproject.toml` |
+| Python 包元数据 | `0.3.17` | `pyproject.toml` |
 
 两层格式互不依赖：`armor/` 只复用 v1 的 Argon2id 与 AES-256-GCM 原语，
 **v1 文件格式一个字节没改**。

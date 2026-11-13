@@ -69,6 +69,10 @@ class NativeDrop:
         self._root = root
         self._callback = callback
         self._old: dict[int, int] = {}
+        # 拖放队列：wndproc 由 Tcl 消息循环回调，内部严禁再调用任何 Tcl/after
+        # （会重入 Tcl 导致 Python 3.12 GIL 致命错误、进程崩溃）。wndproc 只把
+        # 路径放进这个纯 Python 队列，由 App 的 _poll_drop_q（after 安全时机）消费。
+        self._queue: "queue.Queue" = queue.Queue()
         if os.name != "nt":
             self.error = "仅 Windows 支持原生拖放"
             return
@@ -138,7 +142,7 @@ class NativeDrop:
             except Exception:
                 paths = []
             if paths:
-                self._root.after(0, self._callback, paths)
+                self._queue.put(paths)
             return 0
         old = self._old.get(hwnd) or next(iter(self._old.values()), 0)
         return self._user32.CallWindowProcW(old, hwnd, msg, wparam, lparam)
@@ -190,6 +194,8 @@ class App(tk.Tk):
         if not self._drop.ok:
             self.status.set(f"拖放不可用（{self._drop.error}），请用「选择文件 / 选择文件夹」按钮")
             print(f"[NativeDrop] {self._drop.error}", file=sys.stderr)
+        # 拖放队列消费器：在 Tcl 主循环安全时机处理被拖入的文件（避免 wndproc 内重入 Tcl）。
+        self.after(120, self._poll_drop_q)
 
     # ------------------------------------------------------------------
     # 界面
@@ -551,6 +557,24 @@ pip install argon2-cffi cryptography
         widget.insert("end", msg + "\n")
         widget.see("end")
         widget.configure(state="disabled")
+
+    def _poll_drop_q(self) -> None:
+        """在 Tcl 主循环安全时机消费拖放队列。
+
+        wndproc（由 Tcl 消息循环回调）只负责把路径放进 NativeDrop._queue，
+        绝不直接调用 _on_drop，以免重入 Tcl 引发 GIL 致命错误。这里由 after
+        调度，运行在 Tcl 空闲的安全时机，可正常操作界面。
+        """
+        q = getattr(self._drop, "_queue", None)
+        if q is not None:
+            while not q.empty():
+                paths = q.get()
+                try:
+                    self._on_drop(paths)
+                except Exception as exc:
+                    self.status.set(f"拖放处理失败：{exc}")
+                    print(f"[drop] _on_drop 异常: {exc}", file=sys.stderr)
+        self.after(120, self._poll_drop_q)
 
     def _on_drop(self, paths: list[str]) -> None:
         paths = [p for p in paths if p and Path(p).exists()]

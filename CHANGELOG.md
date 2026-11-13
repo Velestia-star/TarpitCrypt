@@ -5,6 +5,14 @@
 
 ## 未发布
 
+### 拖放闪退修复（v0.3.17）
+- **根因**：真实拖放由 Tk/Tcl 消息循环派发 `WM_DROPFILES`，原实现在窗口过程内直接调用
+  `self._root.after(...)` 触发 `_on_drop`，这会重入 Tcl，在 Python 3.12 + tkinter 下触发
+  `PyEval_RestoreThread` GIL 致命错误，进程直接崩溃（拖入即闪退）。
+- **修复**：窗口过程只把路径放入纯 Python 队列（完全不触碰 Tcl/after），由 `App._poll_drop_q`
+  经 `after` 在 Tcl 空闲的安全时机消费并执行 `_on_drop`，彻底消除重入崩溃。
+- selftest 新增 R6（WM_DROPFILES→队列）与 R7（App 消费队列并载入）回归断言。
+
 ### GUI 拖放修复 + 批量拖入（v0.3.16）
 
 `启动.bat` 打开后把文件拖进窗口没有反应。代码里本来实现了 Windows 原生
