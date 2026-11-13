@@ -35,7 +35,13 @@ tarpitcrypt-armor = "armor.armor_gui:main"
 py-modules = ["tarpitcrypt", "tarpitcrypt_server", "desktop_web"]
 
 [tool.setuptools.packages.find]
-include = ["armor*"]
+include = ["armor*", "docs*"]
+
+# docs/ 是 GitHub Pages 发布源，同时也是 tarpitcrypt-web / tarpitcrypt-desktop
+# 的本地前端。pip 安装后 server 会在 site-packages/docs 下找 index.html，
+# 缺了这些静态资源 web 入口会直接报「找不到本地前端」。
+[tool.setuptools.package-data]
+"docs" = ["*", "vendor/*", ".nojekyll"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -1,8 +1,13 @@
-1.打开启动桌面版即可使用
+TarpitCrypt 单文件免安装版（Windows）
 
-2.单文件exe无需python环境，发给别人直接可以用
-
-3.体验完整诱饵层可以打开名为“armor”的文件夹找到启动选项
-
-4.加密文件位置在名为“存放文件”的文件夹里
-
+1. 双击 TarpitCrypt.exe 即可使用，无需安装 Python。
+2. 首次运行若系统缺少 WebView2 运行时，程序会自动运行内置的
+   MicrosoftEdgeWebview2Setup.exe 静默安装（这一步需要联网一次）。
+3. 加密 / 还原产物保存在 exe 同目录自动生成的「存放文件」文件夹里，
+   程序退出后不会丢失。
+4. 加固功能（多层容器、伴生诱饵包、报告导出）已内置在界面中，
+   无需再打开其他文件夹。
+5. 源码、pip 安装方式与在线版见：
+   https://github.com/Velestia-star/TarpitCrypt
+6. 最新单文件版也可从 Releases 下载：
+   https://github.com/Velestia-star/TarpitCrypt/releases/latest

@@ -453,6 +453,22 @@ TarpitCrypt/
 `armor/` 内模块沿用顶层名互相导入，`__init__.py` 负责统一登记搜索路径：
 脚本直跑（`python armor/selftest.py`）与包式运行（`python -m armor.runtime_check`）都保持可用。
 
+## 在全新设备上运行
+
+| 场景 | 做法 | 前置条件 |
+| --- | --- | --- |
+| 只想用，有浏览器 | 打开在线版 https://velestia-star.github.io/TarpitCrypt/ | 无；纯前端 WASM，文件不上传 |
+| Windows，免装 Python | 双击 `打包一件套/TarpitCrypt.exe`，或从 [Releases](https://github.com/Velestia-star/TarpitCrypt/releases/latest) 下载最新单文件版 | Win10 缺 WebView2 时程序自动运行内置安装包（首次需联网一次） |
+| 装了 Python 3.11+ | `pip install .` → `tarpitcrypt` / `tarpitcrypt-armor` / `tarpitcrypt-web` / `tarpitcrypt-desktop` | tkinter（官方安装包自带）、argon2-cffi、cryptography 自动安装 |
+| 直接拷源码目录 | 双击 `启动.bat` | 自动探测已装好依赖的 Python；找不到时给出明确提示 |
+
+产物目录：加密 / 还原结果默认写到 `~/TarpitCrypt/存放文件`（pip 安装）或 exe 同目录（免装版）；源码布局保持项目内 `存放文件/`。
+可用 `--out-dir` 或环境变量 `TARPITCRYPT_OUT_DIR` 覆盖。机器上有多个 Python 时，可用
+`TARPITCRYPT_PYTHON` 指定 `启动.bat` 使用哪个解释器；`TARPITCRYPT_PYTHONW` 指定无控制台版本。
+
+`启动.bat` / `运行自测.bat` / `打包exe.bat` 均按「环境变量 → 同目录便携版 → PATH → `py -3` → 常见安装路径」
+逐一预检依赖，选第一个能跑的解释器；全部缺依赖时自动尝试 `pip install argon2-cffi cryptography`。
+
 ## 开发
 
 ```bash

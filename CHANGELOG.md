@@ -5,6 +5,13 @@
 
 ## 未发布
 
+### 全新设备可移植性修复（结构整理，功能不变）
+- **启动脚本**：`启动.bat` / `运行自测.bat` / `打包exe.bat` 全部改为多候选 Python 探测（环境变量 `TARPITCRYPT_PYTHON` → 同目录便携版 → PATH → `py -3` → 常见安装路径），逐一预检 `tkinter` / `argon2` / `cryptography` / 同目录模块，选第一个能跑的；全失败才自动补装依赖并给出明确提示。移除了桌面副本里硬编码的 `D:\app\py312` 与 `E:\临时文件\_tcvenv`，以及仓库版对 `py -3` 的单点依赖。
+- **wheel 自带前端**：`docs/` 新增 `__init__.py` 作为打包载体，`pyproject.toml` 纳入 `docs*` 并配置 `package-data`。此前 `pip install` 后 `tarpitcrypt-web` 直接 `EXIT=2`「找不到本地前端」，桌面 WebView 版同理；现在 13 个静态资源随 wheel 安装，`tarpitcrypt_server.py` 无需改动即可定位。
+- **产物输出目录**：新增 `_default_out_dir()`，按「环境变量 `TARPITCRYPT_OUT_DIR` → 冻结 exe 同目录 → 源码布局同目录 → `~/TarpitCrypt/存放文件`」择一。此前 pip 安装后落 `site-packages/存放文件`（找不到、系统级安装还可能只读），exe 落 `_MEIPASS` 临时目录（退出即删）。
+- **重打包 exe**：`打包一件套/TarpitCrypt.exe` 用修复后源码重新编译（PyInstaller 6.22.3 / Python 3.12.14），内嵌 13 个 docs 资源、WebView2 安装包与 Python 运行时，`--self-test` 返回 OK。同步修正 `打包一件套/项目说明书.txt`（旧版提到的「启动桌面版」「armor 文件夹」在该目录并不存在）。
+- **验证**：全新 venv 仅装 wheel → 4 个入口齐全、CLI 加解密往返字节一致、`tarpitcrypt-web` 首页 200 + 6 个静态资源 200 + `/api/armor/profiles` 200、`desktop_web --self-test OK`、`runtime_check 16/16`、`selftest 257/257`；三份 bat 在本机与模拟新设备下均选中可用解释器；新 exe `--self-test` EXIT=0。
+
 ### 包结构整合（结构整理，功能不变）
 - `armor/` 新增 `__init__.py`，从隐式命名空间目录变为正式 Python 子包；统一登记搜索路径，目录内既有的顶层名导入（`import armor_core` 等）保持可用，脚本直跑与包式运行两种姿势都不变。
 - `pyproject.toml` 纳入 `armor` 包并新增 `tarpitcrypt-armor` 控制台入口。此前打包配置只列 3 个根模块，pip 安装后 GUI 与加固核心都缺失。

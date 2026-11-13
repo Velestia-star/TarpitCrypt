@@ -65,9 +65,37 @@ DOCS_DIR: Final[Path] = (Path(__file__).resolve().parent / "docs").resolve()
 #: Argon2id 是 GiB 级内存硬函数，并发跑两个大参数会直接把机器拖死。
 _CRYPTO_LOCK: Final[threading.Lock] = threading.Lock()
 
-#: 加密/解密的结果会顺手存一份到磁盘，默认放在项目目录下的 `存放文件/`。
-#: 用 __file__ 定位，换到哪个工作目录启动都指向项目里。
-_OUT_DIR: Path = Path(__file__).resolve().parent / "存放文件"
+def _default_out_dir() -> Path:
+    """挑一个稳定可写、用户找得到的产物目录。
+
+    pip 安装后模块落在 ``site-packages``（用户找不到、系统级安装还可能只读）；
+    PyInstaller 冻结后落在 ``_MEIPASS`` 临时目录（退出即删）。这两种情况
+    都不能再沿用「模块同目录」。优先级：
+
+    1. 环境变量 ``TARPITCRYPT_OUT_DIR``（显式覆盖）
+    2. 冻结环境：exe 同目录，产物不会随临时目录消失
+    3. 源码布局（同目录带 ``docs/index.html``、非 site-packages 且可写）：项目内 ``存放文件/``
+    4. 其余（pip 安装 / 只读目录）：用户目录 ``~/TarpitCrypt/存放文件``
+    """
+    env = os.environ.get("TARPITCRYPT_OUT_DIR")
+    if env:
+        return Path(env).expanduser().resolve()
+
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent / "存放文件"
+
+    here = Path(__file__).resolve().parent
+    installed = any(part in ("site-packages", "dist-packages") for part in here.parts)
+    if (not installed and (here / "docs" / "index.html").is_file()
+            and os.access(here, os.W_OK)):
+        return here / "存放文件"
+
+    return Path.home() / "TarpitCrypt" / "存放文件"
+
+
+#: 加密/解密结果会另存一份到磁盘。默认位置由 _default_out_dir() 决定，
+#: 换到任何工作目录启动都指向同一个稳定位置；可用 --out-dir 或环境变量覆盖。
+_OUT_DIR: Path = _default_out_dir()
 #: P5 桌面壳专用：允许 Web 端直接传本机路径 / 输出目录。普通本地 Web
 #: 永远保持 False；只有 desktop_web.py 启动时打开，并配合随机令牌。
 _ALLOW_PATHS: bool = False
@@ -1427,7 +1455,7 @@ def main(argv: list[str] | None = None) -> int:
     """启动本地 Web 服务。"""
     global _OUT_DIR
     _configure_stdio()
-    default_out = Path(__file__).resolve().parent / "存放文件"
+    default_out = _default_out_dir()
     parser = argparse.ArgumentParser(
         prog="tarpitcrypt-web",
         description="TarpitCrypt 本地 Web 入口：拖文件进来，加密文件出去。",
