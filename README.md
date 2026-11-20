@@ -293,6 +293,59 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build_exe.ps1
 
 ---
 
+## 运行时加固：加密后直接运行（armor/runtime_pack.py）
+
+`armor/` 的 `加固` 页产出 `.armored` 容器，**必须先还原到磁盘**才能使用。
+`运行时加固` 页是另一条路线：把整个程序包加密后塞进一个 exe 尾部，双击即可运行。
+
+### 怎么用
+
+1. 先构建一次通用启动器（只需一次，产物约 14 MB）：
+
+   ```bash
+   python armor/build_runner.py          # → armor/dist/RTPK_Runner.exe
+   ```
+
+2. GUI 打开 `运行时加固` 页 → 选择程序包（文件或文件夹）→ 填两次运行口令 →
+   “启动器”选中 `RTPK_Runner.exe` → 点 `生成加密 exe`。
+   每个包只是把加密数据追加到通用启动器尾部，**秒级完成，无需重新 PyInstaller**。
+
+3. 分发时只给对方这个 exe。双击 → 输入口令 → 解密到临时目录 →
+   启动原程序 → 退出后覆写擦除临时目录。
+
+命令行等价：
+
+```bash
+python armor/runtime_pack.py build MyApp -o MyApp_protected.exe \
+    --password '...' --profile 中 --runner armor/dist/RTPK_Runner.exe
+python armor/runtime_pack.py inspect MyApp_protected.exe
+```
+
+### 它做到什么、做不到什么（务必读完）
+
+| 能力 | 状态 |
+|---|---|
+| 静态拿到分发 exe 读不出任何原文件字节 | 做到（密文 + AES-GCM 认证） |
+| 没有口令无法运行 / 无法解出原文 | 做到（Argon2id 派生 + 认证标签） |
+| 磁盘上不长期留明文 | 做到（临时目录运行，退出覆写擦除） |
+| 篡改 exe 尾部数据被检出 | 做到（CRC32 + AEAD 双重校验） |
+| 路径穿越（Zip Slip） | 做到（解压前拒绝绝对路径 / `..`） |
+| **运行中阻止调试器 dump 内存** | **做不到**。明文必然在内存出现，任何加壳都挡不住有权限的调试器 |
+| **阻止屏幕录制 / 键盘记录 / 已失陷主机** | **做不到** |
+| **反杀软检测 / 免杀 / 注入第三方进程 / 反沙箱** | **明确不做**，本工具不触碰这类能力 |
+
+免密模式（`--no-password` / GUI 单选“免密”）把固定密钥写进工具源码，等价于
+**混淆壳**，挡不住任何定向逆向，仅供演示，不要在真实分发里使用。
+
+SSD 的磨损均衡会让“覆写擦除”不保证物理层不可恢复；这里做到的程度是
+“同机上普通文件恢复工具读不到”。另有 `RTPK_DEBUG=1` 可保留临时目录供调试，
+`RTPK_PASSWORD` 可预填口令供自动化测试——两者都不会写进分发包。
+
+格式 `RTPK v1` 与尾部 footer 布局见 `armor/runtime_pack.py` 模块文档。
+自测含 7 项运行时加固回归（R12~R18）：`python armor/selftest.py`。
+
+---
+
 ## 单次猜测到底有多贵（本机实测）
 
 | 参数 | 单次尝试耗时 |

@@ -102,8 +102,77 @@ def test_content_probe_regression() -> None:
                       str(r["typical"]))
 
 
+def test_runtime_pack_regression() -> None:
+    """运行时加固：加密/清单/错口令/解密/安全解压/擦除/尾部注入回归。"""
+    import importlib.util
+    import tempfile
+    import zipfile
+    import io
+
+    mod_path = Path(__file__).resolve().parent / "runtime_pack.py"
+    spec = importlib.util.spec_from_file_location("runtime_pack", mod_path)
+    assert spec and spec.loader
+    rp = importlib.util.module_from_spec(spec)
+    sys.modules["runtime_pack"] = rp  # dataclass 需要模块已注册
+    try:
+        spec.loader.exec_module(rp)
+    finally:
+        sys.modules.pop("runtime_pack", None)
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        src = root / "DemoApp"
+        src.mkdir()
+        (src / "start.bat").write_text("@echo off\necho hi\n", encoding="utf-8")
+        (src / "secret.txt").write_text("PLAINTEXT_SENTINEL_9527", encoding="utf-8")
+
+        blob = rp.build_pack(src, "S3cure!Pass", profile="轻")
+        check("R12: RTPK 头部与清单正确",
+              blob.startswith(rp.MAGIC)
+              and rp.parse_pack(blob)["manifest"].entry == "start.bat"
+              and rp.parse_pack(blob)["manifest"].files == 2)
+        check("R13: 密文中不含原文",
+              b"PLAINTEXT_SENTINEL_9527" not in blob)
+
+        try:
+            rp.decrypt_pack(blob, "wrong")
+            check("R14: 错误口令被拒绝", False)
+        except rp.RuntimePackError:
+            check("R14: 错误口令被拒绝", True)
+
+        plain, man = rp.decrypt_pack(blob, "S3cure!Pass")
+        out = root / "unpacked"
+        rp.safe_extract(plain, out)
+        check("R15: 正确口令解密并还原原文件",
+              (out / "secret.txt").read_text(encoding="utf-8")
+              == "PLAINTEXT_SENTINEL_9527" and man.files == 2)
+
+        # Zip Slip 拒绝
+        evil = io.BytesIO()
+        with zipfile.ZipFile(evil, "w") as zf:
+            zf.writestr("../../evil.txt", "x")
+        try:
+            rp.safe_extract(evil.getvalue(), root / "evil")
+            check("R16: 拒绝 Zip Slip 路径穿越", False)
+        except rp.RuntimePackError:
+            check("R16: 拒绝 Zip Slip 路径穿越", True)
+
+        # 擦除
+        rp.wipe_dir(out)
+        check("R17: 退出擦除删除临时目录", not out.exists())
+
+        # 尾部注入（用假 exe 字节验证 footer 索引，不依赖 PyInstaller）
+        fake = root / "fake.exe"
+        fake.write_bytes(b"MZ" + b"\x00" * 100)
+        single = root / "single.exe"
+        rp.embed(fake, blob, single)
+        check("R18: 尾部注入后可原样读回包",
+              rp.read_embedded(single) == blob
+              and single.read_bytes().startswith(b"MZ"))
+
+
 def test_gui_drag_regression() -> None:
-    """GUI 拖放：HDROP 类型、双 HWND、wParam、批量队列的回归验证。"""
+    """GUI 拖放：HDROP 类型、全窗口树落点覆盖、wParam、批量队列的回归验证。"""
     import importlib.util
     import textwrap
 
@@ -114,13 +183,19 @@ def test_gui_drag_regression() -> None:
     check("R2: WM_DROPFILES 从 wParam 取 HDROP",
           "paths = self._paths(wparam)" in src
           and "self._paths(lparam)" not in src)
-    check("R3: frame 与 TkChild 双窗口都注册拖放",
-          "int(root.frame(), 16), root.winfo_id()" in src
+    check("R3: 枚举整棵窗口树并给所有子 HWND 注册拖放",
+          "EnumChildWindows" in src and "def refresh(" in src
           and "ChangeWindowMessageFilterEx" in src)
     check("R4: 批量队列与三项作业齐备",
           all(k in src for k in ("_queue_batch", "_pump_batch",
                                  "_batch_armor_job", "_batch_restore_job",
                                  "_batch_kit_job")))
+    check("R10: 输出可见性与大目录预警齐备",
+          all(k in src for k in ("_open_out_dir", "_maybe_warn_large",
+                                 "_scan_dir", "打开输出目录")))
+    check("R11: 运行时加固页签与逻辑齐备",
+          all(k in src for k in ("_tab_runtime", "_do_runtime", "rt_runner",
+                                 "runtime_pack", "运行时加固")))
 
     # 实际投递 WM_DROPFILES：只在 Windows + tkinter 可用的环境跑
     if os.name != "nt":
@@ -183,6 +258,45 @@ def test_gui_drag_regression() -> None:
         app._poll_drop_q()
         check("R7: App 消费拖放队列并触发载入",
               str(_d) in app.src.get(), app.src.get())
+
+        # R8/R9: 真实拖放会落在任意子控件 HWND 上，必须全覆盖且能收到消息
+        CB = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        kids: list[int] = []
+
+        def _collect(h, _l):
+            kids.append(int(h or 0))
+            return True
+
+        user32.EnumChildWindows.argtypes = [wintypes.HWND, CB, wintypes.LPARAM]
+        user32.EnumChildWindows(int(app.frame(), 16), CB(_collect), 0)
+        missing = [h for h in kids if h not in app._drop._old]
+        added = app._drop.refresh()   # 运行中新建的控件由轮询补挂
+        missing_after = [h for h in kids if h not in app._drop._old]
+        check("R8: 所有子 HWND 都注册拖放（含动态补挂）",
+              len(kids) > 2 and not missing_after,
+              f"共 {len(kids)} 个子窗口，初始漏 {len(missing)} 个，"
+              f"refresh 补挂 {added} 个")
+
+        # R6 的 HDROP 已被 DragFinish 释放，这里重新分配一个。
+        data2 = (str(_d) + "\0\0").encode("utf-16-le")
+        hdrop2 = kernel32.GlobalAlloc(0x0042, 20 + len(data2))
+        ptr2 = kernel32.GlobalLock(hdrop2)
+        ctypes.memmove(ptr2, ctypes.byref(ctypes.c_uint32(20)), 4)
+        ctypes.memmove(ptr2 + 16, ctypes.byref(ctypes.c_int(1)), 4)
+        ctypes.memmove(ptr2 + 20, data2, len(data2))
+        kernel32.GlobalUnlock(hdrop2)
+        target = next(
+            (h for h in kids if h not in (int(app.frame(), 16), app.winfo_id())),
+            None,
+        )
+        if target:
+            user32.SendMessageW(target, app._drop.WM_DROPFILES, hdrop2, 0)
+            try:
+                delivered2 = app._drop._queue.get(timeout=3)
+            except Exception:
+                delivered2 = []
+            check("R9: 投递到普通子控件 HWND 也能入队",
+                  delivered2 == [str(_d)], str(delivered2))
         app.destroy()
 
         root.destroy()
@@ -1452,6 +1566,7 @@ def main() -> int:
 
     test_content_probe_regression()
     test_gui_drag_regression()
+    test_runtime_pack_regression()
 
     print(f"\n通过 {len(PASS)} / 失败 {len(FAIL)} / 合计 {len(PASS) + len(FAIL)}")
     if FAIL:

@@ -5,6 +5,20 @@
 
 ## 未发布
 
+### 运行时加固：加密后可直接运行的单文件 exe（新页签）
+- 新增 `armor/runtime_pack.py`：RTPK v1 加密包格式（Argon2id 派生 + AES-256-GCM
+  认证加密 + 清单单独 AAD + CRC32）；加密包可追加到通用启动器 exe 尾部，
+  PE overlay 之后的数据不影响执行，故每次加固秒级完成、无需重打 PyInstaller。
+- 新增 `armor/runtime_runner.py` + `armor/build_runner.py`：无控制台单文件启动器，
+  双击弹口令框 → 解密 → 安全解压到临时目录 → 启动原程序 → 退出后覆写擦除。
+- GUI 新增第 4 个页签「运行时加固」：口令/确认/强度/口令或免密模式/启动器选择/
+  输出 exe；拖入程序包自动填入源与输出路径；复用既有后台任务与日志/报告。
+- 安全边界：静态读不出原文件、无口令无法解密、篡改可检出、拒绝 Zip Slip；
+  **明文运行时必然进内存，不防调试器 dump / 内存取证；不做免杀 / 注入 /
+  反沙箱**。免密模式标注为仅混淆、保护极弱。README 有完整说明。
+- selftest 新增 R11~R18（页签齐备、头部清单、密文无原文、错口令拒绝、
+  正确解密、Zip Slip 拒绝、擦除、尾部注入读回）。**268/268 全绿**。
+
 ### 全新设备可移植性修复（结构整理，功能不变）
 - **启动脚本**：`启动.bat` / `运行自测.bat` / `打包exe.bat` 全部改为多候选 Python 探测（环境变量 `TARPITCRYPT_PYTHON` → 同目录便携版 → PATH → `py -3` → 常见安装路径），逐一预检 `tkinter` / `argon2` / `cryptography` / 同目录模块，选第一个能跑的；全失败才自动补装依赖并给出明确提示。移除了桌面副本里硬编码的 `D:\app\py312` 与 `E:\临时文件\_tcvenv`，以及仓库版对 `py -3` 的单点依赖。
 - **wheel 自带前端**：`docs/` 新增 `__init__.py` 作为打包载体，`pyproject.toml` 纳入 `docs*` 并配置 `package-data`。此前 `pip install` 后 `tarpitcrypt-web` 直接 `EXIT=2`「找不到本地前端」，桌面 WebView 版同理；现在 13 个静态资源随 wheel 安装，`tarpitcrypt_server.py` 无需改动即可定位。

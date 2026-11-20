@@ -52,9 +52,12 @@ def _enable_dpi() -> None:
 class NativeDrop:
     """给 Tk 窗口挂上系统拖放（WM_DROPFILES）。
 
-    Tk 在 Windows 上有两个 HWND：root.frame() 是 TkTopLevel（外层容器），
-    root.winfo_id() 是 TkChild（实际客户区、真正接收拖放消息）。两者都要
-    注册 DragAcceptFiles 并子类化窗口过程，否则文件拖进客户区没有反应。
+    Tk 在 Windows 上会给几乎每个控件建一个 TkChild HWND（本项目实测 99 个）。
+    Explorer 拖放时 WM_DROPFILES 只投递到鼠标正下方那个 HWND，消息不会自动
+    冒泡到父窗口。只给 root.frame() / root.winfo_id() 两个窗口注册，拖到
+    输入框、日志框、页签等区域就会石沉大海（自测用 SendMessageW 直接发给这
+    两个 HWND 是假阳性）。这里枚举整棵窗口树，逐个 DragAcceptFiles +
+    子类化，运行中新建的控件由 App._poll_drop_q 定期 refresh() 补挂。
     """
 
     WM_DROPFILES = 0x0233
@@ -103,24 +106,64 @@ class NativeDrop:
             setter.argtypes = [wintypes.HWND, ctypes.c_int, self._WNDPROC]
             setter.restype = ctypes.c_void_p
 
+            self._user32.IsWindow.argtypes = [wintypes.HWND]
+            self._user32.IsWindow.restype = wintypes.BOOL
+            self._enum_cb = ctypes.WINFUNCTYPE(
+                wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+            self._user32.EnumChildWindows.argtypes = [
+                wintypes.HWND, self._enum_cb, wintypes.LPARAM]
+            self._user32.EnumChildWindows.restype = wintypes.BOOL
             root.update_idletasks()
             proc = self._WNDPROC(self._wndproc)
             self._proc_ref = proc          # 防 GC
-            for hwnd in dict.fromkeys((int(root.frame(), 16), root.winfo_id())):
-                old = setter(hwnd, self.GWL_WNDPROC, proc)
-                if not old:
-                    raise OSError(f"无法替换窗口过程 HWND={hwnd:#x}")
-                self._old[hwnd] = old
-                self._shell32.DragAcceptFiles(hwnd, True)
-                # 提权的资源管理器发来的消息默认被 UIPI 丢掉，逐窗口放行。
-                for msg in (self.WM_DROPFILES, self.WM_COPYGLOBALDATA,
-                            self.WM_COPYDATA):
-                    self._user32.ChangeWindowMessageFilterEx(
-                        hwnd, msg, self.MSGFLT_ALLOW, None)
-            self.ok = True
+            self._setter = setter
+            self._top = int(root.frame(), 16)
+            self._extra = [self._top, root.winfo_id()]
+            self.refresh()
+            self.ok = bool(self._old)
         except Exception as exc:
             self.ok = False
             self.error = f"{type(exc).__name__}: {exc}"
+
+    def _all_hwnds(self) -> list[int]:
+        """枚举顶层窗口下所有 HWND（含顶层自身与 winfo_id 客户区）。"""
+        found: list[int] = []
+
+        def collect(hwnd, _lparam):
+            found.append(int(hwnd or 0))
+            return True
+
+        cb = self._enum_cb(collect)
+        self._enum_cb_ref = cb          # 防 GC
+        self._user32.EnumChildWindows(self._top, cb, 0)
+        return list(dict.fromkeys([*self._extra, *found]))
+
+    def refresh(self) -> int:
+        """给尚未注册的子 HWND 补挂拖放；返回本次新注册数量。
+
+        Tk 运行中可能新建控件（新页签、气泡、滚动条），由 App 的轮询
+        定期调用，保证拖到任何落点都有人接。
+        """
+        if os.name != "nt" or not getattr(self, "_setter", None):
+            return 0
+        added = 0
+        for hwnd in self._all_hwnds():
+            if not hwnd or hwnd in self._old:
+                continue
+            if not self._user32.IsWindow(hwnd):
+                continue
+            old = self._setter(hwnd, self.GWL_WNDPROC, self._proc_ref)
+            if not old:
+                continue
+            self._old[hwnd] = old
+            self._shell32.DragAcceptFiles(hwnd, True)
+            # 提权的资源管理器发来的消息默认被 UIPI 丢掉，逐窗口放行。
+            for msg in (self.WM_DROPFILES, self.WM_COPYGLOBALDATA,
+                        self.WM_COPYDATA):
+                self._user32.ChangeWindowMessageFilterEx(
+                    hwnd, msg, self.MSGFLT_ALLOW, None)
+            added += 1
+        return added
 
     def _paths(self, lparam: int) -> list[str]:
         hdrop = ctypes.c_void_p(lparam)
@@ -181,6 +224,14 @@ class App(tk.Tk):
         self.metrics = Metrics()
         self.poison = tk.StringVar()
         self.parallel = tk.BooleanVar(value=False)
+        # 运行时加固（加密后可直接运行的单文件 exe）
+        self.rt_src = tk.StringVar()
+        self.rt_out = tk.StringVar()
+        self.rt_pw = tk.StringVar()
+        self.rt_pw2 = tk.StringVar()
+        self.rt_profile = tk.StringVar(value="中")
+        self.rt_mode = tk.StringVar(value="password")   # password | nopass
+        self.rt_runner = tk.StringVar()
 
         import armor_core as core
         import decoy_kit as dk
@@ -215,6 +266,7 @@ class App(tk.Tk):
         self.nb.add(self._tab_armor(), text="  加固  ")
         self.nb.add(self._tab_restore(), text="  还原  ")
         self.nb.add(self._tab_kit(), text="  伴生诱饵  ")
+        self.nb.add(self._tab_runtime(), text="  运行时加固  ")
         self.nb.add(self._tab_report(), text="  运行报告  ")
         self.nb.add(self._tab_about(), text="  说明  ")
 
@@ -304,6 +356,8 @@ class App(tk.Tk):
         self.armor_btn = ttk.Button(actions, text="开始加固", style="Accent.TButton",
                                     command=self._do_armor)
         self.armor_btn.pack(side="left")
+        ttk.Button(actions, text="打开输出目录",
+                   command=self._open_out_dir).pack(side="left", padx=8)
         self.pb = ttk.Progressbar(actions, mode="determinate", length=260)
         self.pb.pack(side="left", padx=14)
 
@@ -393,6 +447,136 @@ class App(tk.Tk):
 
         self.kit_log = self._log_box(f)
         return f
+
+    # ------------------------------------------------------------------
+    # 运行时加固：加密后可直接运行的单文件 exe
+    # ------------------------------------------------------------------
+    def _tab_runtime(self) -> ttk.Frame:
+        f = ttk.Frame(self.nb, padding=14)
+        ttk.Label(
+            f,
+            text="把程序包加密成单文件 exe：双击输口令 → 内存解密 → 运行 → 退出擦除。\n"
+                 "明文不长期留盘；程序运行时仍可被调试器 dump，无法绝对防逆向。",
+            style="Hint.TLabel", justify="left", wraplength=680,
+        ).pack(anchor="w", pady=(0, 8))
+
+        self._drop_zone(f, "把要保护的程序包（文件或文件夹）拖进窗口任意位置")
+
+        pick = ttk.Frame(f)
+        pick.pack(fill="x")
+        ttk.Button(pick, text="选择文件",
+                   command=lambda: self._rt_pick(False)).pack(side="left")
+        ttk.Button(pick, text="选择文件夹",
+                   command=lambda: self._rt_pick(True)).pack(side="left", padx=6)
+        ttk.Label(pick, textvariable=self.rt_src, style="Hint.TLabel",
+                  wraplength=560).pack(side="left", padx=10)
+
+        opts = ttk.LabelFrame(f, text=" 加固选项 ", padding=10)
+        opts.pack(fill="x", pady=(8, 0))
+        row1 = ttk.Frame(opts); row1.pack(fill="x")
+        ttk.Label(row1, text="运行口令：").pack(side="left")
+        ttk.Entry(row1, textvariable=self.rt_pw, show="*", width=26).pack(side="left")
+        ttk.Label(row1, text="  确认：").pack(side="left")
+        ttk.Entry(row1, textvariable=self.rt_pw2, show="*", width=26).pack(side="left")
+        ttk.Label(row1, text="  强度：", style="Hint.TLabel").pack(side="left")
+        ttk.Combobox(row1, textvariable=self.rt_profile, width=6, state="readonly",
+                     values=["轻", "中", "狠"]).pack(side="left")
+        row2 = ttk.Frame(opts); row2.pack(fill="x", pady=(8, 0))
+        ttk.Radiobutton(row2, text="口令保护（推荐）", variable=self.rt_mode,
+                        value="password").pack(side="left")
+        ttk.Radiobutton(row2, text="免密（仅混淆，保护极弱）", variable=self.rt_mode,
+                        value="nopass").pack(side="left", padx=14)
+        ttk.Label(row2, text="  启动器：", style="Hint.TLabel").pack(side="left")
+        ttk.Entry(row2, textvariable=self.rt_runner, width=42).pack(side="left")
+        ttk.Button(row2, text="选择", command=self._rt_pick_runner).pack(side="left", padx=4)
+
+        out = ttk.Frame(f); out.pack(fill="x", pady=(8, 0))
+        ttk.Label(out, text="输出 exe：").pack(side="left")
+        ttk.Entry(out, textvariable=self.rt_out, width=64).pack(side="left")
+
+        actions = ttk.Frame(f); actions.pack(fill="x", pady=(10, 0))
+        self.rt_btn = ttk.Button(actions, text="生成加密 exe",
+                                 style="Accent.TButton", command=self._do_runtime)
+        self.rt_btn.pack(side="left")
+        ttk.Button(actions, text="打开输出目录",
+                   command=self._open_rt_dir).pack(side="left", padx=8)
+        ttk.Label(actions, text="  分发时只需这个 exe；明文运行时短暂出现后擦除",
+                  style="Hint.TLabel").pack(side="left")
+
+        self.rt_log = self._log_box(f)
+        return f
+
+    def _rt_pick(self, folder: bool) -> None:
+        if folder:
+            path = filedialog.askdirectory(title="选择要保护的程序包文件夹")
+        else:
+            path = filedialog.askopenfilename(title="选择要保护的程序包文件")
+        if path:
+            self.rt_src.set(path)
+            self.status.set(f"运行时加固源：{path}")
+
+    def _rt_pick_runner(self) -> None:
+        path = filedialog.askopenfilename(
+            title="选择通用启动器 RTPK_Runner.exe",
+            filetypes=[("启动器", "*.exe"), ("全部", "*.*")])
+        if path:
+            self.rt_runner.set(path)
+
+    def _open_rt_dir(self) -> None:
+        raw = self.rt_out.get()
+        if not raw:
+            messagebox.showinfo(APP_TITLE, "还没有生成加密 exe")
+            return
+        out = Path(raw)
+        target = out if out.is_file() else out.parent
+        if target.exists():
+            _open_path(target)
+        else:
+            messagebox.showinfo(APP_TITLE, f"输出不存在：{target}")
+
+    def _do_runtime(self) -> None:
+        import runtime_pack as rpk
+
+        raw = self.rt_src.get()
+        if not raw or not Path(raw).exists():
+            messagebox.showwarning(APP_TITLE, "请先选择程序包（文件或文件夹）")
+            return
+        runner = self.rt_runner.get()
+        if not runner or not Path(runner).is_file():
+            messagebox.showwarning(APP_TITLE,
+                                   "请先选择通用启动器 RTPK_Runner.exe\n"
+                                   "（在 打包exe.bat 生成的 dist 目录里）")
+            return
+        nopass = self.rt_mode.get() == "nopass"
+        pw = "" if nopass else self.rt_pw.get()
+        if not nopass:
+            if not pw or pw != self.rt_pw2.get():
+                messagebox.showwarning(APP_TITLE, "两次运行口令不一致或为空")
+                return
+            ok, hint = __import__("armor_core").check_password_strength(pw)
+            if not ok and not messagebox.askyesno(
+                    APP_TITLE, f"运行口令偏弱：{hint}\n仍要继续吗？"):
+                return
+
+        src = Path(raw)
+        out = Path(self.rt_out.get() or str(src.with_name(src.name + "_protected.exe")))
+        profile = self.rt_profile.get() or "中"
+
+        def job(progress, emit):
+            emit("log", f"运行时加固：{src.name} / 强度 {profile} / "
+                        f"{'免密（弱）' if nopass else '口令保护'}")
+            blob = rpk.build_pack(src, pw or None, profile=profile,
+                                  no_password=nopass, cb=progress)
+            rpk.embed(runner, blob, out)
+            emit("log", f"已生成单文件 exe：{out}（{out.stat().st_size:,} 字节）")
+            emit("log", "分发只需这个 exe。运行需输入口令，明文解密到临时目录，退出擦除。")
+            emit("log", "局限：程序运行时明文在内存中，可被调试器 dump；本工具不防内存取证。")
+            emit("record", dict(action="运行时", label=src.name, ok=True,
+                                layers_tried=0, seconds=0.0,
+                                note=f"{profile} / {'免密' if nopass else '口令'}"))
+            return f"加密 exe 已生成：{out}"
+
+        self._run_async(job, self.rt_log, [self.rt_btn])
 
     def _tab_report(self) -> ttk.Frame:
         f = ttk.Frame(self.nb, padding=14)
@@ -574,6 +758,13 @@ pip install argon2-cffi cryptography
                 except Exception as exc:
                     self.status.set(f"拖放处理失败：{exc}")
                     print(f"[drop] _on_drop 异常: {exc}", file=sys.stderr)
+        # 运行中新建的控件 HWND 也要补挂，约每 1 秒检查一次。
+        self._drop_ticks = getattr(self, "_drop_ticks", 0) + 1
+        if self._drop_ticks % 8 == 0:
+            try:
+                self._drop.refresh()
+            except Exception:
+                pass
         self.after(120, self._poll_drop_q)
 
     def _on_drop(self, paths: list[str]) -> None:
@@ -582,8 +773,16 @@ pip install argon2-cffi cryptography
             return
         if len(paths) == 1:
             path = Path(paths[0])
-            if (self.nb.index(self.nb.select()) == 2
-                    and path.suffix.lower() != ".armored"):
+            # 大目录统计可能耗时，先给个可见反馈，别让界面像卡死。
+            if path.is_dir():
+                self.status.set(f"已拖入目录：{path.name}（正在统计…）")
+                self.update_idletasks()
+            tab = self.nb.index(self.nb.select())
+            if tab == 3 and path.suffix.lower() != ".armored":
+                self.rt_src.set(str(path))
+                self.rt_out.set(str(path.with_name(path.name + "_protected.exe")))
+                return
+            if (tab == 2 and path.suffix.lower() != ".armored"):
                 self._set_kit_src(path)
                 return
             if path.suffix.lower() == ".armored":
@@ -724,6 +923,7 @@ pip install argon2-cffi cryptography
         self.status.set(f"已载入：{path.name} · {size}")
         self.log(self.enc_log, f"待加固：{path}")
         self.log(self.enc_log, f"  {size}；输出：{self.out_armored.get()}")
+        self._maybe_warn_large(path, size)
 
     def _set_armored(self, path: Path) -> None:
         self.armored.set(str(path))
@@ -732,12 +932,70 @@ pip install argon2-cffi cryptography
         self._do_inspect()
 
     @staticmethod
+    def _scan_dir(path: Path, limit: int = 2000):
+        """快速估算目录规模；超过 limit 个文件就停，避免全树扫描卡主线程。
+
+        返回 (文件数, 已统计字节数, 是否提前截断)。
+        """
+        count, total, truncated = 0, 0, False
+        for p in path.rglob("*"):
+            if not p.is_file():
+                continue
+            count += 1
+            if count > limit:
+                truncated = True
+                break
+            try:
+                total += p.stat().st_size
+            except OSError:
+                pass
+        return count, total, truncated
+
+    @staticmethod
     def _describe(path: Path) -> str:
         if path.is_file():
             return f"单文件 {path.stat().st_size:,} 字节"
-        files = [p for p in path.rglob("*") if p.is_file()]
-        total = sum(p.stat().st_size for p in files)
-        return f"目录 {len(files)} 个文件 / {total:,} 字节"
+        count, total, truncated = App._scan_dir(path)
+        if truncated:
+            return "目录 >2000 个文件（超大目录，已跳过精确统计）"
+        return f"目录 {count} 个文件 / {total:,} 字节"
+
+    def _open_out_dir(self) -> None:
+        """在资源管理器里定位输出文件；文件还没生成时打开它所在目录。"""
+        raw = self.out_armored.get()
+        if not raw:
+            messagebox.showinfo(APP_TITLE, "请先拖入或选择程序包，确定输出路径。")
+            return
+        out = Path(raw)
+        parent = out.parent
+        if not parent.exists():
+            messagebox.showwarning(APP_TITLE, f"输出目录还不存在：\n{parent}")
+            return
+        if os.name == "nt" and out.is_file():
+            subprocess.Popen(["explorer", f"/select,{out}"])
+        else:
+            self._open_path(parent)
+        self.status.set(f"输出位置：{out}")
+
+    def _maybe_warn_large(self, path: Path, size_text: str) -> None:
+        """拖入超大目录时明确告知耗时 / 内存风险与输出位置。"""
+        if path.is_file():
+            return
+        count, total, truncated = self._scan_dir(path)
+        if not (truncated or total >= 1024 ** 3 or count >= 5000):
+            return
+        message = (
+            f"检测到超大程序包：\n{path}\n\n"
+            f"规模：{size_text}\n\n"
+            "加固会把整个目录读入内存并构造多层容器，可能耗时数十分钟、"
+            "占用数 GB 内存，内存不足时任务会失败。\n"
+            "建议改用小目录，或先移走 build / 缓存 / 大压缩包再测试。\n\n"
+            f"输出文件将写到：\n{self.out_armored.get()}\n"
+            "点「打开输出目录」可随时定位。"
+        )
+        self.status.set(f"⚠ 大目录预警：{path.name}（输出见「打开输出目录」）")
+        self.log(self.enc_log, f"  ⚠ 大目录预警：{size_text}")
+        messagebox.showwarning(APP_TITLE, message)
 
     def _pick(self, folder: bool) -> None:
         path = filedialog.askdirectory() if folder else filedialog.askopenfilename()
