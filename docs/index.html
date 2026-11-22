@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TarpitCrypt · 加密后直接运行</title>
+<style>
+  body { max-width: 760px; margin: 3rem auto; padding: 0 1.2rem;
+         font-family: system-ui, "Microsoft YaHei", sans-serif;
+         color: #222; line-height: 1.7; }
+  h1 { color: #185FA5; }
+  code { background: #f2f4f7; padding: 2px 6px; border-radius: 4px; }
+  pre { background: #f2f4f7; padding: 14px; border-radius: 6px; overflow-x: auto; }
+  .warn { border-left: 4px solid #d97706; padding-left: 12px; color: #555; }
+</style>
+</head>
+<body>
+<h1>TarpitCrypt</h1>
+<p>把程序包加密成「双击即可运行」的单文件 exe。明文不长期留盘。</p>
+<p>本仓库已精简为纯本地工具，在线加密版已移除。本页仅作项目说明。</p>
+
+<h2>使用</h2>
+<pre>pip install argon2-cffi cryptography pyinstaller
+python armor/build_runner.py      # 构建一次通用启动器
+python armor/armor_gui.py         # 打开单页 GUI</pre>
+<p>GUI：拖入程序包 → 填两次口令 → 选启动器 → 生成加密 exe。
+分发只需这一个 exe；对方双击输口令即可运行原程序。</p>
+
+<h2>命令行</h2>
+<pre>python armor/runtime_pack.py build MyApp -o MyApp_protected.exe \
+  --password '你的口令' --runner armor/dist/RTPK_Runner.exe</pre>
+
+<h2>能力边界</h2>
+<p>静态读分发包拿不到原文件；无口令无法解密；退出后覆写擦除临时目录。
+运行时明文必进内存，无法阻止调试器 dump。不做免杀、注入、反沙箱。</p>
+<p class="warn">仅用于加固你自己拥有或已获授权的程序包。</p>
+
+<p><a href="https://github.com/Velestia-star/TarpitCrypt">GitHub 仓库</a></p>
+</body>
+</html>
