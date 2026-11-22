@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import io
+import os
 import py_compile
 import sys
 import tempfile
@@ -111,6 +112,23 @@ def test_drop() -> None:
           "EnumChildWindows" in src and "def refresh(" in src)
     check("拖放消息只入队列不碰 Tcl",
           "_queue.put" in src and "after" not in src)
+    check("WNDPROC 以整数地址注册（防 ArgumentError）",
+          "ctypes.cast(self._proc_ref" in src
+          and "GWL_WNDPROC, self._proc_addr" in src)
+
+    if os.name == "nt":
+        try:
+            import tkinter as tk
+            from drop_target import NativeDrop
+            root = tk.Tk(); root.withdraw(); root.update()
+            drop = NativeDrop(root, lambda _p: None)
+            check("NativeDrop 实例化成功", drop.ok, drop.error)
+            if drop.ok:
+                drop.refresh()  # 复现旧 bug 的调用路径
+                check("refresh 重复调用不抛异常", True)
+            root.destroy()
+        except Exception as exc:
+            check("NativeDrop 实例化成功", False, str(exc))
 
 
 def main() -> int:

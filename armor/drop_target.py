@@ -50,6 +50,7 @@ class NativeDrop:
                 wintypes.LPARAM, wintypes.HWND, wintypes.UINT,
                 wintypes.WPARAM, wintypes.LPARAM)
             self._proc_ref = self._WNDPROC(self._wndproc)
+            self._proc_addr = ctypes.cast(self._proc_ref, ctypes.c_void_p).value or 0
             self.refresh()
             if not self._old:
                 raise OSError("窗口树为空")
@@ -72,6 +73,7 @@ class NativeDrop:
                             or u.SetWindowLongW)
         self._setwndlong.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t]
         self._setwndlong.restype = ctypes.c_ssize_t
+        self._proc_addr = 0  # WNDPROC 的整数地址，SetWindowLongPtr 只收整数
         u.CallWindowProcW.argtypes = [ctypes.c_ssize_t, wintypes.HWND,
                                       wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
         u.CallWindowProcW.restype = wintypes.LPARAM
@@ -103,7 +105,7 @@ class NativeDrop:
         for hwnd in self._all_hwnds():
             if hwnd in self._old:
                 continue
-            old = self._setwndlong(hwnd, GWL_WNDPROC, self._proc_ref)
+            old = self._setwndlong(hwnd, GWL_WNDPROC, self._proc_addr)
             if not old:
                 continue
             self._old[hwnd] = old
