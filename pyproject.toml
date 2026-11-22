@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tarpitcrypt"
-version = "0.3.17"
-description = "反 AI 逆向整活：用信息污染让逆向 agent 反复做无用功"
+version = "0.4.0"
+description = "把程序包加密成双击即可运行的单文件 exe，明文不长期留盘"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -15,35 +15,19 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "ruff>=0.6"]
-desktop = ["pywebview>=6.0"]
+dev = ["pytest>=8.0"]
 build = ["pyinstaller>=6.0"]
 
 [project.urls]
-Homepage = "https://Velestia-star.github.io/TarpitCrypt/"
 Repository = "https://github.com/Velestia-star/TarpitCrypt"
-Changelog = "https://github.com/Velestia-star/TarpitCrypt/blob/main/CHANGELOG.md"
-Issues = "https://github.com/Velestia-star/TarpitCrypt/issues"
 
 [project.scripts]
-tarpitcrypt = "tarpitcrypt:main"
-tarpitcrypt-web = "tarpitcrypt_server:main"
-tarpitcrypt-desktop = "desktop_web:main"
+tarpitcrypt = "armor.runtime_pack:cli_main"
 tarpitcrypt-armor = "armor.armor_gui:main"
 
-[tool.setuptools]
-py-modules = ["tarpitcrypt", "tarpitcrypt_server", "desktop_web"]
-
 [tool.setuptools.packages.find]
-include = ["armor*", "docs*"]
-
-# docs/ 是 GitHub Pages 发布源，同时也是 tarpitcrypt-web / tarpitcrypt-desktop
-# 的本地前端。pip 安装后 server 会在 site-packages/docs 下找 index.html，
-# 缺了这些静态资源 web 入口会直接报「找不到本地前端」。
-[tool.setuptools.package-data]
-"docs" = ["*", "vendor/*", ".nojekyll"]
+include = ["armor*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
-markers = ["browser: 需要本机 Edge/Chrome 的端到端兼容性测试"]

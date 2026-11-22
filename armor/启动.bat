@@ -13,7 +13,7 @@ rem ============================================================
 set "PY="
 set "PYW="
 set "FIRST="
-set "PRECHECK=import os,sys;sys.path.insert(0,os.getcwd());import tkinter,argon2,cryptography,armor_core,decoy_kit,armor_gui"
+set "PRECHECK=import os,sys;sys.path.insert(0,os.getcwd());import tkinter,argon2,cryptography,runtime_pack,drop_target,armor_gui"
 
 call :TRY "%TARPITCRYPT_PYTHON%"
 call :TRY "%~dp0python.exe"

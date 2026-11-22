@@ -73,6 +73,25 @@ MAX_PACKAGE_BYTES = 512 * 1024 * 1024  # 内存打包上限，防止单包吃光
 Progress = Callable[[int, int, str], None]
 
 
+def check_password(password: str) -> tuple[bool, str]:
+    """GUI 用的最低强度体检（本地静态检查，不联网、不记录口令）。"""
+    if not password:
+        return False, "口令不能为空"
+    if len(password) < 8:
+        return False, "至少 8 个字符"
+    classes = sum((
+        any(c.islower() for c in password),
+        any(c.isupper() for c in password),
+        any(c.isdigit() for c in password),
+        any(not c.isalnum() for c in password),
+    ))
+    if classes < 2:
+        return False, "建议混用大小写、数字或符号中的至少两类"
+    if password.lower() in {"password", "12345678", "qwertyui", "admin123"}:
+        return False, "这是常见弱口令，换一个"
+    return True, "长度与字符种类达标（不等于高熵，长口令更可靠）"
+
+
 class RuntimePackError(Exception):
     """运行时加固过程中的可预期错误。"""
 
@@ -466,9 +485,14 @@ def _cli(argv: list[str] | None = None) -> int:
     return 0
 
 
-if __name__ == "__main__":
+def cli_main() -> int:
+    """控制台脚本入口（pyproject 的 tarpitcrypt 命令）。"""
     try:
-        raise SystemExit(_cli())
+        return _cli()
     except RuntimePackError as exc:
         print(f"错误：{exc}", file=sys.stderr)
-        raise SystemExit(2)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(cli_main())

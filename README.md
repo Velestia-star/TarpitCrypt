@@ -1,610 +1,107 @@
 # TarpitCrypt
 
-**🌐 在线版（打开即用）→ [Velestia-star.github.io/TarpitCrypt](https://Velestia-star.github.io/TarpitCrypt/)**
-—— 拖文件进去就能加解密，运算全在你自己浏览器里，文件不上传。
+**把程序包加密成「双击即可运行」的单文件 exe。**
 
-> 不是让数据「解不开」，而是让**逆向方判断不了自己是不是找对了**。
-
-TarpitCrypt 是一个**反 AI 逆向的整活项目**。底层是一个本地文件加密工具：
-把单次口令猜测的成本钉死在文件头里，每猜一次都要完整执行
-`rounds × Argon2id(mem, time, para)`。在此之上，`armor/` 提供图形化加固层，
-往逆向链路里投放大量「看起来合理、实际走不通」的线索——诱饵层、死层、
-互相矛盾的规格文档、能运行但常量全错的解析器。AI 会反复生成假设、写脚本
-验证、推翻重来，每一轮都烧掉上下文和 token。破解者付的不再是电费，是推理
-成本；越想一次性看懂，亏得越多。
-
-**边界**：只做信息误导，不执行、不注入、不联网、不接触第三方系统。输出是
-容器文件，原程序零改动、用前先还原。**仅用于加固你自己拥有的程序包。**
-
-> 护城河怎么来的、针对哪些真实 AI 逆向工具、利用了它们的哪些盲区，见
-> [`armor/` 威胁模型](docs/AI_RE_THREATMODEL.md)；效果量化与待办（含真实
-> agent 实测）见 [`docs/AGENT_BENCHMARK.md`](docs/AGENT_BENCHMARK.md)；
-> 整活路线与「为什么不是把 Argon2 调到无限」见
-> [`docs/ROADMAP.md`](docs/ROADMAP.md)。
-
----
-
-## 版本说明
-
-| 层面 | 当前值 | 说明 |
-| --- | --- | --- |
-| 发布版本 | **v0.3.17** | 修复拖放导致 GUI 闪退（窗口过程内重入 Tcl 的 GIL 致命错误）；并含 v0.3.16 的原生拖放修复与批量拖入，见 [CHANGELOG.md](CHANGELOG.md) |
-| v1 文件格式 | `VERSION = 1`，`MAGIC = TARPITCR` | `.tarpit` 文件，格式冻结 |
-| armor 容器格式 | `VERSION = 3`，`MAGIC = TPARMOR3` | `.armored` 文件；v2 / v0.3.0 容器仍可读 |
-| Python 包元数据 | `0.3.17` | `pyproject.toml` |
-
-两层格式互不依赖：`armor/` 只复用 v1 的 Argon2id 与 AES-256-GCM 原语，
-**v1 文件格式一个字节没改**。
-
-想直接上手用界面：看 [`armor/README.md`](armor/README.md)，Windows 双击
-`armor/启动.bat` 即可拖入加固。想看命令行加密器，继续往下读。
+明文不长期留盘：双击 → 输口令 → 内存解密 → 临时目录运行 → 退出后覆写擦除。
+逆向者从分发包里读不到任何原文件字节。
 
 ---
 
 ## 快速开始
 
-```bash
-pip install argon2-cffi cryptography
-
-# 加密（默认只需要一个口令）
-python tarpitcrypt.py encrypt notes.pdf notes.pdf.tarpit
-# 解密
-python tarpitcrypt.py decrypt notes.pdf.tarpit notes.pdf
-# 看文件头（不需要口令）
-python tarpitcrypt.py info notes.pdf.tarpit
-```
-
-口令通过交互式 `getpass` 输入，或从 stdin 读（`--password-stdin`），
-**永远不作为命令行参数**——那样会被 `ps` / 命令行历史记下来。
-
-默认流程只问一个口令。`--keyfile` 和 `--decoy` 都是**可选**的高级 / 兼容项；
-不写它们，程序不会要求任何额外秘密。想让 AI 逆向更难受，用 `armor/`
-的多层容器——同样只需要一个主口令。默认档不会碰到单次工作预算或 1 GiB
-内存上限；自定义到超过 16 GiB·轮 / 1 GiB 内存时需要 `--allow-heavy`。
-
-### 可选：加一个 keyfile
+### 1. 装依赖
 
 ```bash
-python tarpitcrypt.py keygen my.key           # 生成 64 字节 keyfile
-python tarpitcrypt.py encrypt big.iso big.tarpit --keyfile my.key
-python tarpitcrypt.py decrypt big.tarpit big.iso --keyfile my.key
+python -m pip install argon2-cffi cryptography pyinstaller
 ```
 
-keyfile 丢了 = 数据没了。请离线备份（U 盘 / 纸）。别把它和密文放同一个目录。
-
-### 输出文件与输入边界
-
-- 默认**不覆盖**已存在的输出文件；确认覆盖请加 `--force`。
-- 输入与输出是同一个文件、或输出路径就是 keyfile 时直接拒绝——这两处
-  覆盖一次就可能同时弄丢密文和密钥。
-- 输出先写同目录临时文件、`fsync` 后再原子替换；中途失败不会留下半截文件，
-  也不会把已有文件先截断。新文件在 POSIX 上权限为 `0600`，覆盖时沿用旧权限。
-- 加密口令不能为空；`keyfile` 不能是空文件，也不能超过 1 MiB。旧版会把
-  0 字节 keyfile 静默当成「没启用 keyfile」，现在直接报错。
-- 解密仍接受空口令，历史上用空口令加密的文件还能打开。
-
-### 可选：加一个诱饵层（v1 兼容层）
+### 2. 构建通用启动器（只做一次）
 
 ```bash
-python tarpitcrypt.py encrypt real.txt out.tarpit --decoy fake.txt
+python armor/build_runner.py          # → armor/dist/RTPK_Runner.exe（约 14 MB）
 ```
 
-同一个文件有两个有效口令：主口令解出 `real.txt`，诱饵口令解出 `fake.txt`。
-解密时命中诱饵层，进程退出码是 **2**（见下方退出码表）。
+### 3. 生成加密 exe
 
-代价：本工具的 `decrypt()` 命中诱饵层前会做两次派生，所以**合法用户会变慢**；
-但这不等于攻击者成本翻倍——他只攻主层就能判定一个候选口令失败，不必碰诱饵段。
-详见下文「什么情况下不安全」。
-
-v1 的诱饵层是**可见的**（文件头有 `FLAGS.bit2`，命中还会返回 `is_decoy`），
-它给的是「一个备用口令」，可否认性为零，不是反 AI 主力。想让 AI 判断不了
-自己是否拿到了真数据，用 [`armor/` 的多层容器](armor/README.md)——同样只需要
-一个主口令，层号与真伪都不会回给还原方。
-
-### 用 AI 生成的参数
+GUI 方式（推荐）：
 
 ```bash
-python tarpitcrypt.py ai-config params.json     # 先校验，看哪些被丢弃
-python tarpitcrypt.py encrypt a.txt a.tarpit --ai-config params.json
+python armor/armor_gui.py
 ```
 
-AI 只允许输出下面这些键与值，其他一律丢弃并记 warning——
-**AI 永远碰不到口令、密钥、keyfile 的内容，它只产出 JSON 旋钮**：
+单页界面：把程序包（文件或文件夹）拖进去 → 填两次口令 → 选启动器 → 点「生成加密 exe」。
 
-| 键 | 白名单 |
-|---|---|
-| `mem` | 262144 / 524288 / 1048576 / 2097152（KiB；2 GiB 档需要 `--allow-heavy`） |
-| `time` | 3 / 4 / 5 |
-| `para` | 2 / 4 / 6 |
-| `rounds` | 2 / 3 / 4 |
-| `pow` | 0 / 16 / 18 / 20 |
-| `cipher` | `xchacha20-poly1305` / `aes-256-gcm` |
-
----
-
-## 在线版（GitHub Pages，纯前端）
-
-把 `docs/` 目录发布成 GitHub Pages 后，可以直接在浏览器里用：
-
-```
-https://Velestia-star.github.io/TarpitCrypt/
-```
-
-**首次启用**：仓库 → Settings → Pages → Source 选 `Deploy from a branch` →
-Branch 选 `main`、目录选 `/docs` → Save。之后每次推送自动更新。
-
-和本地网页版的关键区别：**这里没有服务器**。Argon2id 由 `hash-wasm` 编译成
-WASM 在浏览器里跑，AEAD 用浏览器原生 WebCrypto，文件一个字节都不会上传。
-
-### 与命令行版完全兼容
-
-网页版产出的 `.tarpit` 和 `tarpitcrypt.py` 产出的**逐字节同格式**，
-两边可以互相解开。这不是口号，是有一条专门的双向测试盯着的：
-
-```bash
-python -m pytest tests -k browser      # 需要本机装有 Edge/Chrome
-```
-
-它做的事：Python 造一份密文嵌进页面 → 无头浏览器解开它、再造一份吐回字节 →
-Python 再解开浏览器造的那份，顺带校验浏览器打的 zip。任何一边改了 KDF、
-AAD 或字段顺序，这条测试立刻变红。
-
-浏览器版的额外限制（和 CLI 版不同）：
-
-- **只有 AES-256-GCM**。WebCrypto 没有 XChaCha20-Poly1305，这不是偷懒，
-  是浏览器确实不提供。
-- 强度预设上限压到 **1 GiB**：WASM 在部分设备/移动端分配不到更大的线性内存。
-- 跑 Argon2 期间页面会卡住几秒（主线程被 WASM 占满）。这是故意的等待，
-  不是卡死；界面上有提示。
-- PoW 的 SHA-256 按批提交（每批 256 个），比逐个 `await` 快约 3 倍
-  （本机 WebCrypto 实测，浏览器数字会有差异）；pow=16 大约一两秒，
-  pow=20 仍可能几十秒，期间会显示已试次数。
-- 依赖 `docs/vendor/argon2.umd.min.js`（hash-wasm 4.12.0，MIT，已 vendor
-  进仓库，不从 CDN 加载——加密工具不该有运行时供应链依赖）。
-
-
-
-## 本地网页版（拖拽即用）
-
-不想碰命令行就用这个。零额外依赖，标准库起服务，**启动后会自动打开浏览器**：
-
-```bash
-python tarpitcrypt_server.py
-# → 自动打开 http://127.0.0.1:8765
-# 不想自动开：python tarpitcrypt_server.py --no-open
-```
-
-本地版不再维护一份单独的页面，而是直接复用 `docs/` 这套在线前端：
-同一套界面、同一个口令提示，只是把加密 / 解密请求交给本机 Python 进程，
-所以浏览器主线程不会被 Argon2 卡住。
-
-打开后：**把文件或整个文件夹拖进去** → 输口令 → 点「加密并下载」，
-浏览器直接落一个 `.tarpit` 文件。切到「解密」标签，拖回 `.tarpit` 就能解出来。
-
-- 文件夹会被打包成一个 `.tarpit`；解开后是一个 `.zip`（保留目录结构）。
-- 主表单只需要口令；keyfile / PoW / 诱饵层都在「高级」里，默认不用动。
-- 拖入文件夹后，界面上每条文件都带相对路径，能看出结构对不对。
-- **结果会在服务端另存一份**到项目目录下的 `存放文件/`（首次启动自动创建，
-  `--out-dir` 可改），完成页给出完整路径和「打开所在目录」按钮——点了会弹出
-  系统文件管理器并选中那个文件。同名结果自动加序号，不会覆盖前一份。
-  文件名里的引号 / 换行 / 控制字符会被清洗后再写响应头。
-  这个按钮只认服务端自己登记的随机令牌，客户端传任意路径一律 404，不会变成
-  「打开任意文件」的入口。服务重启后旧令牌失效。
-- 用默认端口 `8765` 时，浏览器关闭再打开，工作区和历史记录会保留（同一
-  origin 的 IndexedDB / localStorage）；换 `--port` 相当于换 origin，之前
-  的本地记录不会跟着走。历史只保留记录，不保留本地文件句柄。
-
-安全边界（务必知道）：
-
-- 只监听 `127.0.0.1`，并校验 `Origin`，拒绝来自其他站点的跨源提交。
-  `--host` 非回环地址默认拒绝启动，确需局域网访问必须显式 `--allow-remote`。
-- 口令随请求体走**本机回环 HTTP**，不落盘、不进日志、不设 cookie。
-  它只在这台机器的内存里存在几秒——但确实存在过。
-- Argon2id 是 GiB 级内存硬函数，服务端用一把全局锁把派生过程串行化，
-  避免你同时点两次直接把机器 OOM。代价是并发请求要排队。
-- 单次请求上限 512 MB（明文、密文都要在内存里过一遍）；负数 / 非法
-  `Content-Length` 直接 400，不会让线程一直等连接。
-- 网页版不替代 CLI：批量、脚本化、离线环境还是用 `tarpitcrypt.py`。
-
-### 本地 Web 的 armor 面板
-
-本地版页面底部有「加固 / 还原 / 伴生诱饵 / 运行报告」四个页签，只有本机 Web 会显示，在线版不显示：
-
-- **加固**：拖入程序包（文件或文件夹）→ 主口令 → 层数 / 强度 / 伴生诱饵 /
-  投毒侧重 / 拟态风格 / 注入强度 → 开始加固。
-- **还原**：拖入 `.armored` + 口令 → 下载还原 zip；可以先「查看摘要」，
-  也可以勾选「并行尝试各层」。
-- **伴生诱饵**：不先加固也能单独生成伴生包；可附一个已有 `.armored` 让
-  规格草稿引用真实容器，支持风格 / 层数 / 投毒 / 注入。
-- **运行报告**：本次服务会话的加固 / 还原 / 伴生统计，支持导出 CSV /
-  Markdown；不记录口令，不写进容器。
-- **输出子目录**：四个页签共用，填 `2026-11-08` 这类相对路径即可把结果
-  放进 `存放文件/2026-11-08/`；不允许 `..` 或绝对路径。
-- 计算在后台单独 worker 里串行执行；页面有进度条和运行日志，不会卡浏览器。
-- 结果保存到 `存放文件/`：`.armored`、伴生目录、伴生包 zip、还原 zip；
-  同名自动加序号，不覆盖。页面提供下载和「打开所在目录」。
-
-给脚本用的接口：
-
-| 方法 | 路径 | 作用 |
-|---|---|---|
-| `GET` | `/api/armor/profiles` | 可选层数 / 强度 / 投毒侧重 / 拟态风格 |
-| `POST` | `/api/armor/pack` | 上传源包，提交加固任务，返回 `job` |
-| `POST` | `/api/armor/sidecar` | 独立生成伴生诱饵，返回 `job` |
-| `GET` | `/api/armor/jobs/<id>` | 查询进度 / 结果 / 错误 |
-| `POST` | `/api/armor/restore` | 上传 `.armored` + 口令，提交还原任务 |
-| `POST` | `/api/armor/inspect` | 只读容器摘要，不需要口令 |
-| `GET` | `/api/armor/report` | 本次会话的运行报告 |
-| `POST` | `/api/armor/report/clear` | 清空本次会话报告 |
-| `GET` | `/api/artifacts/<token>` | 按令牌下载登记过的产出物 |
-
-## 桌面 WebView 壳（P5，可选）
-
-不想开浏览器、又想要 Web 的界面，可以装一个可选的桌面壳：
-
-```bash
-python -m pip install -r requirements-desktop.txt
-python desktop_web.py
-# 或者双击 启动桌面版.cmd
-```
-
-它用 pywebview/WebView2 打开同一个 `docs/` 页面，但套在原生窗口里：
-
-- 不显示浏览器地址栏；本地服务固定监听 `127.0.0.1:8766`（`--port` 可改，
-  但换端口会换一套持久化空间）。
-- 桌面壳使用 `private_mode=False` + 固定存储目录；**工作区的文件字节和
-  加密结果会跨启动保留**，历史列表也会保留。
-- 历史只保存记录元数据；浏览器安全模型不允许跨重启保留本地源文件句柄，
-  所以历史里双击旧记录仍可能提示“页面刷新过”。生成的结果文件本身还在
-  `存放文件/`，不会消失。
-- 页面里多出「本机文件 / 本机文件夹 / 本机输出目录」按钮，直接调系统
-  文件对话框，不再经过浏览器上传。
-- 桌面壳使用随机令牌开启「本机路径模式」；普通 `tarpitcrypt_server.py`
-  永远不开启，仍然只允许往 `存放文件/` 写。
-- 原生对话框选中的路径可以用于加固、伴生、还原和摘要；输出目录也可以
-  直接选任意本地目录。
-- 没有装 pywebview 时会明确提示；原来的 `python armor/armor_gui.py`
-  仍然保留，作为不依赖浏览器的 fallback。
-
-### 单文件 exe 打包
-
-需要 Windows + Python 3.11+：
-
-```powershell
-python -m pip install -r requirements-desktop.txt
-python -m pip install pyinstaller
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build_exe.ps1
-# 或双击 构建单文件exe.cmd
-```
-
-输出：`dist\TarpitCrypt.exe`（约 19 MB），同目录会附带 `使用教程.txt`。
-
-- 构建脚本会自动下载 WebView2 Evergreen Bootstrapper 并打进 exe；第一次在
-  缺 WebView2 的机器上启动时会尝试静默安装。
-- 不想附带安装器：`scripts/build_exe.ps1 -NoWebView2Bundle`；缺运行时会
-  弹出下载地址。
-- 单文件模式第一次启动会解压到临时目录，所以比直接跑 Python 慢几秒；
-  Windows Defender 偶尔会误报未签名 exe。
-- 构建后可用 `dist\TarpitCrypt.exe --self-test` 验证冻结环境里的
-  tarpitcrypt / armor 依赖，退出码 0 表示通过。
-
-完整使用步骤、持久化规则、四种入口（在线版 / 本地 Web / 桌面 exe / GUI）
-和常见问题见 [使用教程.txt](使用教程.txt)。
-
----
-
-## 运行时加固：加密后直接运行（armor/runtime_pack.py）
-
-`armor/` 的 `加固` 页产出 `.armored` 容器，**必须先还原到磁盘**才能使用。
-`运行时加固` 页是另一条路线：把整个程序包加密后塞进一个 exe 尾部，双击即可运行。
-
-### 怎么用
-
-1. 先构建一次通用启动器（只需一次，产物约 14 MB）：
-
-   ```bash
-   python armor/build_runner.py          # → armor/dist/RTPK_Runner.exe
-   ```
-
-2. GUI 打开 `运行时加固` 页 → 选择程序包（文件或文件夹）→ 填两次运行口令 →
-   “启动器”选中 `RTPK_Runner.exe` → 点 `生成加密 exe`。
-   每个包只是把加密数据追加到通用启动器尾部，**秒级完成，无需重新 PyInstaller**。
-
-3. 分发时只给对方这个 exe。双击 → 输入口令 → 解密到临时目录 →
-   启动原程序 → 退出后覆写擦除临时目录。
-
-命令行等价：
+命令行方式：
 
 ```bash
 python armor/runtime_pack.py build MyApp -o MyApp_protected.exe \
-    --password '...' --profile 中 --runner armor/dist/RTPK_Runner.exe
-python armor/runtime_pack.py inspect MyApp_protected.exe
+    --password '你的口令' --profile 中 --runner armor/dist/RTPK_Runner.exe
+python armor/runtime_pack.py inspect MyApp_protected.exe    # 查看包信息，不解密
 ```
 
-### 它做到什么、做不到什么（务必读完）
+每个程序包只是把加密数据追加到通用启动器尾部，**秒级完成，无需重新 PyInstaller**。
+
+### 4. 分发与运行
+
+只分发 `MyApp_protected.exe`。对方双击 → 输入口令 → 原程序照常运行 →
+退出后临时目录被覆写擦除。
+
+---
+
+## 能力边界（务必读完）
 
 | 能力 | 状态 |
 |---|---|
-| 静态拿到分发 exe 读不出任何原文件字节 | 做到（密文 + AES-GCM 认证） |
-| 没有口令无法运行 / 无法解出原文 | 做到（Argon2id 派生 + 认证标签） |
+| 静态拿到分发 exe 读不出原文件字节 | 做到（AES-256-GCM 认证加密） |
+| 无口令无法运行 / 解出原文 | 做到（Argon2id 派生 + 认证标签） |
 | 磁盘上不长期留明文 | 做到（临时目录运行，退出覆写擦除） |
 | 篡改 exe 尾部数据被检出 | 做到（CRC32 + AEAD 双重校验） |
 | 路径穿越（Zip Slip） | 做到（解压前拒绝绝对路径 / `..`） |
-| **运行中阻止调试器 dump 内存** | **做不到**。明文必然在内存出现，任何加壳都挡不住有权限的调试器 |
+| **运行中阻止调试器 dump 内存** | **做不到**。明文必然在内存出现 |
 | **阻止屏幕录制 / 键盘记录 / 已失陷主机** | **做不到** |
-| **反杀软检测 / 免杀 / 注入第三方进程 / 反沙箱** | **明确不做**，本工具不触碰这类能力 |
+| **反杀软检测 / 免杀 / 注入第三方 / 反沙箱** | **明确不做** |
 
-免密模式（`--no-password` / GUI 单选“免密”）把固定密钥写进工具源码，等价于
-**混淆壳**，挡不住任何定向逆向，仅供演示，不要在真实分发里使用。
+免密模式（`--no-password`）把固定密钥写进工具源码，等价于**混淆壳**，挡不住
+定向逆向，仅供演示，不要在真实分发里使用。
 
-SSD 的磨损均衡会让“覆写擦除”不保证物理层不可恢复；这里做到的程度是
-“同机上普通文件恢复工具读不到”。另有 `RTPK_DEBUG=1` 可保留临时目录供调试，
-`RTPK_PASSWORD` 可预填口令供自动化测试——两者都不会写进分发包。
+SSD 磨损均衡会让覆写不保证物理层不可恢复；这里做到的是「同机上普通文件恢复
+工具读不到」。`RTPK_DEBUG=1` 可保留临时目录供调试，`RTPK_PASSWORD` 可预填口令
+供自动化测试——两者都不写进分发包。
 
-格式 `RTPK v1` 与尾部 footer 布局见 `armor/runtime_pack.py` 模块文档。
-自测含 7 项运行时加固回归（R12~R18）：`python armor/selftest.py`。
-
----
-
-## 单次猜测到底有多贵（本机实测）
-
-| 参数 | 单次尝试耗时 |
-|---|---|
-| mem=256 MiB, time=3, para=2, rounds=2 | **0.95 s** |
-| mem=1 GiB, time=3, para=4, rounds=2 | **3.20 s** |
-| mem=1 GiB, time=4, para=4, rounds=3 | **5.86 s** |
-
-> **这些数字是特定机器上的一次观测，不是性能承诺。** 另一台机器实测同一档
-> 为 0.47 s。硬件、Python 与 `argon2-cffi` 版本都会影响结果；要复现请用
-> 同一份脚本在同一台机器上重跑，别拿表里的秒数当安全保证。
-
-启用诱饵层时，**本工具自带的 `decrypt()` 会做两次 `_derive`**，但这不等于
-「破解成本 ×2」：攻击者只攻主层就能判定一个候选口令失败，根本不需要碰诱饵
-段。变慢的是合法用户，不是攻击者。早期版本写过 ×2 的说法，已更正。
-
-口径说明：这里的「一次尝试」= 跑完 `_derive` 得到主密钥并完成一次认证。
-Argon2id 是内存硬函数，GPU/ASIC 的并行优势被内存带宽卡死，所以这些秒数
-**不能靠堆显卡压下去**，只能靠堆内存压——而内存是有货币成本的。
-
-> 一个 8 位随机口令大约 2×10¹⁴ 种组合。按 3.2 s/次计，穷举完需要
-> 约 2000 万年。这就是「焦油坑」的全部含义。
+仅用于加固你自己拥有或已获授权的程序包。
 
 ---
 
-## 文件格式（VERSION = 1）
+## 格式
 
-所有整数字段大端（`>`）。
+`RTPK v1`，详见 `armor/runtime_pack.py` 模块文档。
 
-| 字段 | 长度 | 说明 |
-|---|---|---|
-| `MAGIC` | 8 | `b"TARPITCR"` |
-| `VERSION` | 1 | `1` |
-| `FLAGS` | 1 | bit0=POW, bit1=KEYFILE, bit2=DECOY |
-| `KDF参数` | 8 | `>IHBB` → mem(KiB,u32) \| time(u16) \| para(u8) \| rounds(u8) |
-| `POW_DIFF` | 1 | 前导零比特数，取值 {0,16,18,20} |
-| `SALT` | 32 | 每次加密重新生成 |
-| `NONCE` | 24 | 每次加密重新生成（AES-GCM 取前 12 字节） |
-| `POW_NONCE` | 8 | PoW 解 |
-| `CT_LEN` | 8 | 密文长度 |
-| `CT` | `CT_LEN` | 密文（含 16 字节认证标签） |
-| `DECOY_NONCE` | 24 | 仅 DECOY 置位时 |
-| `DECOY_LEN` | 8 | 仅 DECOY 置位时 |
-| `DECOY_CT` | `DECOY_LEN` | 仅 DECOY 置位时 |
+```
+MAGIC(8)=b"RTPK0001" | VERSION(1) | FLAGS(1) | MEM(4) | TIME(1) | PARA(1)
+SALT(16) | NONCE(12) | PAYLOAD_LEN(8) | MANIFEST_LEN(4)
+MANIFEST(json) | CIPHERTEXT | TAG(16)
+```
 
-头部长 **91 字节**。
+单文件 exe 布局：`[runner.exe][RTPK 包][FOOTER]`。
+FOOTER = `MAGIC(8)=b"RTPKEND1" | PACK_OFFSET(8) | PACK_LEN(8) | CRC32(8) | RESERVED(8)`。
+PE loader 忽略 overlay 之后的数据，追加不影响 exe 执行。
 
-**AAD 绑定**：主层 AAD = 整段文件头；诱饵层 AAD = `文件头 ‖ DECOY_NONCE ‖ DECOY_LEN`。
-这意味着文件头里任何一个比特被改动，认证都会失败——两段密文也换不了位置。
+## 自测
 
----
-
-## 为什么安全
-
-- **密钥**：口令与 keyfile 摘要经 HKDF-SHA256 合成为 Argon2id 的输入，
-  串行跑 `rounds` 轮，得到 32 字节主密钥。
-- **机密性 + 完整性**：AES-256-GCM（或 XChaCha20-Poly1305，若运行库提供），
-  16 字节认证标签，密文与文件头都在 AAD 保护下。
-  默认用 AES-256-GCM——因为截至 `cryptography` 50.x 它并没有提供
-  XChaCha20-Poly1305；选 `--cipher xchacha20-poly1305` 时会**告警并降级**
-  到 AES-256-GCM，而不是让程序崩溃。等上游提供该算法，探测会自动启用。
-- **随机性**：SALT / NONCE / keyfile / PoW 起点全部来自 `secrets`（操作系统 CSPRNG）。
-- **没有自创密码学**：只用 `cryptography` 提供的 AEAD / HKDF，以及
-  `argon2-cffi` 的 Argon2id。口令与 keyfile 用 HKDF-SHA256 预哈希合成，
-  这是标准的组合方式，不是自研 KDF。
-- **文件头先校验后使用**：`mem` / `time` / `para` / `rounds` / `POW_DIFF`
-  全部先过区间检查；`CT_LEN` / `DECOY_LEN` 再检查「至少装得下 16 字节认证
-  标签」并与文件实际长度对齐。截断、尾部残留、`FLAGS.POW` 与 `POW_DIFF`
-  不一致的畸形文件在进入 Argon2 之前就失败，不会为明显坏掉的文件付一次
-  完整 KDF，`info` 也不会再打印自相矛盾的元数据。
-- **单次工作预算**：解密前还会检查文件头里的 `mem × time × rounds`，默认上限
-  **16 GiB·轮**（覆盖最重的官方预设 12 GiB·轮并留约 33% 余量）。超过就拒绝，
-  需要 `--allow-heavy` 显式放行；`info` 会显示 `work_kib_rounds` 与
-  `work_over_default`。这样 91 字节的畸形文件没法让解密端按
-  `2 GiB / time=10 / rounds=8` 跑满一次 Argon2。
-- **默认内存上限**：`mem` 默认不超过 **1 GiB**（覆盖全部官方预设）。像
-  `2 GiB / time=1 / rounds=1` 这种工作量在预算内、但一次要分配 2 GiB 的文件，
-  会在分配前被拒；确需更大内存用 `--allow-heavy`。`info` 会显示
-  `mem_over_default`。
-- **KDF 资源失败可读**：Argon2 抛 `MemoryError` / `HashingError` 时统一转成
-  `EnvironmentSetupError`，CLI 返回退出码 4，不再打 traceback。
-
-## 什么情况下不安全（请务必读）
-
-1. **口令熵低就全盘皆输。** Argon2 只是把每次尝试变贵，不能把弱口令变强。
-   4 位数字 PIN 在 3 秒/次下也只需几小时。用长口令或高熵口令。CLI 和网页会
-   做一次弱口令提示（长度、字符种类、常见弱口令），但只警告不阻止——它不能
-   替代你自己对熵的判断。
-   armor 的 `build_armored()` 默认强制口令体检（可用 `strict=False` 关闭，
-   仅测试用），GUI 里跳过警告需要显式确认。
-1. **容器是自包含的，可以无限次离线爆破。** 没有在线限流、没有锁定计数。
-   本机实测默认「轻」档单次派生约 50 ms（32 MiB / 2 轮），约 19 次尝试/秒；
-   弱口令撑不住几分钟。要更强的抵抗就选「中」/「狠」档，代价是每次还原更慢。
-2. **keyfile 和密文放在一起等于没有 keyfile**，只是把风险换了个位置。
-3. **文件头是明文元数据**：别人能看出你用了多大内存、有没有诱饵层、密文多长。
-   这是为「可迁移」付出的代价，VERSION 就是为将来换格式留的口子。
-4. **PoW 不增加破解成本。** `POW_NONCE` 就写在文件里，验证只需一次 SHA-256。
-   它防控的是「批量低成本造文件」，不是「猜口令」；而且校验发生在
-   `_derive` **之后**，Argon2 的钱已经付完，所谓「错误口令的快速拒绝路径」
-   省下的只是一次 AEAD，占比可以忽略。真正的成本杠杆是
-   `memory_cost × time_cost × rounds`。任何声称 PoW 能拖慢离线破解的说法都不可信。
-5. **v1 的诱饵层存在是可见的**（FLAGS.bit2 + DECOY_LEN 明文），命中时还会
-   返回 `is_decoy=True`、退出码 2 并写出诱饵明文。它给的是「一个备用口令」，
-   **可否认性为零**，也不额外增加攻击者的固定成本。想要「不标记真伪」的
-   效果请用 `armor/` 的 v3 容器，两者的设计目标不同。
-6. **本工具不防内存取证、不防键盘记录、不防已失陷的主机。** 解密时明文与口令
-   一定在内存里出现过。
-7. **没有密钥托管。** 口令 + keyfile 丢任何一个，数据永久不可恢复。
-8. **v3 的主口令是唯一真凭据，诱导层不是加密强度。** 一旦口令泄露、被社工、
-   或直接被爆破出来，攻击者第一轮就能解开真层，所有诱饵层 / 死层 / 内容层
-   陷阱**完全绕过**。它们增加的是「不知道口令」时的搜索与判断成本，
-   **不增加口令本身的熵**。不要把诱导层当成第二道密码学屏障。
-9. **真层解开后是明文 zip，没有二次保护。** 容器格式 `VERSION = 3` 已冻结，
-   为了保持旧容器可读，没有在真层内部再套一层加密。拿到主口令等于拿到全部明文。
-10. **只分发 `.armored` 时伴生诱饵不生效。** 伴生包是可选的独立目录；
-    现在每层都内嵌了假字符串表与注入文档，容器单独分发仍有内容层陷阱，
-    但 9 种投毒侧重（知识库 / 工具产出 / 项目指令等）需要伴生包在场。
-11. **对手读过源码就能识别工具条目。** 内部条目标记是公开的，知情 agent 可以
-    按 comment 精确过滤假 IOC；内容层陷阱是给「不知情的自动 agent」准备的，
-    不是对抗人工分析或源码知情者的机制。
-
----
-
-## 退出码
-
-| 码 | 含义 |
-|---|---|
-| 0 | 成功 |
-| 1 | 参数错误 / 两次口令不一致 |
-| 2 | 诱饵层命中 |
-| 3 | 解密失败（口令或 keyfile 错误） |
-| 4 | 环境错误（依赖缺失、文件不存在等） |
-
----
+```bash
+python armor/selftest.py      # 19 项：编译/加密/错口令/解密/擦除/篡改/拖放等
+```
 
 ## 项目结构
 
-```text
-TarpitCrypt/
-├── tarpitcrypt.py          # v1 核心：Argon2id + AES-256-GCM，命令行入口
-├── tarpitcrypt_server.py   # 本地网页版服务端
-├── desktop_web.py          # WebView 桌面壳
-├── armor/                  # Python 子包：程序包加固工具集
-│   ├── __init__.py         # 包登记，兼容目录内既有的顶层名导入
-│   ├── armor_gui.py        # tkinter 界面（Windows 原生拖放）
-│   ├── armor_core.py       # v3 容器：加固 / 还原
-│   ├── decoy_kit.py        # 伴生诱饵包生成
-│   ├── selftest.py         # 端到端自测
-│   └── ...                 # 探针、评估、保真度矩阵、打包脚本
-├── tests/                  # v1 单元测试与格式兼容
-├── docs/                   # GitHub Pages 纯前端版
-└── scripts/                # 打包辅助脚本
+```
+armor/
+  runtime_pack.py     加密格式、打包/解密/擦除/尾部注入核心 + CLI
+  runtime_runner.py   通用启动器（PyInstaller 打包用）
+  build_runner.py     构建启动器 exe（一次）
+  drop_target.py      Windows 原生拖放（整棵 HWND 树）
+  armor_gui.py        极简单页 GUI
+  selftest.py         端到端自测
 ```
 
-`pip install .` 现在会把 `armor` 一起装上，并提供 `tarpitcrypt-armor` 入口启动 GUI。
-此前打包配置只列出 3 个根模块，GUI 与加固核心都装不进 wheel。
-
-`armor/` 内模块沿用顶层名互相导入，`__init__.py` 负责统一登记搜索路径：
-脚本直跑（`python armor/selftest.py`）与包式运行（`python -m armor.runtime_check`）都保持可用。
-
-## 在全新设备上运行
-
-| 场景 | 做法 | 前置条件 |
-| --- | --- | --- |
-| 只想用，有浏览器 | 打开在线版 https://velestia-star.github.io/TarpitCrypt/ | 无；纯前端 WASM，文件不上传 |
-| Windows，免装 Python | 双击 `打包一件套/TarpitCrypt.exe`，或从 [Releases](https://github.com/Velestia-star/TarpitCrypt/releases/latest) 下载最新单文件版 | Win10 缺 WebView2 时程序自动运行内置安装包（首次需联网一次） |
-| 装了 Python 3.11+ | `pip install .` → `tarpitcrypt` / `tarpitcrypt-armor` / `tarpitcrypt-web` / `tarpitcrypt-desktop` | tkinter（官方安装包自带）、argon2-cffi、cryptography 自动安装 |
-| 直接拷源码目录 | 双击 `启动.bat` | 自动探测已装好依赖的 Python；找不到时给出明确提示 |
-
-产物目录：加密 / 还原结果默认写到 `~/TarpitCrypt/存放文件`（pip 安装）或 exe 同目录（免装版）；源码布局保持项目内 `存放文件/`。
-可用 `--out-dir` 或环境变量 `TARPITCRYPT_OUT_DIR` 覆盖。机器上有多个 Python 时，可用
-`TARPITCRYPT_PYTHON` 指定 `启动.bat` 使用哪个解释器；`TARPITCRYPT_PYTHONW` 指定无控制台版本。
-
-`启动.bat` / `运行自测.bat` / `打包exe.bat` 均按「环境变量 → 同目录便携版 → PATH → `py -3` → 常见安装路径」
-逐一预检依赖，选第一个能跑的解释器；全部缺依赖时自动尝试 `pip install argon2-cffi cryptography`。
-
-## 开发
-
-```bash
-pip install argon2-cffi cryptography pytest
-python -m pytest tests -o addopts=""   # 88 项：v1 单元 + 固定格式兼容 + keygen 保护 + 浏览器互解 + 控制台编码回归
-python -m pytest tests -k browser      # 单跑浏览器 ↔ Python 双向互解（无浏览器时跳过）
-python armor/selftest.py               # 220 项
-python armor/probe_agent.py            # 模拟逆向轮数对照（加密容器层）
-python armor/agent_eval.py --runs 5    # 多轮取样 + 评估报告
-python armor/content_probe.py --poison ALL   # 内容层陷阱实测：模拟 AI 逆向 agent 打诱饵包，验证全 TRAPPED 且无真实主机泄露
-python -m armor.content_probe --injection-matrix --real  # 按注入口吻分档量化真实 LLM 的吞下比例
-python -m armor.container_benchmark --runs 3  # 容器层 A/B 对照：真实 LLM 轮数与 token（取 API usage）
-python -m armor.runtime_check           # 还原保真度与可运行性矩阵：加固→还原→实跑，逐字节 + 权限 + 结构比对
-```
-
-### 验证「还原出来还能跑」
-
-加密容器的价值全押在「还原出来的东西和原来一样」上。字节一致**不等于**能跑：
-可执行位丢了、只读配置变可写、符号链接变实体文件 —— 这些都不会让「还原成功」
-报错，却会让程序行为悄悄变掉。
-
-```bash
-python -m armor.runtime_check                      # 跑内置矩阵（16 项）
-python -m armor.runtime_check <程序目录>            # 验证真实程序包
-python -m armor.runtime_check <程序目录> --run "python main.py"   # 顺带比对运行结果
-```
-
-覆盖：内容/权限/结构三方比对、还原后实跑比对 stdout 与退出码、归档内权限位、
-只读属性、`.sh` / `.bat` 直接执行、CRLF、UTF-8 BOM、空文件 / 空目录、
-中文与空格文件名、大文件、旧格式容器兼容、还原目录可写。
-
-全程离线，只在临时目录操作副本，**原目录一个字节都不改**。
-
-CI 在 3 个系统 × Python 3.11/3.12/3.13 上跑同一套命令，配置见
-`.github/workflows/ci.yml`。协作规则见 [CONTRIBUTING.md](CONTRIBUTING.md)，
-漏洞报告渠道见 [SECURITY.md](SECURITY.md)。
-
-测试里有两类「不能省」的证据：
-
-- **KDF 黄金向量**：`_derive` 的固定输入 → 固定输出；
-- **`tests/fixtures/` 固定格式样本**：四份事先生成并入库的 `.bin`，**只解不加密**。
-  其余测试都是「当前代码加密 → 当前代码解密」自洽，改坏 AAD 组成或诱饵段
-  顺序时照样全绿；只有这批样本能挡住「已发出的旧文件全解不开」。
-
-任何改动 KDF 流程或文件格式的提交，必须附带：
-
-1. 变更前后的单次尝试成本对比；
-2. 对已有文件的影响（不兼容则必须 `VERSION + 1` 并提供迁移脚本）；
-3. 新的测试向量（输入、期望输出、口令、keyfile 摘要）。
-
-浏览器版的期望值不是抄一份常量，而是测试时由 Python 侧现算再注入 JS：
-它断言的是「两边算出同一个东西」，所以任何一边改了 KDF 都会立刻暴露。
-
-不允许为了「性能」下调 `memory_cost` 或 `time_cost`，也不允许移除 AAD 绑定。
-
-## 兼容性
-
-- v1 `VERSION = 1` 格式冻结。解密端遇到未知 VERSION 直接拒绝，绝不猜测着解。
-- 解密端自动识别 AEAD 算法（v1 文件头没有独立的 cipher 字段），
-  因此加密时选的算法不影响文件能否被解开。
-- `cryptography` 48+ / 50+ 均不提供 `XChaCha20Poly1305`，会自动降级到
-  AES-256-GCM；这条降级路径已实测生效。
-- armor v3 容器按 v2 的同一二进制布局读取，`MAGIC=TPARMOR2` 的旧
-  `.armored` 仍可用主口令还原。
-
-## 作者与贡献者
-
-- [@Velestia-star](https://github.com/Velestia-star) — 仓库所有者、v1 加密核心与本地 Web 入口
-- [@yanmoren](https://github.com/yanmoren) — `armor/` 加固层、GUI、工程化与发布
-
-完整的逐提交记录见仓库 Contributors 页面。欢迎通过 PR 参与，协作约定见
-`CONTRIBUTING.md`；安全漏洞请走 `SECURITY.md` 的私下渠道。
-
-## 许可
-
-MIT，版权归 [TarpitCrypt contributors](LICENSE)。
-
----
-
-## ☕ 请我们喝瓶饮料
-
-<img src="assets/donate-qr.jpg" alt="打赏二维码" width="220">
-
-**自愿打赏**，如果你觉得这个项目不错，可以给我们买瓶饮料，嘿嘿嘿
-
-<sub>打赏纯属心意，不解锁任何功能；项目始终 MIT 开源，全部代码都在这个仓库里。</sub>
+依赖：Python 3.11+ / argon2-cffi / cryptography；构建启动器另需 pyinstaller。
