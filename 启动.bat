@@ -4,10 +4,10 @@ setlocal enabledelayedexpansion
 cd /d "%~dp0"
 
 rem ============================================================
-rem  TarpitCrypt Armor Í¨ÓÃÆô¶¯Æ÷£¨ÈÎÒâ Windows »·¾³£©
-rem  ÊÕ¼¯¶à¸ö Python ºòÑ¡£¬ÖðÒ»Ô¤¼ìÒÀÀµ£¬Ñ¡µÚÒ»¸öÄÜÅÜµÄ¡£
-rem  Ë³Ðò£º»·¾³±äÁ¿ -> Í¬Ä¿Â¼±ãÐ¯°æ -> PATH -> py Æô¶¯Æ÷ -> ³£¼û°²×°Â·¾¶
-rem  È«Ê§°Ü²Å³¢ÊÔ×Ô¶¯²¹×° argon2-cffi / cryptography¡£
+rem  TarpitCrypt Armor é€šç”¨å¯åŠ¨å™¨ï¼ˆä»»æ„ Windows çŽ¯å¢ƒï¼‰
+rem  æ”¶é›†å¤šä¸ª Python å€™é€‰ï¼Œé€ä¸€é¢„æ£€ä¾èµ–ï¼Œé€‰ç¬¬ä¸€ä¸ªèƒ½è·‘çš„ã€‚
+rem  é¡ºåºï¼šçŽ¯å¢ƒå˜é‡ -> åŒç›®å½•ä¾¿æºç‰ˆ -> PATH -> py å¯åŠ¨å™¨ -> å¸¸è§å®‰è£…è·¯å¾„
+rem  å…¨å¤±è´¥æ‰å°è¯•è‡ªåŠ¨è¡¥è£… argon2-cffi / cryptographyã€‚
 rem ============================================================
 
 set "PY="
@@ -30,24 +30,24 @@ call :TRY "%LOCALAPPDATA%\Programs\Python\Python311\python.exe"
 call :TRY "C:\Python313\python.exe"
 call :TRY "C:\Python312\python.exe"
 call :TRY "C:\Python311\python.exe"
-call :TRY "D:\app\py312\python.exe"
+for /d %%d in ("D:\app\py*") do call :TRY "%%d\python.exe"
 
 if not defined PY if defined FIRST (
-  echo [ÌáÊ¾] ºòÑ¡»·¾³¾ùÈ±ÉÙÒÀÀµ£¬³¢ÊÔ×Ô¶¯°²×° argon2-cffi cryptography ...
+  echo [æç¤º] å€™é€‰çŽ¯å¢ƒå‡ç¼ºå°‘ä¾èµ–ï¼Œå°è¯•è‡ªåŠ¨å®‰è£… argon2-cffi cryptography ...
   "!FIRST!" -m pip install --disable-pip-version-check argon2-cffi cryptography
   call :TRY "!FIRST!"
 )
 
 if not defined PY (
-  echo [´íÎó] Î´ÕÒµ½¿ÉÓÃµÄ Python 3.11+ »·¾³£¨Ðè tkinter / argon2-cffi / cryptography£©¡£
-  echo   Çë°²×° Python 3.11+£¬¹´Ñ¡ "Add Python to PATH" Óë "tcl/tk and IDLE"£¬È»ºóÖ´ÐÐ£º
+  echo [é”™è¯¯] æœªæ‰¾åˆ°å¯ç”¨çš„ Python 3.11+ çŽ¯å¢ƒï¼ˆéœ€ tkinter / argon2-cffi / cryptographyï¼‰ã€‚
+  echo   è¯·å®‰è£… Python 3.11+ï¼Œå‹¾é€‰ "Add Python to PATH" ä¸Ž "tcl/tk and IDLE"ï¼Œç„¶åŽæ‰§è¡Œï¼š
   echo     python -m pip install argon2-cffi cryptography
-  echo   Ò²¿ÉÉèÖÃ»·¾³±äÁ¿ TARPITCRYPT_PYTHON Ö¸ÏòÒÑ×°ºÃÒÀÀµµÄ python.exe¡£
+  echo   ä¹Ÿå¯è®¾ç½®çŽ¯å¢ƒå˜é‡ TARPITCRYPT_PYTHON æŒ‡å‘å·²è£…å¥½ä¾èµ–çš„ python.exeã€‚
   pause
   exit /b 1
 )
 
-rem --- ÓÉ python.exe ÍÆµ¼ pythonw.exe£¬±ÜÃâºÚ´°¿Ú ---
+rem --- ç”± python.exe æŽ¨å¯¼ pythonw.exeï¼Œé¿å…é»‘çª—å£ ---
 if defined TARPITCRYPT_PYTHONW if exist "%TARPITCRYPT_PYTHONW%" set "PYW=%TARPITCRYPT_PYTHONW%"
 if not defined PYW if exist "%~dp0pythonw.exe" set "PYW=%~dp0pythonw.exe"
 if not defined PYW (

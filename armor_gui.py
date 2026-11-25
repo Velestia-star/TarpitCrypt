@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
-"""TarpitCrypt Armor · 极简单页 GUI。
+"""TarpitCrypt · 正常双击即用 + 反 AI 逆向成本陷阱。
 
-唯一功能：把程序包加密成「双击即可运行」的单文件 exe。
-
-流程：拖入程序包 → 填口令 → 选启动器 → 生成加密 exe。
-运行端：双击 exe → 口令框 → 内存解密 → 临时目录运行 → 退出擦除。
+流程：拖入程序包 → 设置假包 / 诱饵 → 选启动器 → 生成 exe。
+分发后双击直接运行（无口令）；调试器或自动化破解工具才会撞进陷阱。
 
 依赖：Python 3.11+ / tkinter / argon2-cffi / cryptography / PyInstaller（仅构建启动器时）。
 """
@@ -27,7 +25,7 @@ try:
 except ImportError:
     rpk = None  # main() 给出友好提示
 
-APP_TITLE = "TarpitCrypt Armor · 加密后直接运行"
+APP_TITLE = "TarpitCrypt · 正常运行 + 反 AI 逆向陷阱"
 ACCENT = "#185FA5"
 
 
@@ -55,8 +53,8 @@ class App(tk.Tk):
         super().__init__()
         _enable_dpi()
         self.title(APP_TITLE)
-        self.geometry("840x640")
-        self.minsize(740, 560)
+        self.geometry("900x760")
+        self.minsize(800, 680)
         try:
             ttk.Style().theme_use("clam")
         except tk.TclError:
@@ -67,14 +65,19 @@ class App(tk.Tk):
         self.busy = False
         self.src = tk.StringVar()
         self.out = tk.StringVar()
-        self.pw = tk.StringVar()
-        self.pw2 = tk.StringVar()
-        self.profile = tk.StringVar(value="中")
-        self.nopass = tk.BooleanVar(value=False)
+        self.entry = tk.StringVar()
+        self.exclude_defaults = tk.BooleanVar(value=True)
+        self.pkg_info = tk.StringVar()
+        self.decoys = tk.StringVar(value="12")
+        self.farm_mb = tk.StringVar(value="8")
+        self.trap_profile = tk.StringVar(value="标准")
+        self.guard = tk.BooleanVar(value=True)
         self.runner = tk.StringVar()
         self.status = tk.StringVar(value="就绪")
+        self.hint = tk.StringVar()
 
         self._build()
+        self._update_hint()
         self.after(150, self._poll_drop)
 
     # ---------------- UI ----------------
@@ -92,10 +95,9 @@ class App(tk.Tk):
         root = ttk.Frame(self, padding=18)
         root.pack(fill="both", expand=True)
 
-        # 拖放区
         drop = ttk.LabelFrame(root, text=" 拖放区 ", padding=14)
         drop.pack(fill="x")
-        inner = ttk.Frame(drop, height=86)
+        inner = ttk.Frame(drop, height=80)
         inner.pack(fill="x")
         inner.pack_propagate(False)
         ttk.Label(inner,
@@ -109,73 +111,84 @@ class App(tk.Tk):
         ttk.Button(pick, text="选择文件夹",
                    command=lambda: self._pick(True)).pack(side="left", padx=6)
         ttk.Label(pick, textvariable=self.src, style="Hint.TLabel",
-                  wraplength=580).pack(side="left", padx=10)
+                  wraplength=600).pack(side="left", padx=10)
 
-        # 加密选项
-        opts = ttk.LabelFrame(root, text=" 加密选项 ", padding=12)
+        pkg = ttk.LabelFrame(root, text=" 程序包 ", padding=12)
+        pkg.pack(fill="x", pady=(14, 0))
+        prow = ttk.Frame(pkg)
+        prow.pack(fill="x")
+        ttk.Label(prow, text="入口程序：").pack(side="left")
+        self.entry_combo = ttk.Combobox(
+            prow, textvariable=self.entry, width=46, state="readonly", values=[])
+        self.entry_combo.pack(side="left")
+        ttk.Button(prow, text="重新扫描",
+                   command=self._refresh_entries).pack(side="left", padx=6)
+        ttk.Checkbutton(prow, text="排除 .git / 缓存 / 日志 / .env",
+                        variable=self.exclude_defaults,
+                        command=self._update_pkg_info).pack(side="left", padx=(12, 0))
+        ttk.Label(pkg, textvariable=self.pkg_info, style="Hint.TLabel",
+                  wraplength=840).pack(fill="x", pady=(8, 0))
+
+        opts = ttk.LabelFrame(root, text=" 陷阱设置（正常使用零打扰） ", padding=12)
         opts.pack(fill="x", pady=(14, 0))
-        row = ttk.Frame(opts); row.pack(fill="x")
-        ttk.Label(row, text="运行口令：").pack(side="left")
-        self.pw_entry = ttk.Entry(row, textvariable=self.pw, show="*", width=24)
-        self.pw_entry.pack(side="left")
-        ttk.Label(row, text="  确认：").pack(side="left")
-        self.pw2_entry = ttk.Entry(row, textvariable=self.pw2, show="*", width=24)
-        self.pw2_entry.pack(side="left")
-        ttk.Label(row, text="  强度：", style="Hint.TLabel").pack(side="left")
-        ttk.Combobox(row, textvariable=self.profile, width=6, state="readonly",
-                     values=["轻", "中", "狠"]).pack(side="left")
+        row = ttk.Frame(opts)
+        row.pack(fill="x")
+        ttk.Label(row, text="假包数量：").pack(side="left")
+        ttk.Spinbox(row, from_=0, to=64, width=5, textvariable=self.decoys,
+                    command=self._update_hint).pack(side="left")
+        ttk.Label(row, text=" 个   诱饵源码：", style="Hint.TLabel").pack(side="left")
+        ttk.Spinbox(row, from_=0, to=64, width=5, textvariable=self.farm_mb,
+                    command=self._update_hint).pack(side="left")
+        ttk.Label(row, text=" MB   陷阱强度：", style="Hint.TLabel").pack(side="left")
+        ttk.Combobox(row, textvariable=self.trap_profile, width=6,
+                     state="readonly", values=["标准", "激进"],
+                     ).pack(side="left")
 
-        row2 = ttk.Frame(opts); row2.pack(fill="x", pady=(10, 0))
-        ttk.Checkbutton(row2, text="免密（仅混淆，保护极弱）",
-                        variable=self.nopass,
-                        command=self._toggle_nopass).pack(side="left")
+        row2 = ttk.Frame(opts)
+        row2.pack(fill="x", pady=(10, 0))
+        ttk.Checkbutton(row2, text="反调试 / 反 AI 探测",
+                        variable=self.guard).pack(side="left")
         ttk.Label(row2, text="   通用启动器：",
                   style="Hint.TLabel").pack(side="left")
-        ttk.Entry(row2, textvariable=self.runner, width=32).pack(side="left")
+        ttk.Entry(row2, textvariable=self.runner, width=40).pack(side="left")
         ttk.Button(row2, text="选择",
                    command=self._pick_runner).pack(side="left", padx=4)
         ttk.Button(row2, text="构建启动器",
                    command=self._build_runner).pack(side="left")
 
-        # 输出
-        out = ttk.Frame(root); out.pack(fill="x", pady=(14, 0))
-        ttk.Label(out, text="输出 exe：").pack(side="left")
-        ttk.Entry(out, textvariable=self.out, width=64).pack(side="left")
+        ttk.Label(opts, textvariable=self.hint, style="Hint.TLabel",
+                  wraplength=820).pack(fill="x", pady=(8, 0))
 
-        # 主按钮
-        bar = ttk.Frame(root); bar.pack(fill="x", pady=(16, 0))
-        self.go_btn = ttk.Button(bar, text="生成加密 exe",
+        out = ttk.Frame(root)
+        out.pack(fill="x", pady=(14, 0))
+        ttk.Label(out, text="输出 exe：").pack(side="left")
+        ttk.Entry(out, textvariable=self.out, width=68).pack(side="left")
+
+        bar = ttk.Frame(root)
+        bar.pack(fill="x", pady=(16, 0))
+        self.go_btn = ttk.Button(bar, text="生成加固 exe",
                                  style="Accent.TButton", command=self._go)
         self.go_btn.pack(side="left")
         ttk.Button(bar, text="打开输出目录",
                    command=self._open_out).pack(side="left", padx=10)
-        ttk.Label(bar, text="分发只需这个 exe；双击输口令即可运行原程序",
+        ttk.Label(bar, text="分发只需这个 exe：双击直接运行，不弹口令",
                   style="Hint.TLabel").pack(side="left")
 
-        # 日志
         box = ttk.LabelFrame(root, text=" 运行日志 ", padding=8)
         box.pack(fill="both", expand=True, pady=(14, 0))
         self.logw = scrolledtext.ScrolledText(
             box, height=8, wrap="word", font=("Consolas", 9), state="disabled")
         self.logw.pack(fill="both", expand=True)
 
-        # 状态栏
         statusbar = ttk.Frame(self, padding=(14, 6))
         statusbar.pack(fill="x", side="bottom")
         ttk.Label(statusbar, textvariable=self.status,
                   style="Hint.TLabel").pack(side="left")
         ttk.Label(statusbar,
-                  text="明文运行时进内存，无法绝对防 dump；不做免杀 / 注入",
+                  text="只放大逆向成本，不联网、不破坏主机、不碰第三方",
                   style="Hint.TLabel").pack(side="right")
 
     # ---------------- 交互 ----------------
-    def _toggle_nopass(self) -> None:
-        state = "disabled" if self.nopass.get() else "normal"
-        self.pw_entry.configure(state=state)
-        self.pw2_entry.configure(state=state)
-        self.status.set("免密模式：密钥内嵌，仅混淆，保护极弱"
-                        if self.nopass.get() else "就绪")
-
     def _pick(self, folder: bool) -> None:
         if folder:
             p = filedialog.askdirectory(title="选择程序包文件夹")
@@ -188,6 +201,75 @@ class App(tk.Tk):
         self.src.set(str(path))
         self.out.set(str(path.with_name(path.name + "_protected.exe")))
         self.status.set(f"已载入：{path.name}")
+        self.entry.set("")
+        self._refresh_entries()
+
+    def _excludes(self) -> list[str]:
+        if rpk is None:
+            return []
+        return list(rpk.DEFAULT_EXCLUDES) if self.exclude_defaults.get() else []
+
+    def _refresh_entries(self) -> None:
+        raw = self.src.get()
+        if not raw or rpk is None:
+            return
+        path = Path(raw)
+        if not path.exists():
+            return
+        if path.is_file():
+            self.entry_combo.configure(values=[path.name], state="disabled")
+            self.entry.set(path.name)
+            self._update_pkg_info()
+            return
+        try:
+            candidates = rpk.candidate_entries(path)
+        except Exception as exc:
+            candidates = []
+            self._log(f"扫描入口失败：{exc}")
+        self.entry_combo.configure(values=candidates, state="readonly")
+        preferred = ""
+        for suffix in rpk.EXEC_SUFFIXES:
+            matches = [c for c in candidates
+                       if "/" not in c and c.lower().endswith(suffix)]
+            if len(matches) == 1:
+                preferred = matches[0]
+                break
+        current = self.entry.get()
+        if len(candidates) == 1:
+            self.entry.set(candidates[0])
+        elif preferred:
+            self.entry.set(preferred)
+        elif current in candidates:
+            self.entry.set(current)
+        else:
+            self.entry.set("")
+        if not candidates:
+            self.status.set("未找到入口程序，请检查文件夹")
+        elif len(candidates) > 1 and not self.entry.get():
+            self.status.set(f"检测到 {len(candidates)} 个入口，请在「入口程序」中选择")
+        else:
+            self.status.set(f"入口：{self.entry.get()}")
+        self._update_pkg_info()
+
+    def _update_pkg_info(self) -> None:
+        raw = self.src.get()
+        if not raw or rpk is None:
+            self.pkg_info.set("")
+            return
+        path = Path(raw)
+        try:
+            info = rpk.scan_package(path, self._excludes(), self.out.get() or None)
+        except Exception as exc:
+            self.pkg_info.set(f"扫描失败：{exc}")
+            return
+        size_mb = info["bytes"] / 1048576
+        entry = self.entry.get()
+        prefix = (f"将打包 {info['files']} 个文件 / {size_mb:.1f} MB；"
+                  f"排除 {info['excluded']} 项")
+        if path.is_dir() and not entry:
+            self.pkg_info.set(f"{prefix}；请选择入口程序")
+        else:
+            self.pkg_info.set(f"{prefix}；入口：{entry or path.name}")
 
     def _pick_runner(self) -> None:
         p = filedialog.askopenfilename(
@@ -229,14 +311,28 @@ class App(tk.Tk):
     def _open_out(self) -> None:
         raw = self.out.get()
         if not raw:
-            messagebox.showinfo(APP_TITLE, "还没有生成加密 exe")
+            messagebox.showinfo(APP_TITLE, "还没有生成加固 exe")
             return
-        p = Path(raw)
-        target = p.parent
+        target = Path(raw).parent
         if target.exists():
             _open_dir(target)
         else:
             messagebox.showinfo(APP_TITLE, f"输出目录不存在：{target}")
+
+    def _update_hint(self) -> None:
+        profile = self.trap_profile.get() or "标准"
+        try:
+            decoys = int(self.decoys.get())
+            farm_mb = int(self.farm_mb.get())
+        except ValueError:
+            decoys, farm_mb = 12, 8
+        mem, time_cost, _ = (rpk.TRAP_PROFILES.get(profile)
+                             if rpk else (384 * 1024, 3, 2))
+        per_pack = mem / 1048576.0 * time_cost * 1.2
+        total = per_pack * (decoys + 1 + (2 if farm_mb >= 4 else (1 if farm_mb else 0)))
+        self.hint.set(
+            f"正常启动约 <1 秒、无口令；每个假包宣称 Argon2 {mem // 1024} MiB × {time_cost}，"
+            f"估算单包 ≈ {per_pack:.1f} 秒、全量 ≈ {total:.0f} 秒（诱饵源码另计 token）。")
 
     def _go(self) -> None:
         if rpk is None:
@@ -251,31 +347,47 @@ class App(tk.Tk):
             messagebox.showwarning(APP_TITLE,
                                    "请先选择或构建通用启动器 RTPK_Runner.exe")
             return
-
-        nopass = self.nopass.get()
-        pw = "" if nopass else self.pw.get()
-        if not nopass:
-            if not pw or pw != self.pw2.get():
-                messagebox.showwarning(APP_TITLE, "两次运行口令不一致或为空")
-                return
-            ok, hint = rpk.check_password(pw)
-            if not ok and not messagebox.askyesno(
-                    APP_TITLE, f"口令偏弱：{hint}\n仍要继续？"):
-                return
+        try:
+            decoys = max(0, min(64, int(self.decoys.get())))
+            farm_mb = max(0, min(64, int(self.farm_mb.get())))
+        except ValueError:
+            messagebox.showwarning(APP_TITLE, "假包数量 / 诱饵体积必须是整数")
+            return
 
         src = Path(raw)
         out = Path(self.out.get() or str(src.with_name(src.name + "_protected.exe")))
-        profile = self.profile.get() or "中"
+        profile = self.trap_profile.get() or "标准"
+        guard = self.guard.get()
+        excludes = self._excludes()
+        entry = self.entry.get().strip()
+        if src.is_dir() and not entry:
+            messagebox.showwarning(APP_TITLE, "请先在「入口程序」中选择一个入口")
+            return
+        try:
+            if entry:
+                entry = rpk.validate_entry(src, entry)
+        except rpk.RuntimePackError as exc:
+            messagebox.showwarning(APP_TITLE, str(exc))
+            return
 
         def job(progress, emit):
-            emit("log", f"加密：{src.name} / 强度 {profile} / "
-                        f"{'免密（弱）' if nopass else '口令保护'}")
-            blob = rpk.build_pack(src, pw or None, profile=profile,
-                                  no_password=nopass, cb=progress)
+            emit("log", f"打包：{src.name}｜入口 {entry or src.name}｜"
+                        f"假包 {decoys}｜诱饵 {farm_mb}MB｜"
+                        f"强度 {profile}｜反探测 {'开' if guard else '关'}")
+            blob, stats = rpk.build_container(
+                src, entry=entry or None, decoys=decoys, farm_mb=farm_mb,
+                trap_profile=profile, guard=guard,
+                excludes=excludes, out_path=out, cb=progress)
+            emit("log", f"打包文件 {stats['included_files']} 个 / "
+                        f"{stats['included_bytes']:,} 字节；"
+                        f"排除 {stats['excluded_items']} 项")
+            emit("log", f"容器 {len(blob):,} 字节，正在写入启动器…")
             rpk.embed(runner, blob, out)
             emit("log", f"完成：{out}（{out.stat().st_size:,} 字节）")
-            emit("log", "分发只需这个 exe。双击输口令 → 解密运行 → 退出擦除。")
-            emit("log", "局限：运行时明文在内存中，本工具不防调试器 dump / 内存取证。")
+            emit("log", f"假包 {stats['decoys']}｜农场包 {stats['farm_packs']}｜"
+                        f"单包尝试 ≈ {stats['attack_seconds_per_pack']:.1f}s｜"
+                        f"全量 ≈ {stats['attack_seconds_full_pass']:.0f}s")
+            emit("log", "双击直接运行，无口令；调试器 / AI Agent 才会进入陷阱。")
             return f"已生成：{out}"
 
         self._run_async(job)

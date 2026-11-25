@@ -3,36 +3,49 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>TarpitCrypt · 加密后直接运行</title>
+<title>TarpitCrypt · 正常运行 + 反 AI 逆向陷阱</title>
 <style>
-  body { max-width: 760px; margin: 3rem auto; padding: 0 1.2rem;
+  body { max-width: 780px; margin: 3rem auto; padding: 0 1.2rem;
          font-family: system-ui, "Microsoft YaHei", sans-serif;
          color: #222; line-height: 1.7; }
   h1 { color: #185FA5; }
   code { background: #f2f4f7; padding: 2px 6px; border-radius: 4px; }
   pre { background: #f2f4f7; padding: 14px; border-radius: 6px; overflow-x: auto; }
   .warn { border-left: 4px solid #d97706; padding-left: 12px; color: #555; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
 </style>
 </head>
 <body>
 <h1>TarpitCrypt</h1>
-<p>把程序包加密成「双击即可运行」的单文件 exe。明文不长期留盘。</p>
-<p>本仓库已精简为纯本地工具，在线加密版已移除。本页仅作项目说明。</p>
+<p><strong>正常双击即用；只有 AI / 自动化逆向时才会踩进成本陷阱。</strong></p>
+<p>分发出去的是一个普通单文件 exe：双击直接运行，不弹口令。假包、诱饵源码、
+伪造索引和反调试降级会把 AI 分析、动态提取与云端爆破的时间、token、算力成本放大。</p>
 
-<h2>使用</h2>
+<h2>快速开始</h2>
 <pre>pip install argon2-cffi cryptography pyinstaller
-python armor/build_runner.py      # 构建一次通用启动器
-python armor/armor_gui.py         # 打开单页 GUI</pre>
-<p>GUI：拖入程序包 → 填两次口令 → 选启动器 → 生成加密 exe。
-分发只需这一个 exe；对方双击输口令即可运行原程序。</p>
+python build_runner.py      # 构建一次通用启动器
+python armor_gui.py         # 打开单页 GUI</pre>
+<p>GUI：拖入程序包或整个文件夹 → 自动识别/选择入口 → 设置假包与诱饵 → 生成。</p>
 
 <h2>命令行</h2>
-<pre>python armor/runtime_pack.py build MyApp -o MyApp_protected.exe \
-  --password '你的口令' --runner armor/dist/RTPK_Runner.exe</pre>
+<pre>python runtime_pack.py build MyApp -o MyApp_protected.exe \
+  --runner dist/RTPK_Runner.exe --decoys 12 --farm-mb 8</pre>
+<p>文件夹入口可用 <code>--entry</code> 指定；默认排除 <code>.git</code>、缓存、日志和
+<code>.env</code>，保留 <code>node_modules</code> 等运行时依赖。</p>
+
+<h2>四条陷阱链路</h2>
+<table>
+<tr><th>陷阱</th><th>作用</th></tr>
+<tr><td>假包 + 昂贵 KDF</td><td>每个假包都宣称高成本 Argon2id，真实密钥随机</td></tr>
+<tr><td>诱饵源码农场</td><td>大量逼真假工程与嵌套假包，消耗静态分析 token</td></tr>
+<tr><td>伪造索引</td><td>多处假 footer，误导自动扫描与提取</td></tr>
+<tr><td>反调试 / 反 AI 降级</td><td>调试器或 Agent 环境触发慢速迷宫与诱饵投放</td></tr>
+</table>
 
 <h2>能力边界</h2>
-<p>静态读分发包拿不到原文件；无口令无法解密；退出后覆写擦除临时目录。
-运行时明文必进内存，无法阻止调试器 dump。不做免杀、注入、反沙箱。</p>
+<p>没有口令意味着密钥在本地，具备完整读码能力的人最终仍能还原。本工具抬高的是
+AI 与自动化工具的成本，不承诺不可破解；不联网、不破坏主机、不注入第三方进程。</p>
 <p class="warn">仅用于加固你自己拥有或已获授权的程序包。</p>
 
 <p><a href="https://github.com/Velestia-star/TarpitCrypt">GitHub 仓库</a></p>

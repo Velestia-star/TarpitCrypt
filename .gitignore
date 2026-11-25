@@ -1,3 +1,4 @@
+# Python
 __pycache__/
 *.py[cod]
 *.egg-info/
@@ -10,22 +11,22 @@ venv/
 .mypy_cache/
 .ruff_cache/
 
-# 加密产物与临时文件，绝不入库
+# 本地日志 / 临时文件
+*.log
+*.tmp
+
+# 加固产物与历史临时目录，绝不入库
 *.tarpit
+*.armored
 *.key
 *.bin.tmp
-*.armored
 *_build_kit/
 *_internal_docs/
 *_archive_r9/
 tarpit_report.csv
 tarpit_report.md
 report.md
-
-# 本地网页版默认落盘目录（加密产物不应入库）
 存放文件/
 
-# 打包产物体积大，走 Release 附件分发，不再入库。
-# 注意：打包一件套/TarpitCrypt.exe 是历史已跟踪文件，保留不动；
-# 这条规则只拦后续新增的 exe。
+# 打包产物走 Release 附件分发，不入库
 *.exe
