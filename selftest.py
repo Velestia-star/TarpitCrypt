@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import os
 import py_compile
+import random
 import sys
 import tempfile
 import time
@@ -58,7 +60,8 @@ def test_container() -> None:
         check("包数量 = 1 真 + 6 假 + 1 农场", stats["packs"] == 8, str(stats["packs"]))
         check("反探测开关写入容器", rp.parse_container(blob)["guard"] is True)
 
-        packs = rp.parse_container(blob)["packs"]
+        info = rp.parse_container(blob)
+        packs = info["packs"]
         check("所有包宣称高成本 KDF",
               all(p["mem"] == 384 * 1024 and p["time"] == 3 for p in packs))
         check("密文不含原文", b"SENTINEL_PLAIN_9527" not in blob)
@@ -70,7 +73,7 @@ def test_container() -> None:
               f"{core_seconds * 1000:.0f}ms")
         check("正确还原真实程序包", manifest.entry == "start.bat")
 
-        key = rp._core_key(packs)
+        key = rp._core_key(packs, info.get("poly"))
         opened = [p for p in packs if rp._try_key(key, p) is not None]
         check("核心密钥只能打开真包", len(opened) == 1 and opened[0]["offset"] == core["offset"])
 
@@ -139,6 +142,62 @@ def test_container() -> None:
             check("截断容器友好报错", False)
         except rp.RuntimePackError:
             check("截断容器友好报错", True)
+
+
+def test_split() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        src = root / "BigApp"
+        src.mkdir()
+        (src / "realentry.bat").write_text("@echo off\n", encoding="utf-8")
+        payload = os.urandom(20 * 1024 * 1024)
+        (src / "big.bin").write_bytes(payload)
+
+        blob, stats = rp.build_container(src, decoys=2, farm_mb=0)
+        check("真包按 8MB 分片", stats["core_parts"] >= 2,
+              str(stats["core_parts"]))
+
+        plain, manifest, _core = rp.open_core(blob)
+        check("分片拼回真实入口",
+              manifest.entry == "realentry.bat" and manifest.files == 2)
+        out = root / "unpacked"
+        rp.safe_extract(plain, out)
+        check("分片内容完整",
+              hashlib.sha256((out / "big.bin").read_bytes()).hexdigest()
+              == hashlib.sha256(payload).hexdigest())
+
+        packs = rp.parse_container(blob)["packs"]
+        sizes = [p["ct_len"] for p in packs]
+        check("核心分片与假包尺寸接近",
+              max(sizes) / max(1, min(sizes)) < 3,
+              f"{min(sizes) / 1048576:.1f}-{max(sizes) / 1048576:.1f} MB")
+        check("明文清单不含真实入口",
+              b"realentry.bat" not in b"".join(
+                  p["manifest_raw"] for p in packs))
+
+
+def test_native_container() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        src = _demo_source(Path(td))
+        poly = rp._make_poly(random.Random(9527))
+        blob, stats = rp.build_container(
+            src, decoys=2, farm_mb=0, poly=poly, native=True)
+        info = rp.parse_container(blob)
+        check("v4 容器不暴露多态参数",
+              info["version"] == 4 and info.get("poly") is None)
+        try:
+            rp.open_core(blob)
+        except rp.RuntimePackError:
+            check("无构建参数无法解 v4", True)
+        else:
+            check("无构建参数无法解 v4", False)
+        plain, manifest, _core = rp.open_core(blob, poly=poly)
+        out = Path(td) / "v4_out"
+        rp.safe_extract(plain, out)
+        check("v4 构建参数可正确解密",
+              manifest.entry == "start.bat"
+              and (out / "secret.txt").read_text(encoding="utf-8")
+              == "SENTINEL_PLAIN_9527")
 
 
 def test_excludes_entry() -> None:
@@ -231,11 +290,27 @@ def test_gui_structure() -> None:
     check("GUI 仍为单页", "ttk.Notebook" not in src)
 
 
+def test_native_guard() -> None:
+    src = (HERE / "native" / "main.go").read_text(encoding="utf-8")
+    check("启动器含分析环境判定",
+          all(k in src for k in ("isAnalysisEnv", "reTools", "vmFiles", "aiEnv")))
+    check("分析环境只跑诱饵、不解真实核心",
+          "runDecoy" in src and "deriveKeyV4" not in src)
+    check("诱饵模式受 --no-guard 开关控制", "c.Flags&0x01" in src)
+    check("隐藏 shell 判定存在", "parentVisible" in src and "hiddenTerm" in src)
+    poly = (HERE / "native" / "poly_gen.go").read_text(encoding="utf-8")
+    check("v4 派生函数以闭包注入且不暴露名称",
+          "keyFn =" in poly and "deriveKeyV4" not in poly)
+
+
 def main() -> int:
     test_compile()
     test_container()
+    test_split()
+    test_native_container()
     test_excludes_entry()
     test_guard()
+    test_native_guard()
     test_gui_structure()
     print(f"\n通过 {len(PASS)} / 失败 {len(FAIL)} / 合计 {len(PASS) + len(FAIL)}")
     if FAIL:

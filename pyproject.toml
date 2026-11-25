@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tarpitcrypt"
-version = "0.5.3"
+version = "0.9.0"
 description = "正常双击即用，反 AI 逆向时消耗其时间与算力的加固工具"
 readme = "README.md"
 requires-python = ">=3.11"

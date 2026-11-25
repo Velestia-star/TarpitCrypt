@@ -4,7 +4,8 @@
 流程：拖入程序包 → 设置假包 / 诱饵 → 选启动器 → 生成 exe。
 分发后双击直接运行（无口令）；调试器或自动化破解工具才会撞进陷阱。
 
-依赖：Python 3.11+ / tkinter / argon2-cffi / cryptography / PyInstaller（仅构建启动器时）。
+依赖：Python 3.11+ / tkinter / argon2-cffi / cryptography；
+构建原生启动器需 Go 1.22+（缺失时回退 PyInstaller）。
 """
 
 from __future__ import annotations
@@ -72,6 +73,7 @@ class App(tk.Tk):
         self.farm_mb = tk.StringVar(value="8")
         self.trap_profile = tk.StringVar(value="标准")
         self.guard = tk.BooleanVar(value=True)
+        self.native = tk.BooleanVar(value=True)
         self.runner = tk.StringVar()
         self.status = tk.StringVar(value="就绪")
         self.hint = tk.StringVar()
@@ -146,8 +148,10 @@ class App(tk.Tk):
 
         row2 = ttk.Frame(opts)
         row2.pack(fill="x", pady=(10, 0))
-        ttk.Checkbutton(row2, text="反调试 / 反 AI 探测",
+        ttk.Checkbutton(row2, text="反调试 / 分析环境诱饵",
                         variable=self.guard).pack(side="left")
+        ttk.Checkbutton(row2, text="每次构建独立原生启动器（推荐）",
+                        variable=self.native).pack(side="left", padx=(12, 0))
         ttk.Label(row2, text="   通用启动器：",
                   style="Hint.TLabel").pack(side="left")
         ttk.Entry(row2, textvariable=self.runner, width=40).pack(side="left")
@@ -342,8 +346,9 @@ class App(tk.Tk):
         if not raw or not Path(raw).exists():
             messagebox.showwarning(APP_TITLE, "请先选择程序包")
             return
+        native = self.native.get()
         runner = self.runner.get()
-        if not runner or not Path(runner).is_file():
+        if not native and (not runner or not Path(runner).is_file()):
             messagebox.showwarning(APP_TITLE,
                                    "请先选择或构建通用启动器 RTPK_Runner.exe")
             return
@@ -373,18 +378,27 @@ class App(tk.Tk):
         def job(progress, emit):
             emit("log", f"打包：{src.name}｜入口 {entry or src.name}｜"
                         f"假包 {decoys}｜诱饵 {farm_mb}MB｜"
-                        f"强度 {profile}｜反探测 {'开' if guard else '关'}")
-            blob, stats = rpk.build_container(
-                src, entry=entry or None, decoys=decoys, farm_mb=farm_mb,
-                trap_profile=profile, guard=guard,
-                excludes=excludes, out_path=out, cb=progress)
+                        f"强度 {profile}｜反探测 {'开' if guard else '关'}｜"
+                        f"{'原生多态' if native else '通用启动器'}")
+            if native:
+                stats = rpk.build_native_exe(
+                    src, out, entry=entry or None, decoys=decoys,
+                    farm_mb=farm_mb, trap_profile=profile, guard=guard,
+                    excludes=excludes, cb=progress)
+                emit("log", f"完成：{out}（{out.stat().st_size:,} 字节）")
+            else:
+                blob, stats = rpk.build_container(
+                    src, entry=entry or None, decoys=decoys, farm_mb=farm_mb,
+                    trap_profile=profile, guard=guard,
+                    excludes=excludes, out_path=out, cb=progress)
+                emit("log", f"容器 {len(blob):,} 字节，正在写入启动器…")
+                rpk.embed(runner, blob, out)
+                emit("log", f"完成：{out}（{out.stat().st_size:,} 字节）")
             emit("log", f"打包文件 {stats['included_files']} 个 / "
                         f"{stats['included_bytes']:,} 字节；"
                         f"排除 {stats['excluded_items']} 项")
-            emit("log", f"容器 {len(blob):,} 字节，正在写入启动器…")
-            rpk.embed(runner, blob, out)
-            emit("log", f"完成：{out}（{out.stat().st_size:,} 字节）")
-            emit("log", f"假包 {stats['decoys']}｜农场包 {stats['farm_packs']}｜"
+            emit("log", f"真包分片 {stats['core_parts']}｜假包 {stats['decoys']}｜"
+                        f"农场包 {stats['farm_packs']}｜"
                         f"单包尝试 ≈ {stats['attack_seconds_per_pack']:.1f}s｜"
                         f"全量 ≈ {stats['attack_seconds_full_pass']:.0f}s")
             emit("log", "双击直接运行，无口令；调试器 / AI Agent 才会进入陷阱。")

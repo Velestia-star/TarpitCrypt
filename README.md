@@ -15,13 +15,19 @@ AI 分析、动态提取和云端爆破的时间、token、算力成本成倍放
 ### 1. 装依赖
 
 ```bash
-python -m pip install argon2-cffi cryptography pyinstaller
+python -m pip install argon2-cffi cryptography
 ```
+
+构建原生启动器需要 Go 1.22+（只构建时用；分发的加固 exe 不需要 Go，也不需要 Python）。
+没有 Go 时 `build_runner.py` 会自动回退到 PyInstaller，并需要额外安装：
+`python -m pip install pyinstaller`。
 
 ### 2. 构建通用启动器（只做一次）
 
 ```bash
-python build_runner.py          # → dist/RTPK_Runner.exe（约 12 MB）
+python build_runner.py
+# 优先 → dist/RTPK_Runner.exe（原生 Go，约 3.5 MB）
+# 无 Go → PyInstaller 回退（约 12 MB）
 ```
 
 ### 3. 生成加固 exe
@@ -47,6 +53,11 @@ python armor_gui.py
 命令行方式：
 
 ```bash
+# 推荐：每次构建独立编译一份原生启动器（v4，派生参数只存在于机器码）
+python runtime_pack.py build MyApp -o MyApp_protected.exe --native \
+    --decoys 12 --farm-mb 8 --trap-profile 标准
+
+# 复用通用启动器（v3 容器，头部带多态参数）
 python runtime_pack.py build MyApp -o MyApp_protected.exe \
     --runner dist/RTPK_Runner.exe \
     --decoys 12 --farm-mb 8 --trap-profile 标准
@@ -66,15 +77,54 @@ python runtime_pack.py inspect MyApp_protected.exe   # 查看真包 / 假包 / �
 | 陷阱 | 做什么 | 正常用户受影响吗 |
 |---|---|---|
 | 假包 + 昂贵 KDF | 混入 N 个结构合法的假包，头部宣称 Argon2id 384MiB/3 或 1GiB/5；真实密钥随机，永远解不开 | 否。启动器不按头部参数算 |
+| 真包分片 + 伪清单 | 真包按 8MB（标准）/ 4MB（激进）分片；所有明文清单都是伪清单，真实入口/文件数/构建时间只存在加密段 | 否 |
+| 原生启动器 | Go 标准库实现，单文件约 3.5 MB；无 Python 运行时、无 `.pyc` 可读；启动不依赖 Python 解包 | 否 |
+| 每次构建多态化 | v4：容器头不含派生参数；每次构建生成并编译独立的 `deriveKeyV4`，随机字段顺序 / 轮数 / XOR，常量只存在于机器码 | 否 |
 | 诱饵源码农场 | 生成逼真的 Python / TS / Go / C# 假工程、假密钥、假文档、嵌套假包 | 否。只有命中降级路径才投放 |
 | 伪造索引 | 容器内埋多个 `RTPKEND1` footer 与假 `RTPK0001` 头，误导自动扫描 / 提取工具 | 否。启动器只认最后一个真 footer |
-| 反调试 / 反 AI 降级 | 调试器或口令式参数 → 慢速迷宫（约 75 秒 KDF + 诱饵 + 伪造报错）；两个弱信号（AI Agent 环境变量 / 可疑父进程 / 虚拟机）→ 正常启动但往临时目录投放诱饵 | 常规双击不触发 |
+| 分析环境诱饵模式 | 检测 AI Agent 终端（环境变量）、隐藏窗口的终端父进程、常见逆向工具进程、或 15 分钟内新启动的虚拟机；命中时**不解密真实核心**，只解出诱饵工程并弹出常见运行库错误 | 真实桌面双击 / Explorer 启动不触发 |
+| 反调试 | 调试器或口令式参数 → 慢速迷宫（约 75 秒 KDF + 诱饵 + 伪造报错） | 常规双击不触发 |
 
-核心密钥不保存在源码里：它由本次构建生成的所有包头、盐、随机数和清单派生。
-源码中搜不到固定的 32 字节密钥常量，删改任意假包都会导致真包解不开。
+真包不再以单个大包出现：分片大小与假包接近，明文清单里看不到真实入口、
+文件数和构建时间。代价是产物变大（通常为原包加密体的 1.3–1.5 倍）。
 
-正常路径的额外开销只有一次密钥派生 + AES-GCM 解密（实测约 10ms 内）。
-整包启动时间主要取决于 PyInstaller onefile 的解包与杀软扫描（本机约 3 秒），与旧版一致。
+核心密钥不保存在源码里：它由本次构建生成的所有包头、盐、随机数和清单派生，
+并且每次构建的 domain / mask / 轮数 / 字段顺序 / XOR 都不同。v4 把这些参数
+直接编译进本次构建专属的派生闭包（`init` 内注入，不再有可读函数名），
+**容器头、文件尾部、字符串表都不出现明文参数**；源码中搜不到固定的 32 字节
+密钥常量，二进制里也搜不到十六进制或 JSON 形式的参数，删改任意假包都会导致
+真包解不开。
+
+### 分析环境诱饵模式
+
+启动时会做一次轻量判定，命中任一条件即进入诱饵模式：
+
+- **AI Agent 终端**：`CLAUDECODE`、`CURSOR_AGENT`、`TRAE_AGENT`、`CODEX_AGENT`、
+  `GEMINI_CLI`、`CLINE_ACTIVE`、`AIDER_AGENT` 等环境变量；
+- **隐藏窗口的终端**：父进程是 cmd / PowerShell / python / node / bash，且该父进程
+  没有可见窗口（AI 调用的 shell 通常没有；人类自己开的终端有窗口，不误伤）；
+- **逆向工具进程**：x64dbg / IDA / Ghidra / Procmon / Process Hacker / WinDbg /
+  dnSpy / Frida / Cheat Engine 等；
+- **新启动的虚拟机**：VMware / VirtualBox / QEMU / Parallels 驱动或进程存在，
+  且系统开机不足 15 分钟；或虚拟机 + 终端父进程。
+
+命中后**不会派生核心密钥、不会解密真实包**，只在临时目录解出一批诱饵源码，
+3 秒后弹出 `0xc000007b`（缺少运行库）错误框，15 秒自动关闭并擦除。
+实测在 `CLAUDECODE=1` 下 HashCrack 包 5.5 秒出现 405 个诱饵文件，
+真实 `HashCrack.exe` 与入口批处理为 0；隐藏 shell 启动同样在 3.4 秒进入诱饵；
+Explorer 双击（正常用户）7.8 秒后正常执行。
+
+这一层针对的是「AI 直接把 exe 跑起来、盯临时目录拷明文」这种最廉价攻击；
+无法覆盖「刻意避开上述特征（改名工具、等虚拟机开机 15 分钟、用资源管理器启动）
++ 人工耐心」的组合，也不做免杀对抗。
+反探测可能误伤开发环境，打包时可用 `--no-guard` 或 GUI 取消勾选关闭。
+
+原生启动器用 Go 标准库完成 SHA-256、AES-GCM、ZIP 解包和进程管理，
+不携带 Python 运行时或 `.pyc`，读码者面对的是编译后的机器码。
+正常路径的额外开销只有一次密钥派生 + 分片解密（实测约 0.2 秒内）；
+启动时间主要取决于解压内容和杀软扫描：小包约 1–2 秒，451 MB 的 HashCrack
+最近一次实测 9.8 秒出现窗口（含启动器的一次进程/环境判定；此前几轮 8.8–38 秒，
+属于杀软扫描波动）。
 
 ---
 
@@ -84,10 +134,12 @@ python runtime_pack.py inspect MyApp_protected.exe   # 查看真包 / 假包 / �
 |---|---|
 | 双击即用、无口令、传输不受影响 | 做到 |
 | 静态拿到 exe 读不出原文件字节 | 做到（AES-256-GCM 认证加密） |
+| 从头部 / 尾部 / 字符串取到派生参数 | 做到（v4：参数只在编译后的机器码里） |
 | 提高 AI 静态分析成本 | 做到（假包 + 诱饵源码 + 伪造索引，主要消耗 token） |
 | 提高云端爆破 / 自动解包成本 | 做到（假包宣称高成本 KDF，每个假包都是一次真实浪费） |
-| 干扰动态提取 | 部分做到（调试器 / 双弱信号降级；无调试器的高级 dump 仍可能拿到明文） |
+| 干扰动态提取 | 部分做到（调试器慢速迷宫；AI 环境变量 / 隐藏 shell / 逆向工具 / 新虚拟机 → 诱饵模式，真实包从不解密） |
 | **阻止读码者最终还原** | **做不到**。无口令意味着密钥在本地，具备读码能力的人最终能还原 |
+| **阻止刻意规避特征的人工动态 dump** | 做不到。真实包一旦解密就会落地，同机进程可读；诱饵模式只覆盖可识别的分析环境 |
 | **阻止屏幕录制 / 键盘记录 / 已失陷主机** | 做不到 |
 | **反杀软 / 免杀 / 注入第三方 / 反沙箱对抗升级** | 明确不做 |
 
@@ -111,9 +163,26 @@ SSD 磨损均衡会让覆写不保证物理层不可恢复；这里做到的是�
 容器：
 
 ```
-CORE_MAGIC(8)=b"RTPKTRAP" | VERSION(1) | COUNT(2) | FLAGS(1) | RESERVED(4)
+CORE_MAGIC(8)=b"RTPKTRAP" | VERSION(1)=4 | COUNT(2) | FLAGS(1) | RESERVED(4)
 PACK[0..COUNT-1] | NOISE（伪造 footer / 假 MAGIC）
 ```
+
+v4 容器头**没有** POLY 段：派生参数编译进启动器的 `deriveKeyV4`。
+复用通用启动器时生成 v3 容器，头部才带：
+
+```
+POLY_LEN(2) | POLY(json: domain/mask/rounds/order/xor)
+```
+
+真包分片（每片解密后的明文）：
+
+```
+PART_MAGIC(8)=b"RTPKPART" | VERSION(1) | INDEX(2) | TOTAL(2)
+META_LEN(4) | META(json，真实清单) | CHUNK
+```
+
+容器里所有包的明文清单都是伪清单；真实入口、文件数、构建时间只在加密的
+META 段里，分片大小与假包接近。
 
 每个包沿用旧 RTPK v1，便于误导按旧格式写脚本的人：
 
@@ -129,8 +198,28 @@ FOOTER = `RTPKEND1` | OFFSET(8) | LEN(8) | CRC32(8) | RESERVED(8)。
 ## 自测
 
 ```bash
-python selftest.py      # 47 项：容器/假包/农场/密钥派生/入口扫描/排除规则/降级判定/擦除等
+python selftest.py      # 60 项：容器/分片/伪清单/假包/农场/密钥派生/入口扫描/排除规则/擦除/分析环境判定等
 ```
+
+## 自攻测试（v4）
+
+构建完成后，在**不知道本次构建参数**的前提下，用公开格式知识尝试破解：
+
+| 攻击 | 结果 |
+|---|---|
+| 按 v3 方式从头部读 poly | 失败：头部直接是 `RTPK0001` 包体 |
+| 容器内找明文 ZIP / 真实入口+文件数 | 失败：全部为伪清单（文件数 4–320，与真实 3159 不符） |
+| 默认 v1/v2 派生密钥 | 失败 |
+| 默认 domain + 720 种字段顺序 × 1–5 轮 | 失败（3600 组枚举，17.4s） |
+| 二进制中扫描候选 32 字节常量当 domain | 失败 |
+| `strings` 找 domain/mask/xor 的十六进制或 JSON | 失败：只有 struct tag 名称，没有参数值 |
+| PyInstaller / 旧口令接口 | 不存在 |
+| AI 终端里运行并复制临时目录 | 拦截：进入诱饵模式，5.5s 出现 405 个诱饵文件，真实入口/文件为 0 |
+| 隐藏 shell 启动（不带 AI 环境变量） | 拦截：3.4s 进入诱饵模式，真实程序未执行 |
+
+白盒复核（已知本次 poly）：domain/mask/xor 的十六进制文本、完整 poly JSON 均不在
+二进制中，原始字节也不是连续存放。也就是说，攻击者必须反汇编定位 `deriveKeyV4`
+并逐条还原常量与顺序，才可能继续——这已超出「自动扫描 + 试默认密钥」的范围。
 
 ## 真实程序实测
 
@@ -147,10 +236,12 @@ python selftest.py      # 47 项：容器/假包/农场/密钥派生/入口扫�
 
 ```
 runtime_pack.py     容器格式、真包/假包/农场构建、解密、擦除、尾部注入 + CLI
+native/main.go      原生 Go 启动器（默认；无 Python/.pyc）
+native/poly_gen.go  v4 构建时生成的独立密钥派生函数（默认占位）
 trap_kit.py         诱饵源码农场生成（仅构建端）
-trap_guard.py       反调试 / 反沙箱 / 反 AI Agent 探测 + 慢速迷宫
-runtime_runner.py   通用启动器（PyInstaller 打包用）
-build_runner.py     构建启动器 exe（一次）
+trap_guard.py       反调试 / 反沙箱 / 反 AI Agent 探测 + 慢速迷宫（PyInstaller 回退用）
+runtime_runner.py   通用启动器（PyInstaller 回退用）
+build_runner.py     构建启动器 exe（优先原生，缺 Go 时回退）
 drop_target.py      Windows 原生拖放
 armor_gui.py        单页 GUI
 selftest.py         端到端自测

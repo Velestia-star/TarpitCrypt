@@ -40,6 +40,7 @@ import io
 import json
 import os
 import random
+import shutil
 import struct
 import subprocess
 import sys
@@ -61,7 +62,19 @@ CORE_MAGIC = b"RTPKTRAP"
 FOOTER_MAGIC = b"RTPKEND1"
 FOOTER_LEN = 40
 PACK_VERSION = 1
-CORE_VERSION = 1
+CORE_VERSION = 4
+
+# 每次构建随机化的密钥派生参数（多态化）。
+POLY_FIELDS = ("index", "ct_len", "manifest_len", "salt", "nonce", "manifest")
+_DEFAULT_ORDER = list(POLY_FIELDS)
+
+# 真包分片：分片大小与假包接近，避免"最大包就是真包"。
+PART_MAGIC = b"RTPKPART"
+PART_VERSION = 1
+PART_BYTES: dict[str, int] = {
+    "标准": 8 * 1024 * 1024,
+    "激进": 4 * 1024 * 1024,
+}
 
 # 头部对外宣称的 KDF 成本（真实包不按这个算）
 TRAP_PROFILES: dict[str, tuple[int, int, int]] = {
@@ -136,18 +149,58 @@ def _notify(cb: Progress | None, done: int, total: int, text: str) -> None:
         cb(done, total, text)
 
 
-def _core_key(packs: list[dict]) -> bytes:
-    """核心密钥：由本次构建所有包头 + 清单派生，源码中不存在任何密钥常量。"""
+def _make_poly(rng: random.Random) -> dict:
+    order = list(POLY_FIELDS)
+    rng.shuffle(order)
+    return {
+        "v": 1,
+        "domain": os.urandom(32).hex(),
+        "mask": os.urandom(32).hex(),
+        "rounds": rng.randint(1, 5),
+        "order": order,
+        "xor": os.urandom(rng.randint(8, 16)).hex(),
+    }
+
+
+def _core_key_v4(packs: list[dict], poly: dict) -> bytes:
+    key = bytearray(_core_key(packs, poly))
+    xor = bytes.fromhex(poly.get("xor", ""))
+    for i, value in enumerate(xor):
+        key[i % len(key)] ^= value
+    return bytes(key)
+
+
+def _core_key(packs: list[dict], poly: dict | None = None) -> bytes:
+    """核心密钥：由本次构建所有包头 + 清单派生；v3 每次构建随机化派生参数。"""
+    if poly:
+        domain = bytes.fromhex(poly["domain"])
+        mask = bytes.fromhex(poly["mask"])
+        rounds = int(poly.get("rounds", 0))
+        order = list(poly.get("order") or _DEFAULT_ORDER)
+    else:
+        domain = _DOMAIN_CORE
+        mask = b""
+        rounds = 0
+        order = list(_DEFAULT_ORDER)
+
     h = hashlib.sha256()
-    h.update(_DOMAIN_CORE)
+    h.update(domain)
     for index, pack in enumerate(packs):
         man = pack["manifest_raw"]
-        h.update(struct.pack("<HII", index & 0xFFFF,
-                             pack["ct_len"] & 0xFFFFFFFF, len(man)))
-        h.update(pack["salt"])
-        h.update(pack["nonce"])
-        h.update(man)
-    return h.digest()
+        values = {
+            "index": struct.pack("<H", index & 0xFFFF),
+            "ct_len": struct.pack("<I", pack["ct_len"] & 0xFFFFFFFF),
+            "manifest_len": struct.pack("<I", len(man)),
+            "salt": pack["salt"],
+            "nonce": pack["nonce"],
+            "manifest": man,
+        }
+        for name in order:
+            h.update(values[name])
+    digest = h.digest()
+    for _ in range(rounds):
+        digest = hashlib.sha256(digest + mask).digest()
+    return digest
 
 
 def _farm_key(salt: bytes, nonce: bytes, manifest_raw: bytes) -> bytes:
@@ -165,6 +218,42 @@ def _try_key(key: bytes, pack: dict) -> bytes | None:
             pack["nonce"], pack["ct_blob"], pack["manifest_raw"])
     except (InvalidTag, ValueError):
         return None
+
+
+def _make_part_payload(index: int, total: int, meta_raw: bytes,
+                       chunk: bytes) -> bytes:
+    return b"".join((
+        PART_MAGIC,
+        bytes((PART_VERSION,)),
+        struct.pack("<HHI", index, total, len(meta_raw)),
+        meta_raw,
+        chunk,
+    ))
+
+
+def _parse_part(plain: bytes) -> dict | None:
+    """解析核心分片；不是分片格式时返回 None（兼容旧单包）。"""
+    if not plain.startswith(PART_MAGIC):
+        return None
+    p = len(PART_MAGIC)
+    if len(plain) < p + 1 + 4 + 4:
+        raise RuntimePackError("核心分片头部被截断")
+    version = plain[p]
+    p += 1
+    if version != PART_VERSION:
+        raise RuntimePackError(f"不支持的分片版本：{version}")
+    index, total, meta_len = struct.unpack("<HHI", plain[p:p + 8])
+    p += 8
+    if total == 0 or index >= total or len(plain) < p + meta_len:
+        raise RuntimePackError("核心分片元数据异常")
+    meta_raw = plain[p:p + meta_len]
+    p += meta_len
+    return {
+        "index": index,
+        "total": total,
+        "meta_raw": meta_raw,
+        "chunk": plain[p:],
+    }
 
 
 # ---------------------------------------------------------------- 打包辅助
@@ -479,10 +568,10 @@ def parse_pack_at(blob: bytes, pos: int) -> dict:
 # ---------------------------------------------------------------- 容器编解码
 
 
-def _make_noise(rng: random.Random, packs: list[bytes]) -> bytes:
+def _make_noise(rng: random.Random, packs: list[bytes], start: int = 16) -> bytes:
     """真实数据之后塞入伪造 footer / 假 MAGIC，误导自动扫描器。"""
     starts: list[int] = []
-    cur = 16
+    cur = start
     for pack in packs:
         starts.append(cur)
         cur += len(pack)
@@ -501,13 +590,28 @@ def parse_container(blob: bytes) -> dict:
     if len(blob) < 16 or blob[:8] != CORE_MAGIC:
         raise RuntimePackError("不是 TarpitCrypt 加固容器")
     version = blob[8]
-    if version != CORE_VERSION:
+    if version not in (1, 2, 3, CORE_VERSION):
         raise RuntimePackError(f"不支持的容器版本：{version}")
     count = struct.unpack("<H", blob[9:11])[0]
     flags = blob[11]
     if not 1 <= count <= 256:
         raise RuntimePackError(f"包数量异常：{count}")
     pos = 16
+    poly = None
+    if version == 3:
+        if len(blob) < pos + 2:
+            raise RuntimePackError("多态参数被截断")
+        poly_len = struct.unpack("<H", blob[pos:pos + 2])[0]
+        pos += 2
+        if len(blob) < pos + poly_len:
+            raise RuntimePackError("多态参数被截断")
+        try:
+            poly = json.loads(blob[pos:pos + poly_len].decode("utf-8"))
+        except Exception as exc:
+            raise RuntimePackError("多态参数解析失败") from exc
+        pos += poly_len
+        if sorted(poly.get("order", [])) != sorted(POLY_FIELDS):
+            raise RuntimePackError("多态参数字段顺序非法")
     packs: list[dict] = []
     for _ in range(count):
         info = parse_pack_at(blob, pos)
@@ -518,6 +622,7 @@ def parse_container(blob: bytes) -> dict:
         "count": count,
         "flags": flags,
         "guard": bool(flags & 0x01),
+        "poly": poly,
         "packs": packs,
         "trailer": blob[pos:],
     }
@@ -576,6 +681,8 @@ def build_container(
     excludes: list[str] | tuple[str, ...] | None = None,
     out_path: str | Path | None = None,
     cb: Progress | None = None,
+    poly: dict | None = None,
+    native: bool = False,
 ) -> tuple[bytes, dict]:
     """构建陷阱容器（不含启动器），返回 (容器字节, 统计)。
 
@@ -601,13 +708,39 @@ def build_container(
     )
 
     rng = random.Random(int.from_bytes(os.urandom(8), "big"))
-    packs: list[bytes] = []
-    _notify(cb, 0, 1, f"正在生成 {decoys} 个假包…")
-    base = min(max(len(real_zip), 64 * 1024), 1024 * 1024)
-    for _ in range(decoys):
-        size = rng.randint(max(24 * 1024, base // 2), max(48 * 1024, base * 3 // 2))
-        packs.append(make_pack_bytes(
-            os.urandom(size), _fake_manifest(rng, size), "decoy", header_profile))
+    if native:
+        if poly is None:
+            raise RuntimePackError("原生多态包缺少构建参数")
+    else:
+        poly = _make_poly(rng)
+    part_bytes = PART_BYTES[trap_profile]
+    core_parts = max(1, (len(real_zip) + part_bytes - 1) // part_bytes)
+    chunk_size = max(1, (len(real_zip) + core_parts - 1) // core_parts)
+    chunks = [real_zip[i:i + chunk_size]
+              for i in range(0, len(real_zip), chunk_size)]
+    core_parts = len(chunks)
+    meta_raw = manifest.to_bytes()
+    part_payloads = [
+        _make_part_payload(i, core_parts, meta_raw, chunk)
+        for i, chunk in enumerate(chunks)
+    ]
+
+    decoy_count = decoys
+    if core_parts > 2:
+        decoy_count = min(decoys, max(4, core_parts))
+    _notify(cb, 0, 1, f"正在生成 {decoy_count} 个假包…")
+    base = (part_bytes if core_parts > 1
+            else max(1024, min(part_bytes, len(real_zip))))
+    items: list[dict] = []
+    for _ in range(decoy_count):
+        size = max(512, rng.randint(int(base * 0.7), int(base * 1.3)))
+        items.append({
+            "kind": "decoy",
+            "payload": os.urandom(size),
+            "manifest": _fake_manifest(rng, size),
+            "salt": os.urandom(16),
+            "nonce": os.urandom(12),
+        })
 
     farm_packs = 0
     if farm_mb > 0:
@@ -631,49 +764,81 @@ def build_container(
                 files[f"internal/{nested_name}.rpk"] = make_pack_bytes(
                     nested_zip, nested_manifest, "farm", header_profile)
             farm_zip = _zip_files(files)
-            farm_manifest = Manifest(
-                entry=_pick_entry(files),
-                files=len(files),
-                unpacked_bytes=sum(len(v) for v in files.values()),
-                profile=trap_profile,
-                created=time.strftime("%Y-%m-%d %H:%M:%S"),
-            )
-            packs.append(make_pack_bytes(
-                farm_zip, farm_manifest, "farm", header_profile))
+            items.append({
+                "kind": "farm",
+                "payload": farm_zip,
+                "manifest": _fake_manifest(rng, len(farm_zip)),
+                "salt": os.urandom(16),
+                "nonce": os.urandom(12),
+            })
             farm_packs += 1
 
-    # 核心密钥由「最终顺序下所有包」的头部与清单派生，源码里没有可搜索的密钥常量。
-    rng.shuffle(packs)
-    core_salt = os.urandom(16)
-    core_nonce = os.urandom(12)
-    core_meta = {
-        "salt": core_salt,
-        "nonce": core_nonce,
-        "manifest_raw": manifest.to_bytes(),
-        "ct_len": len(real_zip),
-    }
-    metas = [parse_pack_at(pack, 0) for pack in packs]
-    insert_at = rng.randint(0, len(metas))
-    metas.insert(insert_at, core_meta)
-    core_key = _core_key(metas)
-    core_pack = make_pack_bytes(
-        real_zip, manifest, "core", header_profile,
-        key=core_key, salt=core_salt, nonce=core_nonce)
-    packs.insert(insert_at, core_pack)
+    for payload in part_payloads:
+        items.append({
+            "kind": "core",
+            "payload": payload,
+            "manifest": _fake_manifest(rng, len(payload)),
+            "salt": os.urandom(16),
+            "nonce": os.urandom(12),
+        })
 
-    header = b"".join((
-        CORE_MAGIC,
-        bytes((CORE_VERSION,)),
-        struct.pack("<H", len(packs)),
-        bytes((0x01 if guard else 0x00,)),
-        b"\x00" * 4,
-    ))
-    blob = header + b"".join(packs) + _make_noise(rng, packs)
+    # 核心密钥由「最终顺序下所有包」的头部与清单派生；所有明文清单都是伪清单。
+    rng.shuffle(items)
+    metas: list[dict] = []
+    for item in items:
+        man_raw = item["manifest"].to_bytes()
+        item["manifest_raw"] = man_raw
+        metas.append({
+            "salt": item["salt"],
+            "nonce": item["nonce"],
+            "manifest_raw": man_raw,
+            "ct_len": len(item["payload"]),
+        })
+    core_key = (_core_key_v4(metas, poly) if native
+                else _core_key(metas, poly))
+
+    packs: list[bytes] = []
+    for item in items:
+        kind = item["kind"]
+        if kind == "core":
+            pack = make_pack_bytes(
+                item["payload"], item["manifest"], "core", header_profile,
+                key=core_key, salt=item["salt"], nonce=item["nonce"])
+        elif kind == "farm":
+            pack = make_pack_bytes(
+                item["payload"], item["manifest"], "farm", header_profile,
+                salt=item["salt"], nonce=item["nonce"])
+        else:
+            pack = make_pack_bytes(
+                item["payload"], item["manifest"], "decoy", header_profile,
+                salt=item["salt"], nonce=item["nonce"])
+        packs.append(pack)
+
+    flags = 0x01 if guard else 0x00
+    if native:
+        header = b"".join((
+            CORE_MAGIC,
+            bytes((CORE_VERSION,)),
+            struct.pack("<HB4x", len(packs), flags),
+        ))
+    else:
+        poly_raw = json.dumps(poly, ensure_ascii=False,
+                             separators=(",", ":")).encode("utf-8")
+        header = b"".join((
+            CORE_MAGIC,
+            bytes((3,)),
+            struct.pack("<HB4x", len(packs), flags),
+            struct.pack("<H", len(poly_raw)),
+            poly_raw,
+        ))
+    blob = header + b"".join(packs) + _make_noise(rng, packs, len(header))
     mem, time_cost, _ = header_profile
     per_pack = (mem / 1048576.0) * time_cost * 1.2
     stats = {
         "packs": len(packs),
-        "decoys": decoys,
+        "decoys": decoy_count,
+        "core_parts": core_parts,
+        "part_bytes": part_bytes,
         "farm_packs": farm_packs,
         "farm_mb": farm_mb,
         "core_bytes": len(real_zip),
@@ -691,6 +856,137 @@ def build_container(
     }
     _notify(cb, 1, 1, "陷阱容器构建完成")
     return blob, stats
+
+
+def _find_go() -> str | None:
+    candidates = [
+        os.environ.get("TARPITCRYPT_GO", ""),
+        shutil.which("go") or "",
+        r"D:\app\go1.27.4\go\bin\go.exe",
+        r"C:\Program Files\Go\bin\go.exe",
+        r"D:\Go\bin\go.exe",
+    ]
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file():
+            return candidate
+    return None
+
+
+def _go_byte_slice(hex_text: str) -> str:
+    return "[]byte{" + ", ".join(
+        f"0x{b:02x}" for b in bytes.fromhex(hex_text)) + "}"
+
+
+def _write_poly_go(poly: dict) -> Path:
+    native_dir = Path(__file__).resolve().parent / "native"
+    native_dir.mkdir(exist_ok=True)
+    writes = {
+        "index": "h.Write([]byte{byte(idx), byte(idx >> 8)})",
+        "ct_len": "h.Write(u32(uint32(p.CtLen)))",
+        "manifest_len": "h.Write(u32(uint32(len(p.ManifestRaw))))",
+        "salt": "h.Write(p.Salt)",
+        "nonce": "h.Write(p.Nonce)",
+        "manifest": "h.Write(p.ManifestRaw)",
+    }
+    body = "\n\t\t".join(writes[name] for name in poly["order"])
+    rounds = "\n\t".join("mix()" for _ in range(int(poly["rounds"])))
+    xor = "\n\t".join(
+        f"sum[{i % 32}] ^= 0x{value:02x}"
+        for i, value in enumerate(bytes.fromhex(poly["xor"])))
+    source = f'''package main
+
+import "crypto/sha256"
+
+// 由构建器生成：随机派生顺序 / 轮数 / 二进制常量，只存在于机器码里。
+func init() {{
+	keyFn = func(packs []Pack) []byte {{
+		h := sha256.New()
+		h.Write({_go_byte_slice(poly["domain"])})
+		for idx, p := range packs {{
+			_ = idx
+			{body}
+		}}
+		sum := h.Sum(nil)
+		mask := {_go_byte_slice(poly["mask"])}
+		mix := func() {{
+			s := sha256.Sum256(append(append([]byte(nil), sum...), mask...))
+			sum = s[:]
+		}}
+		{rounds}
+		{xor}
+		return sum
+	}}
+}}
+'''
+    path = native_dir / "poly_gen.go"
+    path.write_text(source, encoding="utf-8")
+    return path
+
+
+def _compile_native_runner(poly: dict, out_dir: Path) -> Path:
+    go = _find_go()
+    if not go:
+        raise RuntimePackError("未找到 Go 工具链；安装 Go 1.22+ 或使用 PyInstaller 模式")
+    native_dir = Path(__file__).resolve().parent / "native"
+    poly_path = native_dir / "poly_gen.go"
+    original = poly_path.read_text(encoding="utf-8") if poly_path.exists() else None
+    _write_poly_go(poly)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    runner = out_dir / "RTPK_Native_Runner.exe"
+    cmd = [
+        go, "build", "-trimpath",
+        "-ldflags", "-s -w -H=windowsgui",
+        "-o", str(runner), ".",
+    ]
+    try:
+        env = os.environ.copy()
+        env["PATH"] = str(Path(go).parent) + os.pathsep + env.get("PATH", "")
+        env.setdefault("GOROOT", str(Path(go).parent.parent))
+        proc = subprocess.run(cmd, cwd=str(native_dir), capture_output=True, env=env)
+    finally:
+        if original is not None:
+            poly_path.write_text(original, encoding="utf-8")
+        else:
+            poly_path.unlink(missing_ok=True)
+    if proc.returncode:
+        raise RuntimePackError(
+            "原生启动器编译失败：" + proc.stderr.decode("utf-8", "replace")[-800:])
+    return runner
+
+
+def build_native_exe(
+    src: str | Path,
+    out: str | Path,
+    *,
+    entry: str | None = None,
+    decoys: int = DEFAULT_DECOYS,
+    farm_mb: int = DEFAULT_FARM_MB,
+    trap_profile: str = "标准",
+    guard: bool = True,
+    excludes: list[str] | tuple[str, ...] | None = None,
+    cb: Progress | None = None,
+) -> dict:
+    """每次构建生成独立的原生启动器（v4，派生参数编译进机器码）。"""
+    rng = random.Random(int.from_bytes(os.urandom(8), "big"))
+    poly = _make_poly(rng)
+    target = Path(out)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    build_dir = Path(tempfile.mkdtemp(prefix="rtpk_native_build_"))
+    try:
+        _notify(cb, 0, 1, "正在编译原生多态启动器…")
+        runner = _compile_native_runner(poly, build_dir)
+        blob, stats = build_container(
+            src, entry=entry, decoys=decoys, farm_mb=farm_mb,
+            trap_profile=trap_profile, guard=guard,
+            excludes=excludes, out_path=target, cb=cb,
+            poly=poly, native=True)
+        target = embed(runner, blob, target)
+        stats["exe_bytes"] = target.stat().st_size
+        stats["native"] = True
+        stats["poly_rounds"] = int(poly["rounds"])
+        return stats
+    finally:
+        shutil.rmtree(build_dir, ignore_errors=True)
 
 
 def build_trap_exe(
@@ -718,14 +1014,43 @@ def build_trap_exe(
 # ---------------------------------------------------------------- 运行侧
 
 
-def open_core(blob: bytes) -> tuple[bytes, Manifest, dict]:
-    """扫描所有包，用派生密钥找出并解密真实程序包。"""
+def open_core(blob: bytes, poly: dict | None = None) -> tuple[bytes, Manifest, dict]:
+    """扫描所有包，解密核心分片并拼回真实 zip；v4 需要构建参数。"""
     info = parse_container(blob)
-    key = _core_key(info["packs"])
+    if info["version"] == 4:
+        if poly is None:
+            raise RuntimePackError("这是原生多态包，需要由配套启动器解密")
+        key = _core_key_v4(info["packs"], poly)
+    else:
+        key = _core_key(info["packs"], info.get("poly"))
+    parts: list[dict] = []
+    legacy: tuple[bytes, Manifest, dict] | None = None
     for pack in info["packs"]:
         plain = _try_key(key, pack)
-        if plain is not None:
-            return plain, pack["manifest"], pack
+        if plain is None:
+            continue
+        parsed = _parse_part(plain)
+        if parsed is None:
+            legacy = (plain, pack["manifest"], pack)
+            break
+        parsed["pack"] = pack
+        parts.append(parsed)
+
+    if parts:
+        total = parts[0]["total"]
+        if (len(parts) != total
+                or any(p["total"] != total for p in parts)
+                or {p["index"] for p in parts} != set(range(total))):
+            raise RuntimePackError("核心分片不完整或重复，分发包可能被篡改")
+        meta_raw = parts[0]["meta_raw"]
+        if any(p["meta_raw"] != meta_raw for p in parts):
+            raise RuntimePackError("核心分片元数据不一致")
+        ordered = sorted(parts, key=lambda p: p["index"])
+        zip_bytes = b"".join(p["chunk"] for p in ordered)
+        return zip_bytes, Manifest.from_bytes(meta_raw), ordered[0]["pack"]
+
+    if legacy is not None:
+        return legacy
     raise RuntimePackError("核心数据校验失败：分发包可能损坏或被篡改")
 
 
@@ -741,14 +1066,39 @@ def open_farms(blob: bytes) -> list[tuple[bytes, Manifest]]:
     return found
 
 
-def inspect_blob(blob: bytes) -> dict:
+def _core_part_count(info: dict, poly: dict | None = None) -> int:
+    if info["version"] == 4:
+        if poly is None:
+            return 0
+        key = _core_key_v4(info["packs"], poly)
+    else:
+        key = _core_key(info["packs"], info.get("poly"))
+    count = 0
+    for pack in info["packs"]:
+        plain = _try_key(key, pack)
+        if plain is None:
+            continue
+        if _parse_part(plain) is None:
+            return 1
+        count += 1
+    return count
+
+
+def inspect_blob(blob: bytes, poly: dict | None = None) -> dict:
     info = parse_container(blob)
-    plain, manifest, core = open_core(blob)
+    plain, manifest, core = open_core(blob, poly)
     farms = open_farms(blob)
+    core_parts = _core_part_count(info, poly)
     real_index = next(
         (i for i, p in enumerate(info["packs"])
          if p["offset"] == core["offset"]), -1)
     fake_footers = blob.count(FOOTER_MAGIC)
+    farm_files = 0
+    for zip_bytes, _manifest in farms:
+        try:
+            farm_files += len(zipfile.ZipFile(io.BytesIO(zip_bytes)).namelist())
+        except Exception:
+            pass
     return {
         "count": info["count"],
         "guard": info["guard"],
@@ -756,9 +1106,10 @@ def inspect_blob(blob: bytes) -> dict:
         "core_entry": manifest.entry,
         "core_files": manifest.files,
         "core_bytes": len(plain),
-        "decoys": info["count"] - 1 - len(farms),
+        "core_parts": core_parts,
+        "decoys": info["count"] - core_parts - len(farms),
         "farm_packs": len(farms),
-        "farm_files": sum(m.files for _, m in farms),
+        "farm_files": farm_files,
         "header_mem_kib": core["mem"],
         "header_time": core["time"],
         "header_para": core["para"],
@@ -861,7 +1212,8 @@ def wipe_dir(path: Path, budget: float = 3.0) -> None:
 def _print_stats(stats: dict, out: Path) -> None:
     size = stats.get("exe_bytes", stats["container_bytes"])
     print(f"已生成 {out}（{size:,} 字节）")
-    print(f"  包总数        : {stats['packs']}（真包 1 / 假包 {stats['decoys']} / 农场包 {stats['farm_packs']}）")
+    print(f"  包总数        : {stats['packs']}（真包分片 {stats.get('core_parts', 1)} / "
+          f"假包 {stats['decoys']} / 农场包 {stats['farm_packs']}）")
     print(f"  入口          : {stats['entry']}")
     print(f"  打包文件      : {stats.get('included_files', '?')} 个 / "
           f"{stats.get('included_bytes', 0):,} 字节；排除 {stats.get('excluded_items', 0)} 项")
@@ -879,6 +1231,8 @@ def _cli(argv: list[str] | None = None) -> int:
     p_build.add_argument("src", help="源文件或文件夹")
     p_build.add_argument("-o", "--out", required=True, help="输出 exe / .rtpk")
     p_build.add_argument("--runner", help="通用启动器 exe；提供则生成单文件 exe")
+    p_build.add_argument("--native", action="store_true",
+                         help="生成原生多态启动器（每次构建独立编译，推荐）")
     p_build.add_argument("--entry", help="入口程序相对路径；默认自动识别")
     p_build.add_argument("--decoys", type=int, default=DEFAULT_DECOYS,
                          help=f"假包数量 0-{MAX_DECOYS}（默认 {DEFAULT_DECOYS}）")
@@ -907,13 +1261,20 @@ def _cli(argv: list[str] | None = None) -> int:
         excludes = list(args.exclude or [])
         if not args.no_default_excludes:
             excludes = list(DEFAULT_EXCLUDES) + excludes
-        stats = build_trap_exe(
-            args.src, out,
-            runner=args.runner, entry=args.entry,
+        stats = build_native_exe(
+            args.src, out, entry=args.entry,
             decoys=args.decoys, farm_mb=args.farm_mb,
             trap_profile=args.trap_profile, guard=not args.no_guard,
             excludes=excludes,
-        ) if args.runner else None
+        ) if args.native else (
+            build_trap_exe(
+                args.src, out,
+                runner=args.runner, entry=args.entry,
+                decoys=args.decoys, farm_mb=args.farm_mb,
+                trap_profile=args.trap_profile, guard=not args.no_guard,
+                excludes=excludes,
+            ) if args.runner else None
+        )
         if stats is None:
             blob, stats = build_container(
                 args.src, entry=args.entry, decoys=args.decoys,
@@ -928,7 +1289,8 @@ def _cli(argv: list[str] | None = None) -> int:
         blob = read_embedded(path) if path.suffix.lower() == ".exe" else path.read_bytes()
         data = inspect_blob(blob)
         print(f"包总数        : {data['count']}")
-        print(f"真包序号      : {data['real_index']}")
+        print(f"核心分片      : {data.get('core_parts', 1)}")
+        print(f"首个真包序号  : {data['real_index']}")
         print(f"假包 / 农场包 : {data['decoys']} / {data['farm_packs']}")
         print(f"农场文件数    : {data['farm_files']}")
         print(f"核心入口      : {data['core_entry']}")
